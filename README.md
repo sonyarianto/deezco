@@ -27,7 +27,7 @@ cd deezco
 cargo build --release
 ```
 
-The binary will be at `target/release/deezco` (approx. 2.5 MB).
+The binary will be at `target/release/deezco` (approx. 2.7 MB).
 
 ### Requirements
 
@@ -69,11 +69,11 @@ deezco [OPTIONS] [COMMAND]
 | `--offset <N>` | Skip the first N tracks in favorites JSON output | `0` |
 | `-c, --concurrency <N>` | Number of parallel downloads (playlists, albums, favorites, artists) | `4` |
 | `--pick <N>` | Download the Nth search result (1-based) instead of printing the list; also picks a followed artist for `following` | |
-| `--json` | Print results as JSON instead of downloading: track/artist name searches print the raw API response; `playlist`, `album`, `favorites`, and `following` print their contents | |
+| `--json` | Print results as JSON instead of downloading: track name searches print the API response (its `data` reordered per `--sort`), artist name searches print the raw API response; `playlist`, `album`, `favorites`, and `following` print their contents | |
 | `--output-format <FMT>` | JSON style used with `--json`: `pretty` or `compact` | `pretty` |
-| `--sort <KEY>` | Sort key for track search and listing results: `quality` (highest available first), `relevance` (original API order), `duration` (shortest first). Not applicable to artists or `following` | `quality` |
+| `--sort <KEY>` | Sort key for track search and listing results: `quality` (highest available first), `relevance` (original API order), `duration` (shortest first). Applies to track searches, favorites, and `following` (which supports `quality`/`relevance` only — `duration` is rejected); artists have no sortable columns | `quality` |
 | `--sort-dir <DIR>` | Sort direction: `asc` or `desc`. Defaults to each key's natural order (quality best-first, duration shortest-first) | |
-| `--dry-run` | List what would be downloaded without writing to disk, showing the format each track would use (takes precedence over `--json` for download commands) | |
+| `--dry-run` | List what would be downloaded without writing to disk, showing the format each track would use. Applies to downloads (IDs/URLs and `--pick`); `--json` still wins for search listings and `playlist`/`album`/`favorites`/`following` | |
 | `-h, --help` | Print help | |
 | `-V, --version` | Print version | |
 
@@ -227,6 +227,7 @@ Within the output directory, downloads are organized by type:
 - **Playlist** → `<output>/<Playlist Name>/`
 - **Favorites** → `<output>/Favorites/`
 - **Artist** → `<output>/<Artist>/<Album>/`
+- **Album** → `<output>/<Artist>/<Album>/`
 
 ## Authentication
 

@@ -20,7 +20,7 @@ A fast, lightweight Deezer music downloader written in Rust. Single binary, no r
 ### From source
 
 ```bash
-git clone https://github.com/youruser/deezco.git
+git clone https://github.com/sonyarianto/deezco.git
 cd deezco
 cargo build --release
 ```

@@ -29,7 +29,7 @@ The binary will be at `target/release/deezco` (approx. 2.5 MB).
 
 ### Requirements
 
-- Rust 1.82+ (edition 2024)
+- Rust 1.88+ (edition 2024)
 - A valid Deezer ARL cookie (see [Authentication](#authentication))
 
 ## Usage
@@ -96,6 +96,15 @@ deezco artist 27
 # Custom output directory
 deezco -o ~/Music -q flac artist "Radiohead"
 ```
+
+### Output layout
+
+Within the output directory, downloads are organized by type:
+
+- **Track** → `<output>/<Artist>/<Artist> - <Title>.<ext>`
+- **Playlist** → `<output>/<Playlist Name>/`
+- **Favorites** → `<output>/Favorites/`
+- **Artist** → `<output>/<Artist>/<Album>/`
 
 ## Authentication
 

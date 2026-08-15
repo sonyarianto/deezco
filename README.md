@@ -134,18 +134,6 @@ src/
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
 
-## Tech Stack
-
-- **Rust** (edition 2024)
-- **tokio** — async runtime
-- **reqwest** — HTTP client with cookie jar
-- **clap** — CLI argument parsing
-- **dialoguer** — interactive prompts and selection menus
-- **indicatif** — progress bars
-- **blowfish** / **cbc** — stream decryption
-- **aes** — AES-128-ECB for URL path generation
-- **md-5** — MD5 hashing for key derivation
-
 ## License
 
 MIT

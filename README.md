@@ -268,3 +268,16 @@ src/
 ## License
 
 MIT
+
+## Disclaimer
+
+deezco is provided for **personal and educational use only**. By using this software you acknowledge and agree to the following:
+
+- **Authorized content only.** Only download music you are lawfully entitled to access — e.g. tracks available through your own Deezer account and personal library. This tool does not grant or convey any rights to the content it downloads; those rights remain with their respective owners.
+- **No redistribution.** Do not share, upload, or redistribute downloaded files. If you do not have the rights to a file, delete it.
+- **Anti-circumvention.** deezco decrypts Deezer's stream encryption. Depending on your jurisdiction, circumventing technical protection measures may violate applicable laws (including §1201 of the DMCA in the United States) and Deezer's Terms of Service. You are solely responsible for using this software in compliance with the laws that apply to you.
+- **No affiliation.** deezco is an independent project. It is not affiliated with, endorsed by, or connected to Deezer or any of its trademarks. "Deezer" and related names are the property of their respective owners.
+- **No content included.** This repository contains no copyrighted media. All audio is downloaded at runtime from Deezer's servers.
+- **As-is.** This software is provided "as is", without warranty of any kind. The authors are not liable for any damages arising from its use.
+
+This is not legal advice. If you are unsure whether your use is lawful, consult a qualified legal professional.

@@ -57,13 +57,15 @@ deezco [OPTIONS] [COMMAND]
 |------|-------------|---------|
 | `-o, --output <DIR>` | Output directory | OS Downloads folder (e.g. `~/Downloads`); override with `DEEZCO_OUTPUT_DIR` |
 | `-q, --quality <QUALITY>` | Audio quality: `flac`, `320`, `128` | `320` |
+| `--min-quality <QUALITY>` | Minimum acceptable quality: fail instead of silently falling back below it | |
 | `--arl <COOKIE>` | Deezer ARL cookie (overrides any stored login) | |
 | `-l, --limit <N>` | Number of search results to print (default `10`); also caps favorites JSON tracks (all when unset) | |
 | `--offset <N>` | Skip the first N tracks in favorites JSON output | `0` |
 | `-c, --concurrency <N>` | Number of parallel downloads (playlists, albums, favorites, artists) | `4` |
-| `--pick <N>` | Download the Nth search result (1-based) instead of printing the list | |
+| `--pick <N>` | Download the Nth search result (1-based) instead of printing the list; also picks a followed artist for `following` | |
 | `--json` | Print results as JSON instead of downloading: track/artist name searches print the raw API response; `playlist`, `album`, `favorites`, and `following` print their contents | |
 | `--output-format <FMT>` | JSON style used with `--json`: `pretty` or `compact` | `pretty` |
+| `--dry-run` | List what would be downloaded without writing to disk, showing the format each track would use (takes precedence over `--json` for download commands) | |
 | `-h, --help` | Print help | |
 | `-V, --version` | Print version | |
 
@@ -93,16 +95,20 @@ deezco
 deezco track https://www.deezer.com/en/track/3135556
 deezco track 3135556
 
-# Search by name — prints results with IDs, then download one
+# Search by name — prints results with IDs, the format each would use
+# (e.g. [FLAC], or [MP3_128 — FLAC unavailable] on a free account), sorted by
+# highest available quality (relevance order kept within equal quality)
 deezco track "Get Lucky"
 deezco track 3135556
 
-# ...or auto-download a result by its list position (1-based)
+# ...or auto-download a result by its list position (1-based, in the
+# quality-sorted order shown above)
 deezco --pick 1 track "Get Lucky"
 deezco -l 20 --pick 15 track "Get Lucky"
 
 # Machine-readable results for scripting
 # (use jq to extract IDs: jq -r '.data[].id')
+# The data array is sorted by highest available quality, like the list output
 deezco --json track "Get Lucky"
 deezco --json --output-format compact -l 5 track "Get Lucky" | jq -r '.data[].title'
 
@@ -134,14 +140,36 @@ deezco album 302127
 deezco -o ~/Music -q flac artist "Radiohead"
 
 # Download all releases from every artist you follow
+# (artists whose releases are already on disk are skipped)
 deezco following
 # ...or list them as JSON
 deezco --json following
+# ...or download just one followed artist (by 1-based list position)
+deezco --json following | jq -r '.artists[].name'
+deezco --pick 2 following
+
+# Fail instead of silently falling back below a quality floor
+deezco --min-quality flac track 3135556
+# Batch commands reject below-floor tracks but continue with the rest
+deezco -q flac --min-quality 320 playlist 908622995
+# Works with dry-run too: exit code 1 when the single track would fall below
+deezco --dry-run --min-quality flac --pick 1 track "Get Lucky"
 
 # Control parallelism (default 4)
 deezco -c 8 playlist 908622995
 # Artist discographies download in parallel too
 deezco -c 2 artist 27
+
+# Preview what a command would download, without touching disk.
+# Each line shows the format the track would actually use (e.g. [FLAC]),
+# including fallback when the requested format isn't available
+# (e.g. [MP3_128 — FLAC unavailable] on a free account).
+deezco --dry-run -q flac album 302127
+deezco --dry-run playlist 908622995
+deezco --dry-run artist 27
+deezco --dry-run favorites
+deezco --dry-run following
+deezco --dry-run --pick 1 track "Get Lucky"
 ```
 
 ### Output layout

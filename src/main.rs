@@ -9,8 +9,10 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use crate::api::DeezerApi;
-use crate::models::TrackFormat;
+use crate::models::{FollowedArtist, GwTrack, TrackFormat};
 
 #[derive(Parser)]
 #[command(name = "deezco", version, about = "Deezer music downloader CLI")]
@@ -25,6 +27,10 @@ struct Cli {
     /// Audio quality: flac, 320, 128
     #[arg(short, long, global = true, default_value = "320")]
     quality: String,
+
+    /// Minimum acceptable quality: fail instead of falling back below it
+    #[arg(long, global = true)]
+    min_quality: Option<String>,
 
     /// Deezer ARL cookie (overrides any stored login)
     #[arg(long, global = true)]
@@ -55,6 +61,10 @@ struct Cli {
     /// Print search results as JSON instead of the human-readable list
     #[arg(long, global = true)]
     json: bool,
+
+    /// List what would be downloaded without touching disk
+    #[arg(long, global = true)]
+    dry_run: bool,
 
     /// JSON output style used with --json
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Pretty)]
@@ -152,8 +162,65 @@ fn resolve_output_dir(cli_output: Option<PathBuf>, env_output: Option<PathBuf>) 
     cli_output.or(env_output).unwrap_or_else(default_output_dir)
 }
 
+/// Rank of the highest quality format available for a track (3=FLAC … 0=none)
+fn quality_rank(track: &GwTrack) -> u8 {
+    [TrackFormat::Flac, TrackFormat::Mp3_320, TrackFormat::Mp3_128]
+        .into_iter()
+        .find(|&fmt| track.filesize_for_format(fmt) > 0)
+        .map_or(0, TrackFormat::rank)
+}
+
+/// Result indices sorted by highest available quality. The sort is stable, so
+/// relevance order is kept within equal quality; results without a track ID
+/// (or missing from `by_id`) sort last.
+fn sort_by_quality(data: &[serde_json::Value], by_id: &HashMap<String, GwTrack>) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..data.len()).collect();
+    indices.sort_by_key(|&i| {
+        let rank = data[i]["id"]
+            .as_u64()
+            .and_then(|id| by_id.get(&id.to_string()))
+            .map(quality_rank)
+            .unwrap_or(0);
+        std::cmp::Reverse(rank)
+    });
+    indices
+}
+
+/// Reorder `results["data"]` by highest available quality (stable).
+fn sort_results_by_quality(results: &mut serde_json::Value, by_id: &HashMap<String, GwTrack>) {
+    if let Some(data) = results["data"].as_array_mut() {
+        let indices = sort_by_quality(data, by_id);
+        let sorted: Vec<serde_json::Value> =
+            indices.into_iter().map(|i| data[i].clone()).collect();
+        *data = sorted;
+    }
+}
+
+/// Fetch full track data (with filesizes) for the search results in one
+/// batched call, then return the quality-sorted indices and the track map.
+async fn quality_sorted_indices(
+    api: &DeezerApi,
+    data: &[serde_json::Value],
+) -> Result<(Vec<usize>, HashMap<String, GwTrack>)> {
+    let ids: Vec<String> = data
+        .iter()
+        .filter_map(|track| track["id"].as_u64())
+        .map(|id| id.to_string())
+        .collect();
+
+    let mut by_id: HashMap<String, GwTrack> = HashMap::new();
+    if !ids.is_empty() {
+        for track in api.get_tracks_by_ids(&ids).await? {
+            by_id.insert(track.id_str(), track);
+        }
+    }
+
+    Ok((sort_by_quality(data, &by_id), by_id))
+}
+
 /// Download a track from a URL or ID, or print search results for a name.
 /// Returns `false` when nothing was downloaded (search results shown).
+#[allow(clippy::too_many_arguments)]
 async fn download_track_query(
     api: &DeezerApi,
     query: &str,
@@ -162,16 +229,18 @@ async fn download_track_query(
     limit: u32,
     pick: Option<usize>,
     output_format: Option<OutputFormat>,
+    dry_run: bool,
+    min_format: Option<TrackFormat>,
 ) -> Result<bool> {
     // Already a URL or ID
     if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
         let id = extract_id(query, "track");
-        download::download_single_track(api, &id, format, output).await?;
+        download::download_single_track(api, &id, format, output, dry_run, min_format).await?;
         return Ok(true);
     }
 
     // Search for the track
-    let results = api.search_track(query, limit).await?;
+    let mut results = api.search_track(query, limit).await?;
 
     // Auto-download a specific result instead of printing
     if let Some(pick) = pick {
@@ -186,18 +255,23 @@ async fn download_track_query(
             println!("No result #{pick} — found {} track(s).", data.len());
             return Ok(false);
         }
-        let track = &data[pick - 1];
+        let (indices, _) = quality_sorted_indices(api, data).await?;
+        let track = &data[indices[pick - 1]];
         let id = track["id"].as_u64().unwrap_or(0).to_string();
         if id == "0" {
             println!("Result #{pick} has no track ID.");
             return Ok(false);
         }
-        download::download_single_track(api, &id, format, output).await?;
+        download::download_single_track(api, &id, format, output, dry_run, min_format).await?;
         return Ok(true);
     }
 
-    // Print the raw API response as JSON for scripting
+    // Print the raw API response as JSON for scripting, with the data array
+    // reordered by highest available quality to match the human-readable list
     if let Some(format) = output_format {
+        let data = results["data"].as_array().cloned().unwrap_or_default();
+        let (_, by_id) = quality_sorted_indices(api, &data).await?;
+        sort_results_by_quality(&mut results, &by_id);
         print_json(&results, format)?;
         return Ok(false);
     }
@@ -210,12 +284,27 @@ async fn download_track_query(
             return Ok(false);
         }
     };
+    let limited = &data[..data.len().min(limit as usize)];
+
+    // Fetch full track data (with filesizes) in one batched call, sort by
+    // highest available quality (stable, so relevance order holds within
+    // equal quality), and annotate each result with its format.
+    let (indices, by_id) = quality_sorted_indices(api, limited).await?;
+
     println!("Tracks matching '{query}':");
-    for (i, track) in data.iter().take(limit as usize).enumerate() {
+    for (position, &i) in indices.iter().enumerate() {
+        let track = &limited[i];
         let title = track["title"].as_str().unwrap_or("Unknown");
         let artist = track["artist"]["name"].as_str().unwrap_or("Unknown");
         let id = track["id"].as_u64().unwrap_or(0);
-        println!("  {:>2}. {} - {} (ID: {})", i + 1, artist, title, id);
+        let format = by_id
+            .get(&id.to_string())
+            .map(|full| download::format_annotation(full, format))
+            .unwrap_or_default();
+        println!(
+            "  {:>2}. {} - {} {} (ID: {})",
+            position + 1, artist, title, format, id
+        );
     }
     println!("\nRun `deezco track <ID>` to download one.");
     Ok(false)
@@ -233,11 +322,14 @@ async fn download_artist_query(
     pick: Option<usize>,
     output_format: Option<OutputFormat>,
     concurrency: usize,
+    dry_run: bool,
+    min_format: Option<TrackFormat>,
 ) -> Result<bool> {
     // Already a URL or ID
     if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
         let id = extract_id(query, "artist");
-        download::download_artist(api, &id, format, output, concurrency).await?;
+        download::download_artist(api, &id, format, output, concurrency, dry_run, min_format)
+            .await?;
         return Ok(true);
     }
 
@@ -263,7 +355,8 @@ async fn download_artist_query(
             println!("Result #{pick} has no artist ID.");
             return Ok(false);
         }
-        download::download_artist(api, &id, format, output, concurrency).await?;
+        download::download_artist(api, &id, format, output, concurrency, dry_run, min_format)
+            .await?;
         return Ok(true);
     }
 
@@ -332,9 +425,14 @@ async fn print_album_json(api: &DeezerApi, id: &str, format: OutputFormat) -> Re
 }
 
 /// Print followed artists as JSON instead of downloading
-async fn print_following_json(api: &DeezerApi, format: OutputFormat, user_id: u64) -> Result<()> {
-    let artists = api.get_followed_artists(user_id).await?;
+fn print_following_json(format: OutputFormat, artists: Vec<FollowedArtist>) -> Result<()> {
     print_json(&json!({ "type": "following", "artists": artists }), format)
+}
+
+/// Header line for a followed artist, including their release count
+fn artist_header(artist: &FollowedArtist) -> String {
+    let noun = if artist.nb_album == 1 { "album" } else { "albums" };
+    format!("--- {} ({} {}) ---", artist.name, artist.nb_album, noun)
 }
 
 /// Print favorite tracks as JSON instead of downloading.
@@ -372,6 +470,7 @@ async fn print_favorites_json(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = parse_format(&cli.quality);
+    let min_format = cli.min_quality.as_deref().map(parse_format);
     let output = resolve_output_dir(cli.output.clone(), env_output_dir());
 
     // No command: print help and exit
@@ -422,6 +521,8 @@ async fn main() -> Result<()> {
                 search_limit,
                 cli.pick,
                 json_output,
+                cli.dry_run,
+                min_format,
             )
             .await?
             {
@@ -433,15 +534,31 @@ async fn main() -> Result<()> {
             match json_output {
                 Some(fmt) => print_playlist_json(&api, &id, fmt).await?,
                 None => {
-                    download::download_playlist(&api, &id, format, &output, cli.concurrency)
-                        .await?;
+                    download::download_playlist(
+                        &api,
+                        &id,
+                        format,
+                        &output,
+                        cli.concurrency,
+                        cli.dry_run,
+                        min_format,
+                    )
+                    .await?;
                 }
             }
         }
         Commands::Favorites => match json_output {
             Some(fmt) => print_favorites_json(&api, fmt, cli.limit, cli.offset).await?,
             None => {
-                download::download_favorites(&api, format, &output, cli.concurrency).await?;
+                download::download_favorites(
+                    &api,
+                    format,
+                    &output,
+                    cli.concurrency,
+                    cli.dry_run,
+                    min_format,
+                )
+                .await?;
             }
         },
         Commands::Artist { query } => {
@@ -454,6 +571,8 @@ async fn main() -> Result<()> {
                 cli.pick,
                 json_output,
                 cli.concurrency,
+                cli.dry_run,
+                min_format,
             )
             .await?
             {
@@ -467,19 +586,59 @@ async fn main() -> Result<()> {
                 .await
                 .as_ref()
                 .map_or(0, |u| u.id);
+            let artists = api.get_followed_artists(user_id).await?;
+
+            // --pick: download a single followed artist's releases
+            if let Some(pick) = cli.pick {
+                if !(1..=artists.len()).contains(&pick) {
+                    println!(
+                        "No result #{pick} — found {} followed artist(s).",
+                        artists.len()
+                    );
+                    return Ok(());
+                }
+                let artist = &artists[pick - 1];
+                let art_id = artist.id.to_string();
+                println!("{}", artist_header(artist));
+                if download::is_artist_downloaded(&api, &art_id, &output).await? {
+                    println!("  [skip] Already on disk");
+                    return Ok(());
+                }
+                download::download_artist(
+                    &api,
+                    &art_id,
+                    format,
+                    &output,
+                    cli.concurrency,
+                    cli.dry_run,
+                    min_format,
+                )
+                .await?;
+                return Ok(());
+            }
+
             match json_output {
-                Some(fmt) => print_following_json(&api, fmt, user_id).await?,
+                Some(fmt) => print_following_json(fmt, artists)?,
                 None => {
-                    let artists = api.get_followed_artists(user_id).await?;
-                    println!("Downloading releases from {} followed artist(s)\n", artists.len());
+                    println!(
+                        "Downloading releases from {} followed artist(s)\n",
+                        artists.len()
+                    );
                     for artist in &artists {
-                        println!("--- {} ---", artist.name);
+                        println!("{}", artist_header(artist));
+                        let art_id = artist.id.to_string();
+                        if download::is_artist_downloaded(&api, &art_id, &output).await? {
+                            println!("  [skip] Already on disk");
+                            continue;
+                        }
                         download::download_artist(
                             &api,
-                            &artist.id.to_string(),
+                            &art_id,
                             format,
                             &output,
                             cli.concurrency,
+                            cli.dry_run,
+                            min_format,
                         )
                         .await?;
                     }
@@ -491,7 +650,16 @@ async fn main() -> Result<()> {
             match json_output {
                 Some(fmt) => print_album_json(&api, &id, fmt).await?,
                 None => {
-                    download::download_album(&api, &id, format, &output, cli.concurrency).await?;
+                    download::download_album(
+                        &api,
+                        &id,
+                        format,
+                        &output,
+                        cli.concurrency,
+                        cli.dry_run,
+                        min_format,
+                    )
+                    .await?;
                 }
             }
         }
@@ -507,6 +675,97 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A track with the given reported filesizes (0 = unavailable)
+    fn track_with_filesizes(flac: u64, mp3_320: u64, mp3_128: u64) -> GwTrack {
+        GwTrack {
+            sng_id: serde_json::json!(1),
+            sng_title: Some("Test".to_string()),
+            md5_origin: Some("md5".to_string()),
+            media_version: Some(serde_json::json!(1)),
+            art_name: Some("Artist".to_string()),
+            art_id: Some(serde_json::json!(1)),
+            track_token: None,
+            filesize_mp3_128: Some(serde_json::json!(mp3_128)),
+            filesize_mp3_320: Some(serde_json::json!(mp3_320)),
+            filesize_flac: Some(serde_json::json!(flac)),
+        }
+    }
+
+    #[test]
+    fn quality_rank_orders_formats() {
+        let flac = track_with_filesizes(100, 100, 100);
+        let mp3_320 = track_with_filesizes(0, 100, 100);
+        let mp3_128 = track_with_filesizes(0, 0, 100);
+        let none = track_with_filesizes(0, 0, 0);
+
+        assert_eq!(quality_rank(&flac), 3);
+        assert_eq!(quality_rank(&mp3_320), 2);
+        assert_eq!(quality_rank(&mp3_128), 1);
+        assert_eq!(quality_rank(&none), 0);
+    }
+
+    #[test]
+    fn sort_by_quality_orders_by_rank_stably() {
+        let by_id = HashMap::from([
+            ("1".to_string(), track_with_filesizes(0, 0, 100)),
+            ("2".to_string(), track_with_filesizes(100, 100, 100)),
+            ("3".to_string(), track_with_filesizes(0, 100, 100)),
+            ("4".to_string(), track_with_filesizes(100, 100, 100)),
+        ]);
+        let data: Vec<serde_json::Value> = (1..=4)
+            .map(|i| serde_json::json!({ "id": i, "title": format!("t{i}") }))
+            .collect();
+
+        // 2 and 4 both rank 3 (FLAC): their original order (2 before 4) is kept,
+        // then rank 2 (id 3), then rank 1 (id 1)
+        assert_eq!(sort_by_quality(&data, &by_id), vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn sort_results_by_quality_reorders_the_data_array() {
+        let by_id = HashMap::from([
+            ("1".to_string(), track_with_filesizes(0, 0, 100)),
+            ("2".to_string(), track_with_filesizes(100, 100, 100)),
+            ("3".to_string(), track_with_filesizes(0, 100, 100)),
+        ]);
+        let mut results = serde_json::json!({
+            "data": [
+                { "id": 1, "title": "low" },
+                { "id": 2, "title": "high" },
+                { "id": 3, "title": "mid" },
+            ],
+            "total": 3,
+            "next": "https://example.com/next",
+        });
+
+        sort_results_by_quality(&mut results, &by_id);
+
+        let titles: Vec<&str> = results["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["high", "mid", "low"]);
+        // Envelope fields are untouched
+        assert_eq!(results["total"], serde_json::json!(3));
+        assert_eq!(
+            results["next"],
+            serde_json::json!("https://example.com/next")
+        );
+    }
+
+    #[test]
+    fn sort_by_quality_puts_missing_ids_last() {
+        let by_id = HashMap::from([("2".to_string(), track_with_filesizes(0, 100, 100))]);
+        let data: Vec<serde_json::Value> = (1..=3)
+            .map(|i| serde_json::json!({ "id": i, "title": format!("t{i}") }))
+            .collect();
+
+        // Only id 2 has data (rank 2); ids 1 and 3 rank 0 and keep their order
+        assert_eq!(sort_by_quality(&data, &by_id), vec![1, 0, 2]);
+    }
 
     #[test]
     fn parse_format_maps_quality_names_and_codes() {

@@ -11,6 +11,9 @@ pub struct CurrentUser {
 pub struct FollowedArtist {
     pub id: u64,
     pub name: String,
+    /// Number of releases, as reported by the public API
+    #[serde(default)]
+    pub nb_album: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +122,15 @@ pub enum TrackFormat {
 }
 
 impl TrackFormat {
+    /// Quality rank used for comparisons: FLAC=3, MP3_320=2, MP3_128=1
+    pub fn rank(self) -> u8 {
+        match self {
+            TrackFormat::Flac => 3,
+            TrackFormat::Mp3_320 => 2,
+            TrackFormat::Mp3_128 => 1,
+        }
+    }
+
     pub fn code(&self) -> u32 {
         match self {
             TrackFormat::Flac => 9,
@@ -154,5 +166,76 @@ impl TrackFormat {
 impl std::fmt::Display for TrackFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.api_name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn followed_artist_parses_full_payload() {
+        let artist: FollowedArtist = serde_json::from_value(serde_json::json!({
+            "id": 2529,
+            "name": "Daft Punk",
+            "nb_album": 4,
+        }))
+        .unwrap();
+
+        assert_eq!(artist.id, 2529);
+        assert_eq!(artist.name, "Daft Punk");
+        assert_eq!(artist.nb_album, 4);
+    }
+
+    #[test]
+    fn followed_artist_defaults_missing_album_count() {
+        let artist: FollowedArtist = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "name": "Some Artist",
+        }))
+        .unwrap();
+
+        assert_eq!(artist.id, 42);
+        assert_eq!(artist.name, "Some Artist");
+        assert_eq!(artist.nb_album, 0);
+    }
+
+    #[test]
+    fn followed_artist_ignores_unknown_fields() {
+        let artist: FollowedArtist = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "name": "Artist",
+            "nb_album": 2,
+            "picture": "https://e-cdn-images.dzcdn.net/images/artist/x/500x500.jpg",
+            "link": "https://www.deezer.com/artist/7",
+        }))
+        .unwrap();
+
+        assert_eq!(artist.id, 7);
+        assert_eq!(artist.name, "Artist");
+        assert_eq!(artist.nb_album, 2);
+    }
+
+    #[test]
+    fn track_format_rank_orders_qualities() {
+        assert!(TrackFormat::Flac.rank() > TrackFormat::Mp3_320.rank());
+        assert!(TrackFormat::Mp3_320.rank() > TrackFormat::Mp3_128.rank());
+        assert_eq!(TrackFormat::Flac.rank(), 3);
+        assert_eq!(TrackFormat::Mp3_320.rank(), 2);
+        assert_eq!(TrackFormat::Mp3_128.rank(), 1);
+    }
+
+    #[test]
+    fn followed_artist_serializes_with_album_count() {
+        let artist = FollowedArtist {
+            id: 27,
+            name: "Test Artist".to_string(),
+            nb_album: 3,
+        };
+        let value = serde_json::to_value(&artist).unwrap();
+
+        assert_eq!(value["id"], serde_json::json!(27));
+        assert_eq!(value["name"], serde_json::json!("Test Artist"));
+        assert_eq!(value["nb_album"], serde_json::json!(3));
     }
 }

@@ -421,6 +421,18 @@ impl DeezerApi {
             .await
     }
 
+    pub async fn search_track(&self, query: &str) -> Result<Value> {
+        let result = self
+            .client
+            .get(format!("{}/search/track", PUBLIC_API_URL))
+            .query(&[("q", query), ("limit", "10")])
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(result)
+    }
+
     pub async fn search_artist(&self, query: &str) -> Result<Value> {
         let result = self
             .client

@@ -42,7 +42,7 @@ deezco [OPTIONS] [COMMAND]
 
 | Command | Description |
 |-------------|----------------------------------------------|
-| `track` | Download a track by URL or ID |
+| `track` | Download a track by URL, ID, or search name |
 | `playlist` | Download a playlist by URL or ID |
 | `favorites` | Download your liked/favorite songs |
 | `artist` | Download all songs from an artist |
@@ -83,6 +83,7 @@ deezco
 # Download a single track
 deezco track https://www.deezer.com/en/track/3135556
 deezco track 3135556
+deezco track "Get Lucky"
 
 # Download a playlist
 deezco playlist https://www.deezer.com/en/playlist/908622995

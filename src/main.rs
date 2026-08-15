@@ -29,10 +29,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download a track by URL or ID
+    /// Download a track by URL, ID, or search name
     Track {
-        /// Deezer track URL or track ID
-        url: String,
+        /// Deezer track URL, track ID, or search name
+        query: String,
     },
     /// Download a playlist by URL or ID
     Playlist {
@@ -133,10 +133,11 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &Path) -
         match selection {
             0 => {
                 let input: String = Input::new()
-                    .with_prompt("Enter track URL or ID")
+                    .with_prompt("Enter track URL, ID, or search")
                     .interact_text()?;
-                let id = extract_id(&input, "track");
-                download::download_single_track(api, &id, format, output).await?;
+                if !download_track_query(api, &input, format, output).await? {
+                    continue;
+                }
             }
             1 => {
                 // Show user playlists or enter URL
@@ -208,6 +209,51 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &Path) -
         }
     }
     Ok(())
+}
+
+/// Download a track from a URL, ID, or search query.
+/// Returns `false` when the query is a name with no matching results.
+async fn download_track_query(
+    api: &DeezerApi,
+    query: &str,
+    format: TrackFormat,
+    output: &Path,
+) -> Result<bool> {
+    // Already a URL or ID
+    if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
+        let id = extract_id(query, "track");
+        download::download_single_track(api, &id, format, output).await?;
+        return Ok(true);
+    }
+
+    // Search for tracks and let the user pick one
+    let results = api.search_track(query).await?;
+    let data = match results["data"].as_array() {
+        Some(data) if !data.is_empty() => data,
+        _ => {
+            println!("No tracks found for '{}'.", query);
+            return Ok(false);
+        }
+    };
+
+    let names: Vec<String> = data
+        .iter()
+        .map(|track| {
+            let title = track["title"].as_str().unwrap_or("Unknown");
+            let artist = track["artist"]["name"].as_str().unwrap_or("Unknown");
+            format!("{artist} - {title}")
+        })
+        .collect();
+
+    let sel = Select::new()
+        .with_prompt("Select a track")
+        .items(&names)
+        .default(0)
+        .interact()?;
+
+    let track_id = data[sel]["id"].as_u64().unwrap_or(0).to_string();
+    download::download_single_track(api, &track_id, format, output).await?;
+    Ok(true)
 }
 
 /// Download an artist from a URL, ID, or search query.
@@ -282,9 +328,10 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Track { url }) => {
-            let id = extract_id(&url, "track");
-            download::download_single_track(&api, &id, format, &output).await?;
+        Some(Commands::Track { query }) => {
+            if !download_track_query(&api, &query, format, &output).await? {
+                return Ok(());
+            }
         }
         Some(Commands::Playlist { url }) => {
             let id = extract_id(&url, "playlist");

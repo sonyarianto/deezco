@@ -63,7 +63,7 @@ deezco [OPTIONS] [COMMAND]
 | `--exact <QUALITY>` | Shorthand for `--min-quality` + `--max-quality`: download exactly this quality, no fallback (overrides both flags) | |
 | `--preview` | Download 30-second previews instead of full tracks | |
 | `--preview-and-full` | Download both the 30-second preview and the full track (implies `--preview`) | |
-| `--show-defaults` | Print the effective defaults for every setting (quality resolution, preview mode, sort, output dir, ARL source), then exit without logging in or touching the network | |
+| `--show-defaults` | Print the effective defaults for every setting (quality resolution, preview mode, sort, output dir, ARL source), then exit without logging in or touching the network; with `--json` the same values are emitted as JSON | |
 | `--arl <COOKIE>` | Deezer ARL cookie (overrides any stored login) | |
 | `-l, --limit <N>` | Number of search results to print (default `10`); also caps favorites JSON tracks (all when unset) | |
 | `--offset <N>` | Skip the first N tracks in favorites JSON output | `0` |

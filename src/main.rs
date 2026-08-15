@@ -248,7 +248,7 @@ fn direction(sort_dir: Option<SortDir>, natural_desc: bool) -> bool {
 
 /// Print the effective defaults for every setting. Runs before any login or
 /// network access, so `deezco --show-defaults` works offline and never
-/// touches disk.
+/// touches disk. With `--json` the same values are emitted as JSON instead.
 fn print_defaults(
     cli: &Cli,
     format: TrackFormat,
@@ -257,68 +257,120 @@ fn print_defaults(
     options: download::DownloadOptions,
     output: &Path,
     sort: SortKey,
-) {
+) -> Result<()> {
     let fmt_opt = |opt: Option<TrackFormat>| match opt {
         Some(fmt) => fmt.to_string(),
         None => "none".to_string(),
     };
-    let preview_label = if options.preview_and_full {
-        "preview + full (--preview-and-full)"
+    let preview = if options.preview_and_full {
+        "preview_and_full"
     } else if options.preview {
-        "preview only (--preview)"
+        "preview"
     } else {
-        "full track only"
+        "full"
     };
-    let sort_label = match sort {
+    let preview_label = match preview {
+        "preview_and_full" => "preview + full (--preview-and-full)",
+        "preview" => "preview only (--preview)",
+        _ => "full track only",
+    };
+    let sort_key = match sort {
         SortKey::Quality => "quality",
         SortKey::Relevance => "relevance",
         SortKey::Duration => "duration",
     };
-    let sort_dir_label = match sort {
+    let (sort_direction, sort_dir_label) = match sort {
         SortKey::Quality => {
-            if direction(cli.sort_dir, true) {
-                "best first (desc)"
-            } else {
-                "lowest first (asc)"
-            }
+            let desc = direction(cli.sort_dir, true);
+            (
+                Some(if desc { "desc" } else { "asc" }),
+                if desc {
+                    "best first (desc)"
+                } else {
+                    "lowest first (asc)"
+                },
+            )
         }
         SortKey::Duration => {
-            if direction(cli.sort_dir, false) {
-                "longest first (desc)"
-            } else {
-                "shortest first (asc)"
-            }
+            let desc = direction(cli.sort_dir, false);
+            (
+                Some(if desc { "desc" } else { "asc" }),
+                if desc {
+                    "longest first (desc)"
+                } else {
+                    "shortest first (asc)"
+                },
+            )
         }
-        SortKey::Relevance => "API order (--sort-dir has no effect)",
-    };
-    let json_label = if cli.json {
-        match cli.output_format {
-            OutputFormat::Pretty => "pretty JSON (--json)",
-            OutputFormat::Compact => "compact JSON (--json --output-format compact)",
-        }
-    } else {
-        "off (human-readable output)"
+        SortKey::Relevance => (None, "API order (--sort-dir has no effect)"),
     };
     let output_source = if cli.output.is_some() {
-        "(--output)"
+        "flag"
     } else if env_output_dir().is_some() {
-        "(DEEZCO_OUTPUT_DIR)"
+        "env"
     } else {
-        "(default)"
+        "default"
+    };
+    let output_source_label = match output_source {
+        "flag" => "(--output)",
+        "env" => "(DEEZCO_OUTPUT_DIR)",
+        _ => "(default)",
     };
     let arl_source = if cli.arl.is_some() {
-        "--arl flag"
+        "flag"
     } else if std::env::var("DEEZCO_ARL")
         .ok()
         .filter(|value| !value.is_empty())
         .is_some()
     {
-        "DEEZCO_ARL environment variable"
+        "env"
     } else if auth::config_dir().join(".arl").exists() {
-        "stored login"
+        "stored"
     } else {
-        "none (will prompt interactively)"
+        "none"
     };
+    let arl_source_label = match arl_source {
+        "flag" => "--arl flag",
+        "env" => "DEEZCO_ARL environment variable",
+        "stored" => "stored login",
+        _ => "none (will prompt interactively)",
+    };
+    let json_output = if cli.json {
+        match cli.output_format {
+            OutputFormat::Pretty => "pretty",
+            OutputFormat::Compact => "compact",
+        }
+    } else {
+        "off"
+    };
+    let json_label = match json_output {
+        "pretty" => "pretty JSON (--json)",
+        "compact" => "compact JSON (--json --output-format compact)",
+        _ => "off (human-readable output)",
+    };
+
+    let value = json!({
+        "requested_quality": cli.quality,
+        "min_quality": min_format.map(|fmt| fmt.to_string()),
+        "max_quality": max_format.map(|fmt| fmt.to_string()),
+        "exact_quality": cli.exact.as_deref().map(parse_format).map(|fmt| fmt.to_string()),
+        "effective_quality": format.to_string(),
+        "preview": preview,
+        "sort_key": sort_key,
+        "sort_direction": sort_direction,
+        "output": output.display().to_string(),
+        "output_source": output_source,
+        "concurrency": cli.concurrency,
+        "dry_run": cli.dry_run,
+        "search_limit": cli.limit.unwrap_or(10),
+        "json_output": json_output,
+        "arl_source": arl_source,
+    });
+
+    if cli.json {
+        print_json(&value, cli.output_format)?;
+        return Ok(());
+    }
 
     println!("Effective defaults (no login or network needed):");
     println!(
@@ -333,9 +385,13 @@ fn print_defaults(
     }
     println!("  Effective quality:  {}", format);
     println!("  Preview:            {}", preview_label);
-    println!("  Sort key:           {}", sort_label);
+    println!("  Sort key:           {}", sort_key);
     println!("  Sort direction:     {}", sort_dir_label);
-    println!("  Output dir:         {} {}", output.display(), output_source);
+    println!(
+        "  Output dir:         {} {}",
+        output.display(),
+        output_source_label
+    );
     println!("  Concurrency:        {}", cli.concurrency);
     println!(
         "  Dry run:            {}",
@@ -346,7 +402,8 @@ fn print_defaults(
         cli.limit.unwrap_or(10)
     );
     println!("  JSON output:        {}", json_label);
-    println!("  ARL:                {}", arl_source);
+    println!("  ARL:                {}", arl_source_label);
+    Ok(())
 }
 
 /// Result indices sorted by available quality (stable, so relevance order is
@@ -893,7 +950,7 @@ async fn main() -> Result<()> {
     // --show-defaults: print the effective settings and exit before any
     // login, network access, or disk writes
     if cli.show_defaults {
-        print_defaults(&cli, format, min_format, max_format, options, &output, sort);
+        print_defaults(&cli, format, min_format, max_format, options, &output, sort)?;
         return Ok(());
     }
 

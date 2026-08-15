@@ -305,12 +305,8 @@ async fn get_download_url(
     }
 
     let actual_format = available_format(track, current_format);
-    let url = crypto::generate_crypted_stream_url(
-        &sng_id,
-        &md5,
-        &media_version,
-        actual_format.code(),
-    );
+    let url =
+        crypto::generate_crypted_stream_url(&sng_id, &md5, &media_version, actual_format.code());
     Ok((url, actual_format))
 }
 
@@ -331,7 +327,8 @@ async fn download_to_file(api: &DeezerApi, url: &str, filepath: &Path) -> Result
     let mut file = tokio::fs::File::create(filepath).await?;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        file.write_all(&chunk.context("Error reading preview stream")?).await?;
+        file.write_all(&chunk.context("Error reading preview stream")?)
+            .await?;
     }
     file.flush().await?;
     Ok(())
@@ -552,22 +549,14 @@ fn dry_run_track_label(track: &GwTrack, options: DownloadOptions) -> String {
 /// Tracks below `--min-quality` are flagged instead of listed as downloadable.
 /// In preview modes, format checks don't apply and lines are marked
 /// `[preview]` or `[preview + full]`.
-fn print_dry_run_tracks(
-    header: &str,
-    tracks: &[GwTrack],
-    options: DownloadOptions,
-) {
+fn print_dry_run_tracks(header: &str, tracks: &[GwTrack], options: DownloadOptions) {
     if options.preview {
         let kind = if options.preview_and_full {
             "preview + full"
         } else {
             "preview"
         };
-        println!(
-            "[dry-run] {header} ({} track(s), {})\n",
-            tracks.len(),
-            kind
-        );
+        println!("[dry-run] {header} ({} track(s), {})\n", tracks.len(), kind);
         for (i, track) in tracks.iter().enumerate() {
             println!(
                 "  [{}/{}] {}",
@@ -682,11 +671,7 @@ pub async fn download_favorites(
         } else {
             options.format.api_name()
         };
-        println!(
-            "[dry-run] Favorites ({} track(s), {})\n",
-            ids.len(),
-            kind
-        );
+        println!("[dry-run] Favorites ({} track(s), {})\n", ids.len(), kind);
         let mut index = 0;
         let mut rejected = 0;
         for batch in ids.chunks(50) {
@@ -1092,8 +1077,7 @@ mod tests {
 
     impl TestDir {
         fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("deezco-download-test-{name}"));
+            let path = std::env::temp_dir().join(format!("deezco-download-test-{name}"));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -1208,7 +1192,10 @@ mod tests {
     #[test]
     fn available_format_prefers_requested_when_available() {
         let track = track_with_filesizes(100, 100, 100);
-        assert_eq!(available_format(&track, TrackFormat::Flac), TrackFormat::Flac);
+        assert_eq!(
+            available_format(&track, TrackFormat::Flac),
+            TrackFormat::Flac
+        );
         assert_eq!(
             available_format(&track, TrackFormat::Mp3_320),
             TrackFormat::Mp3_320
@@ -1238,7 +1225,10 @@ mod tests {
     #[test]
     fn available_format_keeps_requested_when_none_available() {
         let track = track_with_filesizes(0, 0, 0);
-        assert_eq!(available_format(&track, TrackFormat::Flac), TrackFormat::Flac);
+        assert_eq!(
+            available_format(&track, TrackFormat::Flac),
+            TrackFormat::Flac
+        );
     }
 
     #[test]

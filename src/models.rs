@@ -109,7 +109,6 @@ impl GwTrack {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumInfo {
     #[serde(rename = "ALB_ID")]
@@ -147,11 +146,7 @@ impl TrackFormat {
 
     /// Cap this format to at most `cap` quality (e.g. FLAC capped by 320 → MP3_320)
     pub fn capped_by(self, cap: TrackFormat) -> TrackFormat {
-        if self.rank() > cap.rank() {
-            cap
-        } else {
-            self
-        }
+        if self.rank() > cap.rank() { cap } else { self }
     }
 
     pub fn code(&self) -> u32 {
@@ -241,11 +236,26 @@ mod tests {
 
     #[test]
     fn track_format_capped_by_never_exceeds_the_cap() {
-        assert_eq!(TrackFormat::Flac.capped_by(TrackFormat::Mp3_320), TrackFormat::Mp3_320);
-        assert_eq!(TrackFormat::Flac.capped_by(TrackFormat::Mp3_128), TrackFormat::Mp3_128);
-        assert_eq!(TrackFormat::Mp3_320.capped_by(TrackFormat::Flac), TrackFormat::Mp3_320);
-        assert_eq!(TrackFormat::Mp3_320.capped_by(TrackFormat::Mp3_320), TrackFormat::Mp3_320);
-        assert_eq!(TrackFormat::Mp3_128.capped_by(TrackFormat::Flac), TrackFormat::Mp3_128);
+        assert_eq!(
+            TrackFormat::Flac.capped_by(TrackFormat::Mp3_320),
+            TrackFormat::Mp3_320
+        );
+        assert_eq!(
+            TrackFormat::Flac.capped_by(TrackFormat::Mp3_128),
+            TrackFormat::Mp3_128
+        );
+        assert_eq!(
+            TrackFormat::Mp3_320.capped_by(TrackFormat::Flac),
+            TrackFormat::Mp3_320
+        );
+        assert_eq!(
+            TrackFormat::Mp3_320.capped_by(TrackFormat::Mp3_320),
+            TrackFormat::Mp3_320
+        );
+        assert_eq!(
+            TrackFormat::Mp3_128.capped_by(TrackFormat::Flac),
+            TrackFormat::Mp3_128
+        );
     }
 
     #[test]

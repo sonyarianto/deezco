@@ -76,13 +76,7 @@ impl DeezerApi {
         }
 
         // Extract user info
-        let options = &user_data["USER"]["OPTIONS"];
-        let license_token = options["license_token"].as_str().unwrap_or("").to_string();
-        let can_stream_hq = options["web_hq"].as_bool().unwrap_or(false)
-            || options["mobile_hq"].as_bool().unwrap_or(false);
-        let can_stream_lossless = options["web_lossless"].as_bool().unwrap_or(false)
-            || options["mobile_lossless"].as_bool().unwrap_or(false);
-        let country = options["license_country"]
+        let license_token = user_data["USER"]["OPTIONS"]["license_token"]
             .as_str()
             .unwrap_or("")
             .to_string();
@@ -96,21 +90,12 @@ impl DeezerApi {
             .as_str()
             .unwrap_or("Unknown")
             .to_string();
-        let loved_tracks_id = match &user_data["USER"]["LOVEDTRACKS_ID"] {
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            Value::String(s) => s.parse().unwrap_or(0),
-            _ => 0,
-        };
 
         let mut cu = self.current_user.lock().await;
         *cu = Some(CurrentUser {
             id: uid,
             name,
             license_token,
-            can_stream_hq,
-            can_stream_lossless,
-            country,
-            loved_tracks_id,
         });
 
         Ok(true)

@@ -47,6 +47,8 @@ pub struct GwTrack {
     pub filesize_mp3_320: Option<serde_json::Value>,
     #[serde(rename = "FILESIZE_FLAC")]
     pub filesize_flac: Option<serde_json::Value>,
+    #[serde(rename = "DURATION")]
+    pub duration: Option<serde_json::Value>,
 }
 
 impl GwTrack {
@@ -82,6 +84,15 @@ impl GwTrack {
 
     pub fn display_name(&self) -> String {
         format!("{} - {}", self.artist(), self.title())
+    }
+
+    /// Track length in seconds (0 when unknown)
+    pub fn duration_secs(&self) -> u64 {
+        match &self.duration {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+            Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        }
     }
 
     pub fn filesize_for_format(&self, format: TrackFormat) -> u64 {

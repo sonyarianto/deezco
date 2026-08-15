@@ -241,6 +241,19 @@ impl DeezerApi {
         Ok(track)
     }
 
+    /// The 30-second preview MP3 URL for a track, via the public API
+    /// (None when the track has no preview).
+    pub async fn get_track_preview(&self, track_id: &str) -> Result<Option<String>> {
+        let result: Value = self
+            .client
+            .get(format!("{}/track/{}", PUBLIC_API_URL, track_id))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(result["preview"].as_str().map(|url| url.to_string()))
+    }
+
     // ========== Playlist operations ==========
 
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<GwTrack>> {

@@ -11,6 +11,19 @@ use crate::api::DeezerApi;
 use crate::crypto;
 use crate::models::*;
 
+/// Quality and format settings shared by every download command.
+#[derive(Clone, Copy)]
+pub struct DownloadOptions {
+    /// Requested audio quality
+    pub format: TrackFormat,
+    /// Minimum acceptable quality (fail instead of falling back below it)
+    pub min_format: Option<TrackFormat>,
+    /// Download the 30-second preview instead of the full track
+    pub preview: bool,
+    /// Download both the preview and the full track (implies `preview`)
+    pub preview_and_full: bool,
+}
+
 /// Sanitize a filename by removing/replacing invalid characters
 fn sanitize_filename(name: &str) -> String {
     name.chars()
@@ -302,13 +315,34 @@ async fn get_download_url(
 }
 
 /// Download and decrypt a single track
+/// Download a plain (non-encrypted) URL to a file, used for previews.
+async fn download_to_file(api: &DeezerApi, url: &str, filepath: &Path) -> Result<()> {
+    let response = api
+        .client()
+        .get(url)
+        .send()
+        .await
+        .context("Failed to download preview")?;
+
+    if !response.status().is_success() {
+        bail!("Preview download failed with status: {}", response.status());
+    }
+
+    let mut file = tokio::fs::File::create(filepath).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        file.write_all(&chunk.context("Error reading preview stream")?).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
 pub async fn download_track(
     api: &DeezerApi,
     track: &GwTrack,
-    format: TrackFormat,
     output_dir: &Path,
     show_progress: bool,
-    min_format: Option<TrackFormat>,
+    options: DownloadOptions,
 ) -> Result<PathBuf> {
     let artist = sanitize_filename(&track.artist());
     let title = sanitize_filename(&track.title());
@@ -318,29 +352,48 @@ pub async fn download_track(
         bail!("Invalid track data");
     }
 
+    // Ensure the destination directory exists. Callers pass the final
+    // destination (e.g. <output>/Artist for single tracks, <output>/Artist/
+    // <Album> for albums), so no artist folder is added here.
+    fs::create_dir_all(output_dir).await?;
+
+    // 30-second preview: a plain MP3, no format negotiation or decryption.
+    // In preview-and-full mode it's saved alongside the full track.
+    if options.preview {
+        let filename = format!("{} - {} (preview).mp3", artist, title);
+        let filepath = output_dir.join(&filename);
+        if !filepath.exists() {
+            let url = match api.get_track_preview(&sng_id).await? {
+                Some(url) => url,
+                None => bail!("Track has no preview available"),
+            };
+            download_to_file(api, &url, &filepath).await?;
+        } else if show_progress {
+            println!("  [skip] {} (already exists)", filename);
+        }
+        if !options.preview_and_full {
+            return Ok(filepath);
+        }
+    }
+
     // Get download URL
-    let (url, actual_format) = get_download_url(api, track, format).await?;
+    let (url, actual_format) = get_download_url(api, track, options.format).await?;
 
     // Refuse to silently fall back below the minimum quality
-    if let Some(min) = min_format
+    if let Some(min) = options.min_format
         && actual_format.rank() < min.rank()
     {
         bail!(
             "Requested {} but only {} is available (below --min-quality {})",
-            format,
+            options.format,
             actual_format,
             min
         );
     }
 
     let extension = actual_format.extension();
-
-    // Create output directory
-    let track_dir = output_dir.join(sanitize_filename(&artist));
-    fs::create_dir_all(&track_dir).await?;
-
     let filename = format!("{} - {}{}", artist, title, extension);
-    let filepath = track_dir.join(&filename);
+    let filepath = output_dir.join(&filename);
 
     // Skip if already exists
     if filepath.exists() {
@@ -427,15 +480,14 @@ pub async fn download_track(
 async fn download_tracks_concurrently(
     api: &DeezerApi,
     jobs: &[(PathBuf, GwTrack)],
-    format: TrackFormat,
     concurrency: usize,
-    min_format: Option<TrackFormat>,
+    options: DownloadOptions,
 ) -> Vec<(String, Result<PathBuf>)> {
     stream::iter(jobs.iter().cloned().map(|(dir, track)| {
         let api = api.clone();
         let display = track.display_name();
         async move {
-            let outcome = download_track(&api, &track, format, &dir, false, min_format).await;
+            let outcome = download_track(&api, &track, &dir, false, options).await;
             (display, outcome)
         }
     }))
@@ -480,28 +532,62 @@ pub(crate) fn format_annotation(track: &GwTrack, format: TrackFormat) -> String 
     }
 }
 
-/// Track label for dry-run output, showing the format it would use
-fn dry_run_track_label(track: &GwTrack, format: TrackFormat) -> String {
-    format!("{} {}", track.display_name(), format_annotation(track, format))
+/// Track label for dry-run output: the format it would use, `[preview]` for
+/// sample-only downloads, or `[preview + full]` for both.
+fn dry_run_track_label(track: &GwTrack, options: DownloadOptions) -> String {
+    if options.preview_and_full {
+        format!("{} [preview + full]", track.display_name())
+    } else if options.preview {
+        format!("{} [preview]", track.display_name())
+    } else {
+        format!(
+            "{} {}",
+            track.display_name(),
+            format_annotation(track, options.format)
+        )
+    }
 }
 
 /// Print the tracks a download would fetch, without downloading.
 /// Tracks below `--min-quality` are flagged instead of listed as downloadable.
+/// In preview modes, format checks don't apply and lines are marked
+/// `[preview]` or `[preview + full]`.
 fn print_dry_run_tracks(
     header: &str,
     tracks: &[GwTrack],
-    format: TrackFormat,
-    min_format: Option<TrackFormat>,
+    options: DownloadOptions,
 ) {
+    if options.preview {
+        let kind = if options.preview_and_full {
+            "preview + full"
+        } else {
+            "preview"
+        };
+        println!(
+            "[dry-run] {header} ({} track(s), {})\n",
+            tracks.len(),
+            kind
+        );
+        for (i, track) in tracks.iter().enumerate() {
+            println!(
+                "  [{}/{}] {}",
+                i + 1,
+                tracks.len(),
+                dry_run_track_label(track, options)
+            );
+        }
+        return;
+    }
+
     println!(
         "[dry-run] {header} ({} track(s), {})\n",
         tracks.len(),
-        format
+        options.format
     );
     let mut rejected = 0;
     for (i, track) in tracks.iter().enumerate() {
-        let actual = available_format(track, format);
-        match min_format {
+        let actual = available_format(track, options.format);
+        match options.min_format {
             Some(min) if actual.rank() < min.rank() => {
                 rejected += 1;
                 println!(
@@ -518,7 +604,7 @@ fn print_dry_run_tracks(
                     "  [{}/{}] {}",
                     i + 1,
                     tracks.len(),
-                    dry_run_track_label(track, format)
+                    dry_run_track_label(track, options)
                 );
             }
         }
@@ -535,11 +621,10 @@ fn print_dry_run_tracks(
 pub async fn download_playlist(
     api: &DeezerApi,
     playlist_id: &str,
-    format: TrackFormat,
+    options: DownloadOptions,
     output_dir: &Path,
     concurrency: usize,
     dry_run: bool,
-    min_format: Option<TrackFormat>,
 ) -> Result<()> {
     // Get playlist info
     let info = api.get_playlist_info(playlist_id).await?;
@@ -553,12 +638,7 @@ pub async fn download_playlist(
     let total = tracks.len();
 
     if dry_run {
-        print_dry_run_tracks(
-            &format!("Playlist: {}", playlist_name),
-            &tracks,
-            format,
-            min_format,
-        );
+        print_dry_run_tracks(&format!("Playlist: {}", playlist_name), &tracks, options);
         return Ok(());
     }
 
@@ -568,7 +648,7 @@ pub async fn download_playlist(
         .into_iter()
         .map(|track| (playlist_dir.clone(), track))
         .collect();
-    let results = download_tracks_concurrently(api, &jobs, format, concurrency, min_format).await;
+    let results = download_tracks_concurrently(api, &jobs, concurrency, options).await;
     let (downloaded, failed) = summarize_downloads(results);
 
     println!(
@@ -581,11 +661,10 @@ pub async fn download_playlist(
 /// Download user's favorite (liked) tracks
 pub async fn download_favorites(
     api: &DeezerApi,
-    format: TrackFormat,
+    options: DownloadOptions,
     output_dir: &Path,
     concurrency: usize,
     dry_run: bool,
-    min_format: Option<TrackFormat>,
 ) -> Result<()> {
     println!("Fetching favorite tracks...\n");
 
@@ -596,15 +675,35 @@ pub async fn download_favorites(
     }
 
     if dry_run {
-        println!("[dry-run] Favorites ({} track(s), {})\n", ids.len(), format);
+        let kind = if options.preview_and_full {
+            "preview + full"
+        } else if options.preview {
+            "preview"
+        } else {
+            options.format.api_name()
+        };
+        println!(
+            "[dry-run] Favorites ({} track(s), {})\n",
+            ids.len(),
+            kind
+        );
         let mut index = 0;
         let mut rejected = 0;
         for batch in ids.chunks(50) {
             let tracks = api.get_tracks_by_ids(batch).await?;
             for track in &tracks {
                 index += 1;
-                let actual = available_format(track, format);
-                match min_format {
+                if options.preview {
+                    println!(
+                        "  [{}/{}] {}",
+                        index,
+                        ids.len(),
+                        dry_run_track_label(track, options)
+                    );
+                    continue;
+                }
+                let actual = available_format(track, options.format);
+                match options.min_format {
                     Some(min) if actual.rank() < min.rank() => {
                         rejected += 1;
                         println!(
@@ -621,7 +720,7 @@ pub async fn download_favorites(
                             "  [{}/{}] {}",
                             index,
                             ids.len(),
-                            dry_run_track_label(track, format)
+                            dry_run_track_label(track, options)
                         );
                     }
                 }
@@ -650,8 +749,7 @@ pub async fn download_favorites(
             .into_iter()
             .map(|track| (favorites_dir.clone(), track))
             .collect();
-        let results =
-            download_tracks_concurrently(api, &jobs, format, concurrency, min_format).await;
+        let results = download_tracks_concurrently(api, &jobs, concurrency, options).await;
         let (downloaded_in_batch, failed_in_batch) = summarize_downloads(results);
         downloaded += downloaded_in_batch;
         failed += failed_in_batch;
@@ -725,11 +823,10 @@ async fn contains_audio(dir: &Path) -> Result<bool> {
 pub async fn download_artist(
     api: &DeezerApi,
     art_id: &str,
-    format: TrackFormat,
+    options: DownloadOptions,
     output_dir: &Path,
     concurrency: usize,
     dry_run: bool,
-    min_format: Option<TrackFormat>,
 ) -> Result<()> {
     let artist_info = api.get_artist_info(art_id).await?;
     let artist_name = artist_info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
@@ -755,8 +852,13 @@ pub async fn download_artist(
                     println!("    [skip] Not by {}", artist_name);
                     continue;
                 }
-                let actual = available_format(&track, format);
-                match min_format {
+                if options.preview {
+                    total += 1;
+                    println!("    [dry-run] {}", dry_run_track_label(&track, options));
+                    continue;
+                }
+                let actual = available_format(&track, options.format);
+                match options.min_format {
                     Some(min) if actual.rank() < min.rank() => {
                         rejected += 1;
                         println!(
@@ -768,7 +870,7 @@ pub async fn download_artist(
                     }
                     _ => {
                         total += 1;
-                        println!("    [dry-run] {}", dry_run_track_label(&track, format));
+                        println!("    [dry-run] {}", dry_run_track_label(&track, options));
                     }
                 }
             }
@@ -832,7 +934,7 @@ pub async fn download_artist(
 
     // Download all tracks in parallel, then dedupe in completion order
     let total = jobs.len();
-    let results = download_tracks_concurrently(api, &jobs, format, concurrency, min_format).await;
+    let results = download_tracks_concurrently(api, &jobs, concurrency, options).await;
     for (i, (display, outcome)) in results.into_iter().enumerate() {
         println!("  [{}/{}] {}", i + 1, total, display);
         match outcome {
@@ -863,11 +965,10 @@ pub async fn download_artist(
 pub async fn download_album(
     api: &DeezerApi,
     alb_id: &str,
-    format: TrackFormat,
+    options: DownloadOptions,
     output_dir: &Path,
     concurrency: usize,
     dry_run: bool,
-    min_format: Option<TrackFormat>,
 ) -> Result<()> {
     let info = api.get_album_info(alb_id).await?;
     let album_title = info["ALB_TITLE"].as_str().unwrap_or("Unknown Album");
@@ -882,8 +983,7 @@ pub async fn download_album(
         print_dry_run_tracks(
             &format!("Album: {} - {}", artist_name, album_title),
             &tracks,
-            format,
-            min_format,
+            options,
         );
         return Ok(());
     }
@@ -898,7 +998,7 @@ pub async fn download_album(
         .into_iter()
         .map(|track| (album_dir.clone(), track))
         .collect();
-    let results = download_tracks_concurrently(api, &jobs, format, concurrency, min_format).await;
+    let results = download_tracks_concurrently(api, &jobs, concurrency, options).await;
     let (downloaded, failed) = summarize_downloads(results);
 
     println!(
@@ -912,10 +1012,9 @@ pub async fn download_album(
 pub async fn download_single_track(
     api: &DeezerApi,
     track_id: &str,
-    format: TrackFormat,
+    options: DownloadOptions,
     output_dir: &Path,
     dry_run: bool,
-    min_format: Option<TrackFormat>,
 ) -> Result<()> {
     println!("Fetching track info...\n");
 
@@ -923,29 +1022,27 @@ pub async fn download_single_track(
     let display = track.display_name();
 
     if dry_run {
-        let actual_format = available_format(&track, format);
-        if let Some(min) = min_format
-            && actual_format.rank() < min.rank()
-        {
-            bail!(
-                "Requested {} but only {} is available (below --min-quality {})",
-                format,
-                actual_format,
-                min
-            );
-        }
-
         let artist = sanitize_filename(&track.artist());
         let title = sanitize_filename(&track.title());
-        let filepath = output_dir.join(&artist).join(format!(
-            "{} - {}{}",
-            artist,
-            title,
-            actual_format.extension()
-        ));
+        let filepath = output_dir.join(&artist).join(if options.preview {
+            format!("{} - {} (preview).mp3", artist, title)
+        } else {
+            let actual_format = available_format(&track, options.format);
+            if let Some(min) = options.min_format
+                && actual_format.rank() < min.rank()
+            {
+                bail!(
+                    "Requested {} but only {} is available (below --min-quality {})",
+                    options.format,
+                    actual_format,
+                    min
+                );
+            }
+            format!("{} - {}{}", artist, title, actual_format.extension())
+        });
         println!(
             "[dry-run] Would download: {}",
-            dry_run_track_label(&track, format)
+            dry_run_track_label(&track, options)
         );
         println!("[dry-run] Target: {}", filepath.display());
         return Ok(());
@@ -953,7 +1050,9 @@ pub async fn download_single_track(
 
     println!("Downloading: {}\n", display);
 
-    let path = download_track(api, &track, format, output_dir, true, min_format)
+    // Single tracks land in <output>/<Artist>/
+    let track_dir = output_dir.join(sanitize_filename(&track.artist()));
+    let path = download_track(api, &track, &track_dir, true, options)
         .await
         .context("Failed to download track")?;
     println!("\nSaved to: {}", path.display());
@@ -1025,6 +1124,16 @@ mod tests {
         }
     }
 
+    /// DownloadOptions for tests: requested format, no min, optional previews
+    fn test_options(format: TrackFormat, preview: bool, preview_and_full: bool) -> DownloadOptions {
+        DownloadOptions {
+            format,
+            min_format: None,
+            preview,
+            preview_and_full,
+        }
+    }
+
     #[tokio::test]
     async fn is_artist_downloaded_true_when_all_releases_on_disk() {
         let dir = TestDir::new("artist-complete");
@@ -1092,6 +1201,7 @@ mod tests {
             filesize_mp3_128: Some(serde_json::json!(mp3_128)),
             filesize_mp3_320: Some(serde_json::json!(mp3_320)),
             filesize_flac: Some(serde_json::json!(flac)),
+            duration: None,
         }
     }
 
@@ -1147,7 +1257,7 @@ mod tests {
     fn dry_run_label_shows_requested_format_when_available() {
         let track = track_with_filesizes(100, 100, 100);
         assert_eq!(
-            dry_run_track_label(&track, TrackFormat::Flac),
+            dry_run_track_label(&track, test_options(TrackFormat::Flac, false, false)),
             "Artist - Test [FLAC]"
         );
     }
@@ -1156,8 +1266,26 @@ mod tests {
     fn dry_run_label_notes_when_format_falls_back() {
         let track = track_with_filesizes(0, 100, 100);
         assert_eq!(
-            dry_run_track_label(&track, TrackFormat::Flac),
+            dry_run_track_label(&track, test_options(TrackFormat::Flac, false, false)),
             "Artist - Test [MP3_320 — FLAC unavailable]"
+        );
+    }
+
+    #[test]
+    fn dry_run_label_shows_preview_in_preview_mode() {
+        let track = track_with_filesizes(100, 100, 100);
+        assert_eq!(
+            dry_run_track_label(&track, test_options(TrackFormat::Flac, true, false)),
+            "Artist - Test [preview]"
+        );
+    }
+
+    #[test]
+    fn dry_run_label_shows_preview_and_full() {
+        let track = track_with_filesizes(100, 100, 100);
+        assert_eq!(
+            dry_run_track_label(&track, test_options(TrackFormat::Flac, true, true)),
+            "Artist - Test [preview + full]"
         );
     }
 

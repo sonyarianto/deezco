@@ -12,6 +12,7 @@ A fast, lightweight Deezer music downloader written in Rust. Single binary, no r
 - **Parallel downloads** — configurable concurrency for playlists, albums, favorites, and artists
 - **Quality selection** — FLAC, MP3 320kbps, MP3 128kbps with automatic fallback
 - **Blowfish CBC decryption** — handles Deezer's encrypted streams natively
+- **Previews** — download the 30-second public sample MP3 instead of the full track (`--preview`)
 - **Skip existing** — won't re-download files already on disk
 - **Progress bars** — per-track download progress
 - **Persistent login** — ARL cookie stored in `~/.config/deezco/.arl`
@@ -60,6 +61,9 @@ deezco [OPTIONS] [COMMAND]
 | `--min-quality <QUALITY>` | Minimum acceptable quality: fail instead of silently falling back below it | |
 | `--max-quality <QUALITY>` | Maximum quality to download: caps the bitrate, never exceeding it | |
 | `--exact <QUALITY>` | Shorthand for `--min-quality` + `--max-quality`: download exactly this quality, no fallback (overrides both flags) | |
+| `--preview` | Download 30-second previews instead of full tracks | |
+| `--preview-and-full` | Download both the 30-second preview and the full track (implies `--preview`) | |
+| `--show-defaults` | Print the effective defaults for every setting (quality resolution, preview mode, sort, output dir, ARL source), then exit without logging in or touching the network | |
 | `--arl <COOKIE>` | Deezer ARL cookie (overrides any stored login) | |
 | `-l, --limit <N>` | Number of search results to print (default `10`); also caps favorites JSON tracks (all when unset) | |
 | `--offset <N>` | Skip the first N tracks in favorites JSON output | `0` |
@@ -67,6 +71,8 @@ deezco [OPTIONS] [COMMAND]
 | `--pick <N>` | Download the Nth search result (1-based) instead of printing the list; also picks a followed artist for `following` | |
 | `--json` | Print results as JSON instead of downloading: track/artist name searches print the raw API response; `playlist`, `album`, `favorites`, and `following` print their contents | |
 | `--output-format <FMT>` | JSON style used with `--json`: `pretty` or `compact` | `pretty` |
+| `--sort <KEY>` | Sort key for track search and listing results: `quality` (highest available first), `relevance` (original API order), `duration` (shortest first). Not applicable to artists or `following` | `quality` |
+| `--sort-dir <DIR>` | Sort direction: `asc` or `desc`. Defaults to each key's natural order (quality best-first, duration shortest-first) | |
 | `--dry-run` | List what would be downloaded without writing to disk, showing the format each track would use (takes precedence over `--json` for download commands) | |
 | `-h, --help` | Print help | |
 | `-V, --version` | Print version | |
@@ -97,11 +103,28 @@ deezco
 deezco track https://www.deezer.com/en/track/3135556
 deezco track 3135556
 
+# ...or just the 30-second preview instead (saved as "... (preview).mp3")
+deezco --preview track 3135556
+deezco --preview album 302127
+deezco --preview --dry-run playlist 908622995
+
+# ...or download both the preview and the full track
+deezco --preview-and-full track 3135556
+
 # Search by name — prints results with IDs, the format each would use
-# (e.g. [FLAC], or [MP3_128 — FLAC unavailable] on a free account), sorted by
-# highest available quality (relevance order kept within equal quality)
+# (e.g. [FLAC], or [MP3_128 — FLAC unavailable] on a free account), duration,
+# sorted by highest available quality (relevance order kept within equal quality)
 deezco track "Get Lucky"
 deezco track 3135556
+
+# Other sort keys: original API order, or shortest track first
+deezco --sort relevance track "Get Lucky"
+deezco --sort duration -l 5 track "Get Lucky"
+# Reverse the direction: longest tracks first, or lowest quality first
+deezco --sort duration --sort-dir desc -l 5 track "Get Lucky"
+deezco --sort quality --sort-dir asc --json favorites
+# Same keys apply to the JSON output and favorites listing
+deezco --sort duration --json favorites
 
 # ...or auto-download a result by its list position (1-based, in the
 # quality-sorted order shown above)
@@ -121,9 +144,12 @@ deezco --json favorites
 
 # Browse a large favorites library in sorted, paginated chunks
 # (tracks are sorted by highest available quality, then artist/title;
-# offset+limit give stable pages)
+# each track carries a numeric "duration" in seconds; offset+limit give
+# stable pages)
 deezco --json favorites -l 100
 deezco --json favorites --offset 100 -l 100
+# e.g. list the five longest favorites
+deezco --json favorites --sort duration --sort-dir desc | jq -r '.tracks[].duration' | head -5
 
 # Download a playlist
 deezco playlist https://www.deezer.com/en/playlist/908622995
@@ -143,7 +169,8 @@ deezco album 302127
 deezco -o ~/Music -q flac artist "Radiohead"
 
 # Download all releases from every artist you follow
-# (artists whose releases are already on disk are skipped)
+# (artists whose releases are already on disk are skipped; headers show each
+# artist's best available quality, e.g. "--- Daft Punk (12 albums, best FLAC) ---")
 deezco following
 # ...or list them as JSON, sorted by each artist's best available quality
 # (each entry gains a "best_quality" field, e.g. "FLAC")

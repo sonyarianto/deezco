@@ -184,15 +184,6 @@ fn extract_id(input: &str, _entity: &str) -> String {
     input.to_string()
 }
 
-/// Print a startup banner with the tool name and version.
-fn print_banner() {
-    let version = env!("CARGO_PKG_VERSION");
-    let title = format!("deezco v{version} — Deezer music downloader");
-    let width = title.chars().count() + 4;
-    println!("╔{}╗", "═".repeat(width));
-    println!("║  {title}  ║");
-    println!("╚{}╝\n", "═".repeat(width));
-}
 
 /// Default output directory: the user's OS Downloads folder.
 fn default_output_dir() -> PathBuf {
@@ -975,10 +966,6 @@ async fn main() -> Result<()> {
     // Keep stdout clean when emitting JSON for scripts
     let json_output = cli.json.then_some(cli.output_format);
     let search_limit = cli.limit.unwrap_or(10);
-    if !matches!(command, Commands::Logout) && json_output.is_none() {
-        print_banner();
-    }
-
     let api = DeezerApi::new()?;
 
     // Login and prepare the output dir for every command except logout

@@ -6,6 +6,7 @@ mod models;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use futures_util::{StreamExt, stream};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,14 @@ struct Cli {
     /// Minimum acceptable quality: fail instead of falling back below it
     #[arg(long, global = true)]
     min_quality: Option<String>,
+
+    /// Maximum quality to download: caps the bitrate, never exceeding it
+    #[arg(long, global = true)]
+    max_quality: Option<String>,
+
+    /// Shorthand for --min-quality + --max-quality: download exactly this quality
+    #[arg(long, global = true)]
+    exact: Option<String>,
 
     /// Deezer ARL cookie (overrides any stored login)
     #[arg(long, global = true)]
@@ -162,12 +171,29 @@ fn resolve_output_dir(cli_output: Option<PathBuf>, env_output: Option<PathBuf>) 
     cli_output.or(env_output).unwrap_or_else(default_output_dir)
 }
 
-/// Rank of the highest quality format available for a track (3=FLAC … 0=none)
-fn quality_rank(track: &GwTrack) -> u8 {
+/// Resolve the quality bounds: `--exact` sets both min and max (overriding
+/// individual flags), otherwise the individual flags pass through as given.
+fn resolve_quality_bounds(
+    exact: Option<TrackFormat>,
+    min: Option<TrackFormat>,
+    max: Option<TrackFormat>,
+) -> (Option<TrackFormat>, Option<TrackFormat>) {
+    match exact {
+        Some(e) => (Some(e), Some(e)),
+        None => (min, max),
+    }
+}
+
+/// The best format actually available for a track (None when no filesize data)
+fn best_available_format(track: &GwTrack) -> Option<TrackFormat> {
     [TrackFormat::Flac, TrackFormat::Mp3_320, TrackFormat::Mp3_128]
         .into_iter()
         .find(|&fmt| track.filesize_for_format(fmt) > 0)
-        .map_or(0, TrackFormat::rank)
+}
+
+/// Rank of the highest quality format available for a track (3=FLAC … 0=none)
+fn quality_rank(track: &GwTrack) -> u8 {
+    best_available_format(track).map_or(0, TrackFormat::rank)
 }
 
 /// Result indices sorted by highest available quality. The sort is stable, so
@@ -435,8 +461,76 @@ fn artist_header(artist: &FollowedArtist) -> String {
     format!("--- {} ({} {}) ---", artist.name, artist.nb_album, noun)
 }
 
+/// Best quality available across an artist's discography, derived from the
+/// filesizes of every album's tracks (None when unknown).
+async fn artist_best_quality(api: &DeezerApi, art_id: &str) -> Result<Option<TrackFormat>> {
+    let albums = api.get_artist_discography(art_id).await?;
+    let mut best: Option<TrackFormat> = None;
+    for album in &albums {
+        let tracks = api.get_album_tracks(&album.id_str()).await?;
+        for track in &tracks {
+            if let Some(fmt) = best_available_format(track) {
+                let better = match best {
+                    Some(current) => fmt.rank() > current.rank(),
+                    None => true,
+                };
+                if better {
+                    best = Some(fmt);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Fetch the best available quality for every followed artist, concurrently.
+/// Artists whose quality can't be determined keep `best_quality` unset.
+async fn enrich_followed_artists(
+    api: &DeezerApi,
+    artists: Vec<FollowedArtist>,
+) -> Result<Vec<FollowedArtist>> {
+    let futures = artists.into_iter().map(|mut artist| {
+        let api = api.clone();
+        async move {
+            let best = artist_best_quality(&api, &artist.id.to_string())
+                .await
+                .ok()
+                .flatten();
+            artist.best_quality = best.map(|fmt| fmt.api_name().to_string());
+            artist
+        }
+    });
+    Ok(stream::iter(futures).buffer_unordered(4).collect().await)
+}
+
+/// Sort followed artists by best available quality (stable; the followed-list
+/// order is kept within equal quality, unknown quality sorts last).
+fn sort_followed_by_quality(artists: &mut [FollowedArtist]) {
+    artists.sort_by_key(|artist| {
+        let rank = artist
+            .best_quality
+            .as_deref()
+            .map_or(0, |quality| parse_format(quality).rank());
+        std::cmp::Reverse(rank)
+    });
+}
+
+/// Sort tracks for favorites JSON: highest available quality first, then
+/// artist/title/id. The tiebreakers are deterministic so pagination pages
+/// stay stable across calls.
+fn sort_favorites(tracks: &mut [GwTrack]) {
+    tracks.sort_by(|a, b| {
+        quality_rank(b)
+            .cmp(&quality_rank(a))
+            .then_with(|| a.artist().to_lowercase().cmp(&b.artist().to_lowercase()))
+            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
+            .then_with(|| a.id_str().cmp(&b.id_str()))
+    });
+}
+
 /// Print favorite tracks as JSON instead of downloading.
-/// Tracks are sorted by artist/title and paginated with `--offset`/`--limit`.
+/// Tracks are sorted by quality (then artist/title) and paginated with
+/// `--offset`/`--limit`.
 async fn print_favorites_json(
     api: &DeezerApi,
     format: OutputFormat,
@@ -449,14 +543,7 @@ async fn print_favorites_json(
         tracks.extend(api.get_tracks_by_ids(batch).await?);
     }
 
-    // Deterministic ordering so pagination pages are stable
-    tracks.sort_by(|a, b| {
-        a.artist()
-            .to_lowercase()
-            .cmp(&b.artist().to_lowercase())
-            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
-            .then_with(|| a.id_str().cmp(&b.id_str()))
-    });
+    sort_favorites(&mut tracks);
 
     let tracks: Vec<_> = tracks
         .into_iter()
@@ -469,8 +556,30 @@ async fn print_favorites_json(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let format = parse_format(&cli.quality);
-    let min_format = cli.min_quality.as_deref().map(parse_format);
+    let mut format = parse_format(&cli.quality);
+    let (min_format, max_format) = resolve_quality_bounds(
+        cli.exact.as_deref().map(parse_format),
+        cli.min_quality.as_deref().map(parse_format),
+        cli.max_quality.as_deref().map(parse_format),
+    );
+
+    // An unsatisfiable floor: every download would fail
+    if let (Some(min), Some(max)) = (min_format, max_format)
+        && min.rank() > max.rank()
+    {
+        anyhow::bail!(
+            "--min-quality {} is higher than --max-quality {}; no quality can satisfy both",
+            min,
+            max
+        );
+    }
+
+    // Cap the effective quality once; the fallback chain only goes downward,
+    // so the cap propagates through downloads, dry-run, and annotations.
+    if let Some(max) = max_format {
+        format = format.capped_by(max);
+    }
+
     let output = resolve_output_dir(cli.output.clone(), env_output_dir());
 
     // No command: print help and exit
@@ -588,60 +697,67 @@ async fn main() -> Result<()> {
                 .map_or(0, |u| u.id);
             let artists = api.get_followed_artists(user_id).await?;
 
-            // --pick: download a single followed artist's releases
-            if let Some(pick) = cli.pick {
-                if !(1..=artists.len()).contains(&pick) {
-                    println!(
-                        "No result #{pick} — found {} followed artist(s).",
-                        artists.len()
-                    );
-                    return Ok(());
-                }
-                let artist = &artists[pick - 1];
-                let art_id = artist.id.to_string();
-                println!("{}", artist_header(artist));
-                if download::is_artist_downloaded(&api, &art_id, &output).await? {
-                    println!("  [skip] Already on disk");
-                    return Ok(());
-                }
-                download::download_artist(
-                    &api,
-                    &art_id,
-                    format,
-                    &output,
-                    cli.concurrency,
-                    cli.dry_run,
-                    min_format,
-                )
-                .await?;
-                return Ok(());
-            }
+            // --pick and --json share the quality-sorted order; plain
+            // downloads keep the followed-list order with no extra fetches
+            if cli.pick.is_some() || json_output.is_some() {
+                let mut enriched = enrich_followed_artists(&api, artists).await?;
+                sort_followed_by_quality(&mut enriched);
 
-            match json_output {
-                Some(fmt) => print_following_json(fmt, artists)?,
-                None => {
-                    println!(
-                        "Downloading releases from {} followed artist(s)\n",
-                        artists.len()
-                    );
-                    for artist in &artists {
-                        println!("{}", artist_header(artist));
-                        let art_id = artist.id.to_string();
-                        if download::is_artist_downloaded(&api, &art_id, &output).await? {
-                            println!("  [skip] Already on disk");
-                            continue;
-                        }
-                        download::download_artist(
-                            &api,
-                            &art_id,
-                            format,
-                            &output,
-                            cli.concurrency,
-                            cli.dry_run,
-                            min_format,
-                        )
-                        .await?;
+                // --pick: download a single followed artist's releases
+                if let Some(pick) = cli.pick {
+                    if !(1..=enriched.len()).contains(&pick) {
+                        println!(
+                            "No result #{pick} — found {} followed artist(s).",
+                            enriched.len()
+                        );
+                        return Ok(());
                     }
+                    let artist = &enriched[pick - 1];
+                    let art_id = artist.id.to_string();
+                    println!("{}", artist_header(artist));
+                    if download::is_artist_downloaded(&api, &art_id, &output).await? {
+                        println!("  [skip] Already on disk");
+                        return Ok(());
+                    }
+                    download::download_artist(
+                        &api,
+                        &art_id,
+                        format,
+                        &output,
+                        cli.concurrency,
+                        cli.dry_run,
+                        min_format,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                if let Some(fmt) = json_output {
+                    print_following_json(fmt, enriched)?;
+                    return Ok(());
+                }
+            } else {
+                println!(
+                    "Downloading releases from {} followed artist(s)\n",
+                    artists.len()
+                );
+                for artist in &artists {
+                    println!("{}", artist_header(artist));
+                    let art_id = artist.id.to_string();
+                    if download::is_artist_downloaded(&api, &art_id, &output).await? {
+                        println!("  [skip] Already on disk");
+                        continue;
+                    }
+                    download::download_artist(
+                        &api,
+                        &art_id,
+                        format,
+                        &output,
+                        cli.concurrency,
+                        cli.dry_run,
+                        min_format,
+                    )
+                    .await?;
                 }
             }
         }
@@ -720,6 +836,79 @@ mod tests {
         // 2 and 4 both rank 3 (FLAC): their original order (2 before 4) is kept,
         // then rank 2 (id 3), then rank 1 (id 1)
         assert_eq!(sort_by_quality(&data, &by_id), vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn resolve_quality_bounds_exact_sets_both_and_overrides() {
+        // --exact sets both bounds
+        assert_eq!(
+            resolve_quality_bounds(Some(TrackFormat::Flac), None, None),
+            (Some(TrackFormat::Flac), Some(TrackFormat::Flac))
+        );
+        // Individual flags pass through when no exact is given
+        assert_eq!(
+            resolve_quality_bounds(
+                None,
+                Some(TrackFormat::Mp3_320),
+                Some(TrackFormat::Mp3_128)
+            ),
+            (Some(TrackFormat::Mp3_320), Some(TrackFormat::Mp3_128))
+        );
+        // Exact overrides conflicting individual flags
+        assert_eq!(
+            resolve_quality_bounds(
+                Some(TrackFormat::Flac),
+                Some(TrackFormat::Mp3_320),
+                Some(TrackFormat::Mp3_128)
+            ),
+            (Some(TrackFormat::Flac), Some(TrackFormat::Flac))
+        );
+    }
+
+    #[test]
+    fn sort_followed_by_quality_orders_best_first_stably() {
+        let mut artists = vec![
+            FollowedArtist { id: 1, name: "Low".to_string(), nb_album: 2, best_quality: Some("MP3_128".to_string()) },
+            FollowedArtist { id: 2, name: "High".to_string(), nb_album: 2, best_quality: Some("FLAC".to_string()) },
+            FollowedArtist { id: 3, name: "Unknown".to_string(), nb_album: 2, best_quality: None },
+            FollowedArtist { id: 4, name: "Mid".to_string(), nb_album: 2, best_quality: Some("MP3_320".to_string()) },
+            FollowedArtist { id: 5, name: "High2".to_string(), nb_album: 2, best_quality: Some("FLAC".to_string()) },
+        ];
+
+        sort_followed_by_quality(&mut artists);
+
+        let names: Vec<&str> = artists.iter().map(|a| a.name.as_str()).collect();
+        // FLAC pair keeps original order (2 before 5), then 320, 128, unknown
+        assert_eq!(names, vec!["High", "High2", "Mid", "Low", "Unknown"]);
+    }
+
+    #[test]
+    fn sort_favorites_orders_by_quality_then_artist_title() {
+        let high_b = GwTrack {
+            art_name: Some("B Artist".to_string()),
+            sng_title: Some("b-title".to_string()),
+            sng_id: serde_json::json!(2),
+            ..track_with_filesizes(100, 100, 100)
+        };
+        let high_a = GwTrack {
+            art_name: Some("A Artist".to_string()),
+            sng_title: Some("a-title".to_string()),
+            sng_id: serde_json::json!(1),
+            ..track_with_filesizes(100, 100, 100)
+        };
+        let low_a = GwTrack {
+            art_name: Some("A Artist".to_string()),
+            sng_title: Some("a-title".to_string()),
+            sng_id: serde_json::json!(3),
+            ..track_with_filesizes(0, 0, 100)
+        };
+        let mut tracks = vec![low_a, high_b, high_a];
+
+        sort_favorites(&mut tracks);
+
+        // FLAC-available tracks first (by artist/title), then MP3_128-only
+        let ids: Vec<String> = tracks.iter().map(|t| t.id_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
     }
 
     #[test]

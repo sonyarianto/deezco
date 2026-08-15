@@ -58,6 +58,8 @@ deezco [OPTIONS] [COMMAND]
 | `-o, --output <DIR>` | Output directory | OS Downloads folder (e.g. `~/Downloads`); override with `DEEZCO_OUTPUT_DIR` |
 | `-q, --quality <QUALITY>` | Audio quality: `flac`, `320`, `128` | `320` |
 | `--min-quality <QUALITY>` | Minimum acceptable quality: fail instead of silently falling back below it | |
+| `--max-quality <QUALITY>` | Maximum quality to download: caps the bitrate, never exceeding it | |
+| `--exact <QUALITY>` | Shorthand for `--min-quality` + `--max-quality`: download exactly this quality, no fallback (overrides both flags) | |
 | `--arl <COOKIE>` | Deezer ARL cookie (overrides any stored login) | |
 | `-l, --limit <N>` | Number of search results to print (default `10`); also caps favorites JSON tracks (all when unset) | |
 | `--offset <N>` | Skip the first N tracks in favorites JSON output | `0` |
@@ -118,7 +120,8 @@ deezco --json album 302127
 deezco --json favorites
 
 # Browse a large favorites library in sorted, paginated chunks
-# (tracks are sorted by artist/title; offset+limit give stable pages)
+# (tracks are sorted by highest available quality, then artist/title;
+# offset+limit give stable pages)
 deezco --json favorites -l 100
 deezco --json favorites --offset 100 -l 100
 
@@ -142,9 +145,12 @@ deezco -o ~/Music -q flac artist "Radiohead"
 # Download all releases from every artist you follow
 # (artists whose releases are already on disk are skipped)
 deezco following
-# ...or list them as JSON
+# ...or list them as JSON, sorted by each artist's best available quality
+# (each entry gains a "best_quality" field, e.g. "FLAC")
 deezco --json following
-# ...or download just one followed artist (by 1-based list position)
+deezco --json following | jq -r '.artists[] | "\(.name): \(.best_quality // "unknown")"'
+# ...or download just one followed artist (by 1-based list position;
+# --pick uses the same quality-sorted order as the JSON output)
 deezco --json following | jq -r '.artists[].name'
 deezco --pick 2 following
 
@@ -154,6 +160,20 @@ deezco --min-quality flac track 3135556
 deezco -q flac --min-quality 320 playlist 908622995
 # Works with dry-run too: exit code 1 when the single track would fall below
 deezco --dry-run --min-quality flac --pick 1 track "Get Lucky"
+
+# Cap the bitrate for data-sensitive connections (e.g. 128kbps max)
+deezco -q flac --max-quality 128 favorites
+# The cap is the effective request: annotations show [MP3_128], not a fallback
+deezco --dry-run -q flac --max-quality 128 album 302127
+# min and max together must be satisfiable (error otherwise)
+deezco -q flac --min-quality 320 --max-quality 128 playlist 908622995
+
+# Download exactly one quality — no fallback, no cap surprises
+# (shorthand for --min-quality X --max-quality X)
+deezco --exact flac track 3135556
+deezco --exact 128 favorites
+# Same command, but verify before downloading
+deezco --dry-run --exact 320 album 302127
 
 # Control parallelism (default 4)
 deezco -c 8 playlist 908622995

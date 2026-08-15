@@ -14,6 +14,9 @@ pub struct FollowedArtist {
     /// Number of releases, as reported by the public API
     #[serde(default)]
     pub nb_album: u64,
+    /// Best quality available across the artist's releases, when known
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_quality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +134,15 @@ impl TrackFormat {
         }
     }
 
+    /// Cap this format to at most `cap` quality (e.g. FLAC capped by 320 → MP3_320)
+    pub fn capped_by(self, cap: TrackFormat) -> TrackFormat {
+        if self.rank() > cap.rank() {
+            cap
+        } else {
+            self
+        }
+    }
+
     pub fn code(&self) -> u32 {
         match self {
             TrackFormat::Flac => 9,
@@ -217,6 +229,15 @@ mod tests {
     }
 
     #[test]
+    fn track_format_capped_by_never_exceeds_the_cap() {
+        assert_eq!(TrackFormat::Flac.capped_by(TrackFormat::Mp3_320), TrackFormat::Mp3_320);
+        assert_eq!(TrackFormat::Flac.capped_by(TrackFormat::Mp3_128), TrackFormat::Mp3_128);
+        assert_eq!(TrackFormat::Mp3_320.capped_by(TrackFormat::Flac), TrackFormat::Mp3_320);
+        assert_eq!(TrackFormat::Mp3_320.capped_by(TrackFormat::Mp3_320), TrackFormat::Mp3_320);
+        assert_eq!(TrackFormat::Mp3_128.capped_by(TrackFormat::Flac), TrackFormat::Mp3_128);
+    }
+
+    #[test]
     fn track_format_rank_orders_qualities() {
         assert!(TrackFormat::Flac.rank() > TrackFormat::Mp3_320.rank());
         assert!(TrackFormat::Mp3_320.rank() > TrackFormat::Mp3_128.rank());
@@ -231,11 +252,27 @@ mod tests {
             id: 27,
             name: "Test Artist".to_string(),
             nb_album: 3,
+            best_quality: None,
         };
         let value = serde_json::to_value(&artist).unwrap();
 
         assert_eq!(value["id"], serde_json::json!(27));
         assert_eq!(value["name"], serde_json::json!("Test Artist"));
         assert_eq!(value["nb_album"], serde_json::json!(3));
+        // best_quality is omitted when unknown
+        assert!(value.get("best_quality").is_none());
+    }
+
+    #[test]
+    fn followed_artist_serializes_best_quality_when_known() {
+        let artist = FollowedArtist {
+            id: 27,
+            name: "Test Artist".to_string(),
+            nb_album: 3,
+            best_quality: Some("FLAC".to_string()),
+        };
+        let value = serde_json::to_value(&artist).unwrap();
+
+        assert_eq!(value["best_quality"], serde_json::json!("FLAC"));
     }
 }

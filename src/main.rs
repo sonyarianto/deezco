@@ -5,8 +5,8 @@ mod download;
 mod models;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use dialoguer::{Input, Select};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use crate::api::DeezerApi;
@@ -19,17 +19,59 @@ struct Cli {
     command: Option<Commands>,
 
     /// Output directory for downloads
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     output: Option<PathBuf>,
 
     /// Audio quality: flac, 320, 128
-    #[arg(short, long, default_value = "320")]
+    #[arg(short, long, global = true, default_value = "320")]
     quality: String,
+
+    /// Deezer ARL cookie (overrides any stored login)
+    #[arg(long, global = true)]
+    arl: Option<String>,
+
+    /// Number of search results to print (default: 10); also caps favorites JSON output
+    #[arg(short, long, global = true)]
+    limit: Option<u32>,
+
+    /// Skip the first N tracks in favorites JSON output
+    #[arg(long, global = true, default_value_t = 0)]
+    offset: u32,
+
+    /// Number of parallel downloads (minimum 1)
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value_t = 4,
+        value_parser = clap::builder::RangedI64ValueParser::<usize>::new().range(1..)
+    )]
+    concurrency: usize,
+
+    /// 1-based index of the search result to download instead of printing the list
+    #[arg(long, global = true)]
+    pick: Option<usize>,
+
+    /// Print search results as JSON instead of the human-readable list
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// JSON output style used with --json
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Pretty)]
+    output_format: OutputFormat,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// Human-friendly multi-line JSON
+    Pretty,
+    /// Single-line JSON, ideal for piping
+    Compact,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download a track by URL, ID, or search name
+    /// Download a track by URL or ID (names print search results)
     Track {
         /// Deezer track URL, track ID, or search name
         query: String,
@@ -41,9 +83,9 @@ enum Commands {
     },
     /// Download your liked/favorite songs
     Favorites,
-    /// Download all songs from an artist
+    /// Download all songs from an artist (names print search results)
     Artist {
-        /// Deezer artist URL, ID, or search name
+        /// Deezer artist URL, artist ID, or search name
         query: String,
     },
     /// Download an album by URL or ID
@@ -51,8 +93,8 @@ enum Commands {
         /// Deezer album URL or album ID
         url: String,
     },
-    /// Interactive mode - choose what to download
-    Interactive,
+    /// Download all releases from every artist you follow
+    Following,
     /// Remove stored login credentials
     Logout,
 }
@@ -110,114 +152,16 @@ fn resolve_output_dir(cli_output: Option<PathBuf>, env_output: Option<PathBuf>) 
     cli_output.or(env_output).unwrap_or_else(default_output_dir)
 }
 
-async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &Path) -> Result<()> {
-    println!("Output directory: {}\n", output.display());
-
-    loop {
-        println!();
-        let choices = &[
-            "Download a track (URL or search)",
-            "Download a playlist",
-            "Download favorites (liked songs)",
-            "Download all songs from an artist",
-            "Download an album",
-            "Quit",
-        ];
-
-        let selection = Select::new()
-            .with_prompt("What would you like to do?")
-            .items(choices)
-            .default(0)
-            .interact()?;
-
-        match selection {
-            0 => {
-                let input: String = Input::new()
-                    .with_prompt("Enter track URL, ID, or search")
-                    .interact_text()?;
-                if !download_track_query(api, &input, format, output).await? {
-                    continue;
-                }
-            }
-            1 => {
-                // Show user playlists or enter URL
-                let playlist_choices = &["Enter playlist URL or ID", "Choose from my playlists"];
-                let pl_sel = Select::new()
-                    .with_prompt("How to find the playlist?")
-                    .items(playlist_choices)
-                    .default(0)
-                    .interact()?;
-
-                match pl_sel {
-                    0 => {
-                        let input: String = Input::new()
-                            .with_prompt("Enter playlist URL or ID")
-                            .interact_text()?;
-                        let id = extract_id(&input, "playlist");
-                        download::download_playlist(api, &id, format, output).await?;
-                    }
-                    1 => {
-                        let user = api.current_user.lock().await;
-                        let user_id = user.as_ref().map(|u| u.id).unwrap_or(0);
-                        drop(user);
-
-                        let playlists = api.get_user_playlists(user_id).await?;
-                        if playlists.is_empty() {
-                            println!("No playlists found.");
-                            continue;
-                        }
-
-                        let names: Vec<String> =
-                            playlists.iter().map(|p| p.display_name()).collect();
-
-                        let sel = Select::new()
-                            .with_prompt("Select a playlist")
-                            .items(&names)
-                            .default(0)
-                            .interact()?;
-
-                        let playlist_id = playlists[sel].id_str();
-                        download::download_playlist(api, &playlist_id, format, output).await?;
-                    }
-                    _ => {}
-                }
-            }
-            2 => {
-                download::download_favorites(api, format, output).await?;
-            }
-            3 => {
-                let input: String = Input::new()
-                    .with_prompt("Enter artist URL, ID, or name to search")
-                    .interact_text()?;
-
-                if !download_artist_query(api, &input, format, output).await? {
-                    continue;
-                }
-            }
-            4 => {
-                let input: String = Input::new()
-                    .with_prompt("Enter album URL or ID")
-                    .interact_text()?;
-                let id = extract_id(&input, "album");
-                download::download_album(api, &id, format, output).await?;
-            }
-            5 => {
-                println!("Bye!");
-                break;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Download a track from a URL, ID, or search query.
-/// Returns `false` when the query is a name with no matching results.
+/// Download a track from a URL or ID, or print search results for a name.
+/// Returns `false` when nothing was downloaded (search results shown).
 async fn download_track_query(
     api: &DeezerApi,
     query: &str,
     format: TrackFormat,
     output: &Path,
+    limit: u32,
+    pick: Option<usize>,
+    output_format: Option<OutputFormat>,
 ) -> Result<bool> {
     // Already a URL or ID
     if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
@@ -226,79 +170,202 @@ async fn download_track_query(
         return Ok(true);
     }
 
-    // Search for tracks and let the user pick one
-    let results = api.search_track(query).await?;
+    // Search for the track
+    let results = api.search_track(query, limit).await?;
+
+    // Auto-download a specific result instead of printing
+    if let Some(pick) = pick {
+        let data = match results["data"].as_array() {
+            Some(data) if !data.is_empty() => data,
+            _ => {
+                println!("No tracks found for '{}'.", query);
+                return Ok(false);
+            }
+        };
+        if !(1..=data.len()).contains(&pick) {
+            println!("No result #{pick} — found {} track(s).", data.len());
+            return Ok(false);
+        }
+        let track = &data[pick - 1];
+        let id = track["id"].as_u64().unwrap_or(0).to_string();
+        if id == "0" {
+            println!("Result #{pick} has no track ID.");
+            return Ok(false);
+        }
+        download::download_single_track(api, &id, format, output).await?;
+        return Ok(true);
+    }
+
+    // Print the raw API response as JSON for scripting
+    if let Some(format) = output_format {
+        print_json(&results, format)?;
+        return Ok(false);
+    }
+
+    // Print search results so the user can pick an ID
     let data = match results["data"].as_array() {
-        Some(data) if !data.is_empty() => data,
+        Some(data) if !data.is_empty() && limit > 0 => data,
         _ => {
             println!("No tracks found for '{}'.", query);
             return Ok(false);
         }
     };
-
-    let names: Vec<String> = data
-        .iter()
-        .map(|track| {
-            let title = track["title"].as_str().unwrap_or("Unknown");
-            let artist = track["artist"]["name"].as_str().unwrap_or("Unknown");
-            format!("{artist} - {title}")
-        })
-        .collect();
-
-    let sel = Select::new()
-        .with_prompt("Select a track")
-        .items(&names)
-        .default(0)
-        .interact()?;
-
-    let track_id = data[sel]["id"].as_u64().unwrap_or(0).to_string();
-    download::download_single_track(api, &track_id, format, output).await?;
-    Ok(true)
+    println!("Tracks matching '{query}':");
+    for (i, track) in data.iter().take(limit as usize).enumerate() {
+        let title = track["title"].as_str().unwrap_or("Unknown");
+        let artist = track["artist"]["name"].as_str().unwrap_or("Unknown");
+        let id = track["id"].as_u64().unwrap_or(0);
+        println!("  {:>2}. {} - {} (ID: {})", i + 1, artist, title, id);
+    }
+    println!("\nRun `deezco track <ID>` to download one.");
+    Ok(false)
 }
 
-/// Download an artist from a URL, ID, or search query.
-/// Returns `false` when the query is a name with no matching results.
+/// Download an artist from a URL or ID, or print search results for a name.
+/// Returns `false` when nothing was downloaded (search results shown).
+#[allow(clippy::too_many_arguments)]
 async fn download_artist_query(
     api: &DeezerApi,
     query: &str,
     format: TrackFormat,
     output: &Path,
+    limit: u32,
+    pick: Option<usize>,
+    output_format: Option<OutputFormat>,
+    concurrency: usize,
 ) -> Result<bool> {
     // Already a URL or ID
     if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
         let id = extract_id(query, "artist");
-        download::download_artist(api, &id, format, output).await?;
+        download::download_artist(api, &id, format, output, concurrency).await?;
         return Ok(true);
     }
 
-    // Search for the artist and let the user pick one
-    let results = api.search_artist(query).await?;
+    // Search for the artist
+    let results = api.search_artist(query, limit).await?;
+
+    // Auto-download a specific result instead of printing
+    if let Some(pick) = pick {
+        let data = match results["data"].as_array() {
+            Some(data) if !data.is_empty() => data,
+            _ => {
+                println!("No artists found for '{}'.", query);
+                return Ok(false);
+            }
+        };
+        if !(1..=data.len()).contains(&pick) {
+            println!("No result #{pick} — found {} artist(s).", data.len());
+            return Ok(false);
+        }
+        let artist = &data[pick - 1];
+        let id = artist["id"].as_u64().unwrap_or(0).to_string();
+        if id == "0" {
+            println!("Result #{pick} has no artist ID.");
+            return Ok(false);
+        }
+        download::download_artist(api, &id, format, output, concurrency).await?;
+        return Ok(true);
+    }
+
+    // Print the raw API response as JSON for scripting
+    if let Some(format) = output_format {
+        print_json(&results, format)?;
+        return Ok(false);
+    }
+
+    // Print search results so the user can pick an ID
     let data = match results["data"].as_array() {
-        Some(data) if !data.is_empty() => data,
+        Some(data) if !data.is_empty() && limit > 0 => data,
         _ => {
             println!("No artists found for '{}'.", query);
             return Ok(false);
         }
     };
+    println!("Artists matching '{query}':");
+    for (i, artist) in data.iter().take(limit as usize).enumerate() {
+        let name = artist["name"].as_str().unwrap_or("Unknown");
+        let fans = artist["nb_fan"].as_u64().unwrap_or(0);
+        let id = artist["id"].as_u64().unwrap_or(0);
+        println!("  {:>2}. {} ({} fans, ID: {})", i + 1, name, fans, id);
+    }
+    println!("\nRun `deezco artist <ID>` to download the discography.");
+    Ok(false)
+}
 
-    let names: Vec<String> = data
-        .iter()
-        .map(|a| {
-            let name = a["name"].as_str().unwrap_or("Unknown");
-            let fans = a["nb_fan"].as_u64().unwrap_or(0);
-            format!("{} ({} fans)", name, fans)
-        })
+/// Print a value as JSON in the requested style
+fn print_json(value: &serde_json::Value, format: OutputFormat) -> Result<()> {
+    let out = match format {
+        OutputFormat::Pretty => serde_json::to_string_pretty(value)?,
+        OutputFormat::Compact => serde_json::to_string(value)?,
+    };
+    println!("{out}");
+    Ok(())
+}
+
+/// Print playlist contents as JSON instead of downloading
+async fn print_playlist_json(api: &DeezerApi, id: &str, format: OutputFormat) -> Result<()> {
+    let info = api.get_playlist_info(id).await?;
+    let title = info["DATA"]["TITLE"].as_str().unwrap_or("Unknown Playlist");
+    let tracks = api.get_playlist_tracks(id).await?;
+    print_json(
+        &json!({ "type": "playlist", "id": id, "title": title, "tracks": tracks }),
+        format,
+    )
+}
+
+/// Print album contents as JSON instead of downloading
+async fn print_album_json(api: &DeezerApi, id: &str, format: OutputFormat) -> Result<()> {
+    let info = api.get_album_info(id).await?;
+    let title = info["ALB_TITLE"].as_str().unwrap_or("Unknown Album");
+    let artist = info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
+    let tracks = api.get_album_tracks(id).await?;
+    print_json(
+        &json!({
+            "type": "album",
+            "id": id,
+            "title": title,
+            "artist": artist,
+            "tracks": tracks,
+        }),
+        format,
+    )
+}
+
+/// Print followed artists as JSON instead of downloading
+async fn print_following_json(api: &DeezerApi, format: OutputFormat, user_id: u64) -> Result<()> {
+    let artists = api.get_followed_artists(user_id).await?;
+    print_json(&json!({ "type": "following", "artists": artists }), format)
+}
+
+/// Print favorite tracks as JSON instead of downloading.
+/// Tracks are sorted by artist/title and paginated with `--offset`/`--limit`.
+async fn print_favorites_json(
+    api: &DeezerApi,
+    format: OutputFormat,
+    limit: Option<u32>,
+    offset: u32,
+) -> Result<()> {
+    let ids = api.get_favorite_track_ids().await?;
+    let mut tracks = Vec::new();
+    for batch in ids.chunks(50) {
+        tracks.extend(api.get_tracks_by_ids(batch).await?);
+    }
+
+    // Deterministic ordering so pagination pages are stable
+    tracks.sort_by(|a, b| {
+        a.artist()
+            .to_lowercase()
+            .cmp(&b.artist().to_lowercase())
+            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
+            .then_with(|| a.id_str().cmp(&b.id_str()))
+    });
+
+    let tracks: Vec<_> = tracks
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit.map_or(usize::MAX, |l| l as usize))
         .collect();
-
-    let sel = Select::new()
-        .with_prompt("Select an artist")
-        .items(&names)
-        .default(0)
-        .interact()?;
-
-    let art_id = data[sel]["id"].as_u64().unwrap_or(0).to_string();
-    download::download_artist(api, &art_id, format, output).await?;
-    Ok(true)
+    print_json(&json!({ "type": "favorites", "tracks": tracks }), format)
 }
 
 #[tokio::main]
@@ -307,52 +374,128 @@ async fn main() -> Result<()> {
     let format = parse_format(&cli.quality);
     let output = resolve_output_dir(cli.output.clone(), env_output_dir());
 
-    if !matches!(&cli.command, Some(Commands::Logout)) {
+    // No command: print help and exit
+    let Some(command) = cli.command else {
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    // Keep stdout clean when emitting JSON for scripts
+    let json_output = cli.json.then_some(cli.output_format);
+    let search_limit = cli.limit.unwrap_or(10);
+    if !matches!(command, Commands::Logout) && json_output.is_none() {
         print_banner();
     }
 
     let api = DeezerApi::new()?;
 
     // Login and prepare the output dir for every command except logout
-    if !matches!(&cli.command, Some(Commands::Logout)) {
-        if !auth::login(&api).await? {
+    if !matches!(command, Commands::Logout) {
+        let arl: Option<String> = cli.arl.clone().or_else(|| {
+            std::env::var("DEEZCO_ARL")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+        if !auth::login(&api, arl.as_deref()).await? {
             return Ok(());
         }
 
         let user = api.current_user.lock().await;
-        if let Some(u) = user.as_ref() {
+        if let Some(u) = user.as_ref()
+            && json_output.is_none()
+        {
             println!("Logged in as: {}\n", u.name);
         }
 
         tokio::fs::create_dir_all(&output).await?;
     }
 
-    match cli.command {
-        Some(Commands::Track { query }) => {
-            if !download_track_query(&api, &query, format, &output).await? {
+    match command {
+        Commands::Track { query } => {
+            if !download_track_query(
+                &api,
+                &query,
+                format,
+                &output,
+                search_limit,
+                cli.pick,
+                json_output,
+            )
+            .await?
+            {
                 return Ok(());
             }
         }
-        Some(Commands::Playlist { url }) => {
+        Commands::Playlist { url } => {
             let id = extract_id(&url, "playlist");
-            download::download_playlist(&api, &id, format, &output).await?;
+            match json_output {
+                Some(fmt) => print_playlist_json(&api, &id, fmt).await?,
+                None => {
+                    download::download_playlist(&api, &id, format, &output, cli.concurrency)
+                        .await?;
+                }
+            }
         }
-        Some(Commands::Favorites) => {
-            download::download_favorites(&api, format, &output).await?;
-        }
-        Some(Commands::Artist { query }) => {
-            if !download_artist_query(&api, &query, format, &output).await? {
+        Commands::Favorites => match json_output {
+            Some(fmt) => print_favorites_json(&api, fmt, cli.limit, cli.offset).await?,
+            None => {
+                download::download_favorites(&api, format, &output, cli.concurrency).await?;
+            }
+        },
+        Commands::Artist { query } => {
+            if !download_artist_query(
+                &api,
+                &query,
+                format,
+                &output,
+                search_limit,
+                cli.pick,
+                json_output,
+                cli.concurrency,
+            )
+            .await?
+            {
                 return Ok(());
             }
         }
-        Some(Commands::Album { url }) => {
+        Commands::Following => {
+            let user_id = api
+                .current_user
+                .lock()
+                .await
+                .as_ref()
+                .map_or(0, |u| u.id);
+            match json_output {
+                Some(fmt) => print_following_json(&api, fmt, user_id).await?,
+                None => {
+                    let artists = api.get_followed_artists(user_id).await?;
+                    println!("Downloading releases from {} followed artist(s)\n", artists.len());
+                    for artist in &artists {
+                        println!("--- {} ---", artist.name);
+                        download::download_artist(
+                            &api,
+                            &artist.id.to_string(),
+                            format,
+                            &output,
+                            cli.concurrency,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Commands::Album { url } => {
             let id = extract_id(&url, "album");
-            download::download_album(&api, &id, format, &output).await?;
+            match json_output {
+                Some(fmt) => print_album_json(&api, &id, fmt).await?,
+                None => {
+                    download::download_album(&api, &id, format, &output, cli.concurrency).await?;
+                }
+            }
         }
-        Some(Commands::Interactive) | None => {
-            interactive_mode(&api, format, &output).await?;
-        }
-        Some(Commands::Logout) => {
+        Commands::Logout => {
             auth::remove_arl().await?;
             println!("Logged out. Stored ARL removed.");
         }

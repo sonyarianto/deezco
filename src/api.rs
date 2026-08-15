@@ -277,29 +277,46 @@ impl DeezerApi {
         .await
     }
 
-    // ========== User playlists ==========
+    // ========== Followed artists ==========
 
-    pub async fn get_user_playlists(&self, user_id: u64) -> Result<Vec<PlaylistInfo>> {
-        let result = self
-            .gw_call(
-                "deezer.pageProfile",
-                json!({
-                    "USER_ID": user_id,
-                    "tab": "playlists",
-                    "nb": 100,
-                }),
-            )
-            .await?;
+    /// List the artists a user follows (public API, paginated)
+    pub async fn get_followed_artists(&self, user_id: u64) -> Result<Vec<FollowedArtist>> {
+        let mut artists = Vec::new();
+        let mut index = 0u32;
+        let limit = 100u32;
 
-        let data = &result["TAB"]["playlists"]["data"];
-        let playlists: Vec<PlaylistInfo> = if let Some(arr) = data.as_array() {
-            arr.iter()
-                .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Ok(playlists)
+        loop {
+            let response = self
+                .client
+                .get(format!("{}/user/{}/artists", PUBLIC_API_URL, user_id))
+                .query(&[("index", index), ("limit", limit)])
+                .send()
+                .await
+                .context("Failed to fetch followed artists")?;
+            let body: Value = response.json().await?;
+
+            let batch: Vec<FollowedArtist> = match body["data"].as_array() {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .collect(),
+                None => Vec::new(),
+            };
+
+            let count = batch.len() as u32;
+            if count == 0 {
+                break;
+            }
+            artists.extend(batch);
+
+            let total = body["total"].as_u64().unwrap_or(0) as u32;
+            index += limit;
+            if index >= total || count < limit {
+                break;
+            }
+        }
+
+        Ok(artists)
     }
 
     // ========== Favorites ==========
@@ -421,11 +438,12 @@ impl DeezerApi {
             .await
     }
 
-    pub async fn search_track(&self, query: &str) -> Result<Value> {
+    pub async fn search_track(&self, query: &str, limit: u32) -> Result<Value> {
+        let limit_str = limit.to_string();
         let result = self
             .client
             .get(format!("{}/search/track", PUBLIC_API_URL))
-            .query(&[("q", query), ("limit", "10")])
+            .query(&[("q", query), ("limit", &limit_str)])
             .send()
             .await?
             .json()
@@ -433,11 +451,12 @@ impl DeezerApi {
         Ok(result)
     }
 
-    pub async fn search_artist(&self, query: &str) -> Result<Value> {
+    pub async fn search_artist(&self, query: &str, limit: u32) -> Result<Value> {
+        let limit_str = limit.to_string();
         let result = self
             .client
             .get(format!("{}/search/artist", PUBLIC_API_URL))
-            .query(&[("q", query), ("limit", "20")])
+            .query(&[("q", query), ("limit", &limit_str)])
             .send()
             .await?
             .json()

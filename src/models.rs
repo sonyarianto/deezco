@@ -8,6 +8,12 @@ pub struct CurrentUser {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowedArtist {
+    pub id: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GwResponse {
     pub error: serde_json::Value,
     pub results: serde_json::Value,
@@ -86,29 +92,6 @@ impl GwTrack {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistInfo {
-    #[serde(rename = "PLAYLIST_ID")]
-    pub playlist_id: Option<serde_json::Value>,
-    #[serde(rename = "TITLE")]
-    pub title: Option<String>,
-}
-
-impl PlaylistInfo {
-    pub fn id_str(&self) -> String {
-        match &self.playlist_id {
-            Some(serde_json::Value::Number(n)) => n.to_string(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            _ => "0".to_string(),
-        }
-    }
-
-    pub fn display_name(&self) -> String {
-        self.title
-            .clone()
-            .unwrap_or_else(|| "Unknown Playlist".to_string())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumInfo {

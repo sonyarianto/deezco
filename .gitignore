@@ -15,3 +15,6 @@ Thumbs.db
 # Environment / credentials
 .env
 .arl
+
+# Downloaded music (fallback output dir)
+/downloads/

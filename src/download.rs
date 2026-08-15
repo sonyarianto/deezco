@@ -400,31 +400,31 @@ pub async fn download_track(
     Ok(filepath)
 }
 
-/// Max number of tracks downloaded in parallel
-const MAX_CONCURRENT_DOWNLOADS: usize = 4;
-
 /// Download a list of tracks with bounded concurrency.
-/// Returns `(downloaded, failed)`.
+/// Each job pairs an output directory with a track.
+/// Returns per-track outcomes in completion order.
 async fn download_tracks_concurrently(
     api: &DeezerApi,
-    tracks: &[GwTrack],
+    jobs: &[(PathBuf, GwTrack)],
     format: TrackFormat,
-    output_dir: &Path,
-) -> (usize, usize) {
-    let total = tracks.len();
-    let results = stream::iter(tracks.iter().map(|track| {
+    concurrency: usize,
+) -> Vec<(String, Result<PathBuf>)> {
+    stream::iter(jobs.iter().cloned().map(|(dir, track)| {
         let api = api.clone();
-        let dir = output_dir.to_path_buf();
         let display = track.display_name();
         async move {
-            let outcome = download_track(&api, track, format, &dir, false).await;
+            let outcome = download_track(&api, &track, format, &dir, false).await;
             (display, outcome)
         }
     }))
-    .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+    .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
-    .await;
+    .await
+}
 
+/// Print per-track results and return `(downloaded, failed)`.
+fn summarize_downloads(results: Vec<(String, Result<PathBuf>)>) -> (usize, usize) {
+    let total = results.len();
     let mut downloaded = 0;
     let mut failed = 0;
     for (i, (display, outcome)) in results.into_iter().enumerate() {
@@ -449,6 +449,7 @@ pub async fn download_playlist(
     playlist_id: &str,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     // Get playlist info
     let info = api.get_playlist_info(playlist_id).await?;
@@ -463,8 +464,12 @@ pub async fn download_playlist(
 
     println!("Found {} tracks\n", total);
 
-    let (downloaded, failed) =
-        download_tracks_concurrently(api, &tracks, format, &playlist_dir).await;
+    let jobs: Vec<(PathBuf, GwTrack)> = tracks
+        .into_iter()
+        .map(|track| (playlist_dir.clone(), track))
+        .collect();
+    let results = download_tracks_concurrently(api, &jobs, format, concurrency).await;
+    let (downloaded, failed) = summarize_downloads(results);
 
     println!(
         "\nPlaylist complete: {} downloaded, {} failed out of {} tracks",
@@ -478,6 +483,7 @@ pub async fn download_favorites(
     api: &DeezerApi,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     println!("Fetching favorite tracks...\n");
 
@@ -497,8 +503,12 @@ pub async fn download_favorites(
 
     for batch in ids.chunks(50) {
         let tracks = api.get_tracks_by_ids(batch).await?;
-        let (downloaded_in_batch, failed_in_batch) =
-            download_tracks_concurrently(api, &tracks, format, &favorites_dir).await;
+        let jobs: Vec<(PathBuf, GwTrack)> = tracks
+            .into_iter()
+            .map(|track| (favorites_dir.clone(), track))
+            .collect();
+        let results = download_tracks_concurrently(api, &jobs, format, concurrency).await;
+        let (downloaded_in_batch, failed_in_batch) = summarize_downloads(results);
         downloaded += downloaded_in_batch;
         failed += failed_in_batch;
     }
@@ -516,6 +526,7 @@ pub async fn download_artist(
     art_id: &str,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     let artist_info = api.get_artist_info(art_id).await?;
     let artist_name = artist_info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
@@ -550,6 +561,8 @@ pub async fn download_artist(
         );
     }
 
+    // Gather every album's tracks so they can be downloaded in parallel
+    let mut jobs: Vec<(PathBuf, GwTrack)> = Vec::new();
     for album in &albums {
         let alb_id = album.id_str();
         let album_title = album.alb_title.as_deref().unwrap_or("Unknown Album");
@@ -566,30 +579,34 @@ pub async fn download_artist(
             }
         };
 
-        for (i, track) in tracks.iter().enumerate() {
-            let display = track.display_name();
-            println!("  [{}/{}] {}", i + 1, tracks.len(), display);
-
-            if !track_belongs_to_artist(track, art_id, artist_name) {
+        for track in tracks {
+            if !track_belongs_to_artist(&track, art_id, artist_name) {
                 total_skipped += 1;
                 println!("    [skip] Not by {}", artist_name);
                 continue;
             }
+            jobs.push((album_dir.clone(), track));
+        }
+    }
 
-            match download_track(api, track, format, &album_dir, true).await {
-                Ok(path) => {
-                    if dedupe_audio_file(&path, &mut audio_hash_index).await? {
-                        total_linked += 1;
-                        println!("    [link] Duplicate audio linked to existing file");
-                    }
+    // Download all tracks in parallel, then dedupe in completion order
+    let total = jobs.len();
+    let results = download_tracks_concurrently(api, &jobs, format, concurrency).await;
+    for (i, (display, outcome)) in results.into_iter().enumerate() {
+        println!("  [{}/{}] {}", i + 1, total, display);
+        match outcome {
+            Ok(path) => {
+                if dedupe_audio_file(&path, &mut audio_hash_index).await? {
+                    total_linked += 1;
+                    println!("    [link] Duplicate audio linked to existing file");
+                }
 
-                    total_downloaded += 1;
-                    println!("    [ok] Downloaded");
-                }
-                Err(e) => {
-                    total_failed += 1;
-                    eprintln!("    [err] Failed: {}", e);
-                }
+                total_downloaded += 1;
+                println!("    [ok] Downloaded");
+            }
+            Err(e) => {
+                total_failed += 1;
+                eprintln!("    [err] Failed: {}", e);
             }
         }
     }
@@ -607,6 +624,7 @@ pub async fn download_album(
     alb_id: &str,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     let info = api.get_album_info(alb_id).await?;
     let album_title = info["ALB_TITLE"].as_str().unwrap_or("Unknown Album");
@@ -622,7 +640,12 @@ pub async fn download_album(
         .join(sanitize_filename(artist_name))
         .join(sanitize_filename(album_title));
 
-    let (downloaded, failed) = download_tracks_concurrently(api, &tracks, format, &album_dir).await;
+    let jobs: Vec<(PathBuf, GwTrack)> = tracks
+        .into_iter()
+        .map(|track| (album_dir.clone(), track))
+        .collect();
+    let results = download_tracks_concurrently(api, &jobs, format, concurrency).await;
+    let (downloaded, failed) = summarize_downloads(results);
 
     println!(
         "\nAlbum complete: {} downloaded, {} failed out of {} tracks",

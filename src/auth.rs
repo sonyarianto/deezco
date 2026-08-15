@@ -55,12 +55,28 @@ pub async fn remove_arl() -> Result<()> {
     remove_arl_from(&config_dir()).await
 }
 
-/// Attempt login with stored ARL, or prompt the user
-pub async fn login(api: &DeezerApi) -> Result<bool> {
+/// Attempt login: explicit ARL first, then the stored one, else prompt.
+/// `provided` is the `--arl` flag or `DEEZCO_ARL` environment variable.
+pub async fn login(api: &DeezerApi, provided: Option<&str>) -> Result<bool> {
+    // An explicitly provided ARL is authoritative
+    if let Some(arl) = provided {
+        return match api.login_via_arl(arl).await {
+            Ok(true) => {
+                save_arl_to(&config_dir(), arl).await?;
+                Ok(true)
+            }
+            Ok(false) => {
+                eprintln!("Login failed. Invalid ARL.");
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        };
+    }
+
     login_with(api, &config_dir(), default_prompt).await
 }
 
-/// Interactive ARL prompt (requires a terminal)
+/// Read an ARL from stdin (no terminal UI dependency)
 fn default_prompt() -> Result<String> {
     println!("No stored login found — you need your Deezer ARL cookie to use deezco.\n");
     println!("How to get it:");
@@ -69,11 +85,14 @@ fn default_prompt() -> Result<String> {
     println!("  3. Go to Application > Cookies > https://www.deezer.com");
     println!("  4. Copy the value of the 'arl' cookie\n");
     println!("It is stored locally and used to log you in on later runs.\n");
+    println!("Alternatively, pass it via --arl or the DEEZCO_ARL environment variable.");
 
-    dialoguer::Input::new()
-        .with_prompt("Paste your ARL")
-        .interact_text()
-        .map_err(Into::into)
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().is_empty() {
+        anyhow::bail!("No ARL provided.");
+    }
+    Ok(input)
 }
 
 /// The login state machine: try the stored ARL, fall back to prompting.

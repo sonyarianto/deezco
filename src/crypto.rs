@@ -1,26 +1,24 @@
 use aes::Aes128;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use blowfish::Blowfish;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use md5::{Digest, Md5};
 
 type BlowfishCbcDec = cbc::Decryptor<Blowfish>;
 
-/// MD5 hash returning hex string
 pub fn md5_hex(data: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
-/// AES-128-ECB encrypt (no padding) - returns hex string
 pub fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> String {
-    let cipher = Aes128::new(key.into());
+    let cipher = Aes128::new_from_slice(key).expect("Invalid AES key length");
     let mut result = Vec::new();
 
     for chunk in data.chunks(16) {
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
+        let block: [u8; 16] = chunk.try_into().expect("chunk must be 16 bytes");
+        let mut block = Array::from(block);
         cipher.encrypt_block(&mut block);
         result.extend_from_slice(&block);
     }
@@ -28,7 +26,6 @@ pub fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> String {
     hex::encode(result)
 }
 
-/// Generate the Blowfish key for track decryption
 pub fn generate_blowfish_key(track_id: &str) -> Vec<u8> {
     const SECRET: &[u8] = b"g4el58wc0zvf9na1";
     let id_md5 = md5_hex(track_id.as_bytes());
@@ -41,23 +38,22 @@ pub fn generate_blowfish_key(track_id: &str) -> Vec<u8> {
     bf_key
 }
 
-/// Decrypt a 2048-byte chunk with Blowfish CBC
 pub fn decrypt_chunk(chunk: &[u8], blowfish_key: &[u8]) -> Vec<u8> {
     let iv: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
     let mut buf = chunk.to_vec();
     let mut decryptor =
         BlowfishCbcDec::new_from_slices(blowfish_key, &iv).expect("Invalid blowfish key/iv length");
 
-    // Blowfish block size is 8 bytes; decrypt each block in place (CBC).
-    // Partial trailing blocks are left untouched, matching the previous behavior.
-    for block in buf.chunks_exact_mut(8) {
-        decryptor.decrypt_block_mut(GenericArray::from_mut_slice(block));
+    for block_data in buf.chunks_exact_mut(8) {
+        let block: [u8; 8] = block_data.try_into().expect("block must be 8 bytes");
+        let mut block = Array::from(block);
+        decryptor.decrypt_block(&mut block);
+        block_data.copy_from_slice(&block);
     }
 
     buf
 }
 
-/// Generate the encrypted stream URL path
 pub fn generate_stream_path(sng_id: &str, md5: &str, media_version: &str, format: u32) -> String {
     let url_part_raw = format!(
         "{}\u{00a4}{}\u{00a4}{}\u{00a4}{}",
@@ -73,7 +69,6 @@ pub fn generate_stream_path(sng_id: &str, md5: &str, media_version: &str, format
     aes_ecb_encrypt(b"jo6aey6haid2Teih", step2.as_bytes())
 }
 
-/// Generate the full crypted stream URL
 pub fn generate_crypted_stream_url(
     sng_id: &str,
     md5: &str,
@@ -88,7 +83,6 @@ pub fn generate_crypted_stream_url(
     )
 }
 
-/// Decrypt a full encrypted stream, processing 2048*3-byte blocks
 pub fn decrypt_stream(encrypted: &[u8], blowfish_key: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(encrypted.len());
     let mut offset = 0;
@@ -116,15 +110,17 @@ pub fn decrypt_stream(encrypted: &[u8], blowfish_key: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbc::cipher::BlockEncryptMut;
+    use cbc::cipher::BlockModeEncrypt;
 
-    /// Encrypt with Blowfish-CBC using the same IV as the decoder.
     fn blowfish_cbc_encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
         let mut buf = data.to_vec();
         let mut encryptor =
             cbc::Encryptor::<Blowfish>::new_from_slices(key, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
-        for block in buf.chunks_exact_mut(8) {
-            encryptor.encrypt_block_mut(GenericArray::from_mut_slice(block));
+        for block_data in buf.chunks_exact_mut(8) {
+            let block: [u8; 8] = block_data.try_into().expect("block must be 8 bytes");
+            let mut block = Array::from(block);
+            encryptor.encrypt_block(&mut block);
+            block_data.copy_from_slice(&block);
         }
         buf
     }
@@ -137,7 +133,6 @@ mod tests {
 
     #[test]
     fn aes_ecb_encrypt_matches_fips_vector() {
-        // FIPS-197 Appendix B: AES-128 with an all-zero key and plaintext block
         assert_eq!(
             aes_ecb_encrypt(&[0u8; 16], &[0u8; 16]),
             "66e94bd4ef8a2c3b884cfa59ca342b2e"
@@ -146,7 +141,6 @@ mod tests {
 
     #[test]
     fn aes_ecb_encrypt_processes_blocks_independently() {
-        // ECB mode: identical plaintext blocks produce identical ciphertext blocks
         let one = aes_ecb_encrypt(&[0u8; 16], &[0u8; 16]);
         let two = aes_ecb_encrypt(&[0u8; 16], &[0u8; 32]);
         assert_eq!(two, format!("{one}{one}"));
@@ -154,8 +148,6 @@ mod tests {
 
     #[test]
     fn generate_blowfish_key_matches_known_answer() {
-        // For track id "123": MD5("123") = "202cb962ac59075b964b07152d234b70",
-        // key[i] = md5_hex_ascii[i] ^ md5_hex_ascii[i + 16] ^ SECRET[i]
         let expected = [
             0x6c, 0x32, 0x63, 0x6d, 0x67, 0x36, 0x70, 0x64, 0x63, 0x7d, 0x71, 0x6c, 0x3d, 0x3b,
             0x63, 0x63,
@@ -187,7 +179,7 @@ mod tests {
     #[test]
     fn decrypt_chunk_leaves_partial_trailing_block_untouched() {
         let key = b"0123456789abcdef";
-        let data: Vec<u8> = (0..20u8).collect(); // 16 full bytes + 4 trailing
+        let data: Vec<u8> = (0..20u8).collect();
 
         let decrypted = decrypt_chunk(&data, key);
 
@@ -200,8 +192,6 @@ mod tests {
         let key = b"0123456789abcdef";
         let plaintext: Vec<u8> = (0..=255u8).cycle().take(2048 * 3 + 100).collect();
 
-        // Build an encrypted stream: every 6144 bytes, the first 2048 are
-        // Blowfish-CBC encrypted and the rest pass through unchanged.
         let mut encrypted = Vec::new();
         let mut offset = 0;
         while offset < plaintext.len() {
@@ -222,7 +212,7 @@ mod tests {
     #[test]
     fn decrypt_stream_passes_through_short_input() {
         let key = b"0123456789abcdef";
-        let data: Vec<u8> = (0..100u8).collect(); // shorter than a 2048-byte block
+        let data: Vec<u8> = (0..100u8).collect();
 
         assert_eq!(decrypt_stream(&data, key), data);
     }

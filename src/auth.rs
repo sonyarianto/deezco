@@ -62,13 +62,16 @@ pub async fn login(api: &DeezerApi) -> Result<bool> {
 
 /// Interactive ARL prompt (requires a terminal)
 fn default_prompt() -> Result<String> {
-    println!("You need a Deezer ARL cookie to use this tool.");
-    println!(
-        "Get it from your browser: open deezer.com, press F12, go to Application > Cookies > arl\n"
-    );
+    println!("No stored login found — you need your Deezer ARL cookie to use deezco.\n");
+    println!("How to get it:");
+    println!("  1. Log in to https://www.deezer.com in your browser");
+    println!("  2. Press F12 to open Developer Tools");
+    println!("  3. Go to Application > Cookies > https://www.deezer.com");
+    println!("  4. Copy the value of the 'arl' cookie\n");
+    println!("It is stored locally and used to log you in on later runs.\n");
 
     dialoguer::Input::new()
-        .with_prompt("Enter your ARL")
+        .with_prompt("Paste your ARL")
         .interact_text()
         .map_err(Into::into)
 }

@@ -83,6 +83,16 @@ fn extract_id(input: &str, _entity: &str) -> String {
     input.to_string()
 }
 
+/// Print a startup banner with the tool name and version.
+fn print_banner() {
+    let version = env!("CARGO_PKG_VERSION");
+    let title = format!("deezco v{version} — Deezer music downloader");
+    let width = title.chars().count() + 4;
+    println!("╔{}╗", "═".repeat(width));
+    println!("║  {title}  ║");
+    println!("╚{}╝\n", "═".repeat(width));
+}
+
 /// Default output directory: the user's OS Downloads folder.
 fn default_output_dir() -> PathBuf {
     dirs::download_dir().unwrap_or_else(|| PathBuf::from("./downloads"))
@@ -250,6 +260,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = parse_format(&cli.quality);
     let output = resolve_output_dir(cli.output.clone(), env_output_dir());
+
+    if !matches!(&cli.command, Some(Commands::Logout)) {
+        print_banner();
+    }
 
     let api = DeezerApi::new()?;
 

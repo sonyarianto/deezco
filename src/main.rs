@@ -46,6 +46,11 @@ enum Commands {
         /// Deezer artist URL, ID, or search name
         query: String,
     },
+    /// Download an album by URL or ID
+    Album {
+        /// Deezer album URL or album ID
+        url: String,
+    },
     /// Interactive mode - choose what to download
     Interactive,
     /// Remove stored login credentials
@@ -105,6 +110,7 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &Path) -
             "Download a playlist",
             "Download favorites (liked songs)",
             "Download all songs from an artist",
+            "Download an album",
             "Quit",
         ];
 
@@ -178,6 +184,13 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &Path) -
                 }
             }
             4 => {
+                let input: String = Input::new()
+                    .with_prompt("Enter album URL or ID")
+                    .interact_text()?;
+                let id = extract_id(&input, "album");
+                download::download_album(api, &id, format, output).await?;
+            }
+            5 => {
                 println!("Bye!");
                 break;
             }
@@ -270,6 +283,10 @@ async fn main() -> Result<()> {
             if !download_artist_query(&api, &query, format, &output).await? {
                 return Ok(());
             }
+        }
+        Some(Commands::Album { url }) => {
+            let id = extract_id(&url, "album");
+            download::download_album(&api, &id, format, &output).await?;
         }
         Some(Commands::Interactive) | None => {
             interactive_mode(&api, format, &output).await?;

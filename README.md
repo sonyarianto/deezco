@@ -46,6 +46,7 @@ deezco [OPTIONS] [COMMAND]
 | `playlist` | Download a playlist by URL or ID |
 | `favorites` | Download your liked/favorite songs |
 | `artist` | Download all songs from an artist |
+| `album` | Download an album by URL or ID |
 | `interactive`| Interactive mode (default when no command) |
 | `logout` | Remove stored login credentials |
 
@@ -92,6 +93,10 @@ deezco -q flac favorites
 # Download an artist's full discography
 deezco artist "Daft Punk"
 deezco artist 27
+
+# Download a single album
+deezco album https://www.deezer.com/en/album/302127
+deezco album 302127
 
 # Custom output directory
 deezco -o ~/Music -q flac artist "Radiohead"

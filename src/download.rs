@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use futures_util::stream;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -399,6 +400,49 @@ pub async fn download_track(
     Ok(filepath)
 }
 
+/// Max number of tracks downloaded in parallel
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+
+/// Download a list of tracks with bounded concurrency.
+/// Returns `(downloaded, failed)`.
+async fn download_tracks_concurrently(
+    api: &DeezerApi,
+    tracks: &[GwTrack],
+    format: TrackFormat,
+    output_dir: &Path,
+) -> (usize, usize) {
+    let total = tracks.len();
+    let results = stream::iter(tracks.iter().map(|track| {
+        let api = api.clone();
+        let dir = output_dir.to_path_buf();
+        let display = track.display_name();
+        async move {
+            let outcome = download_track(&api, track, format, &dir, false).await;
+            (display, outcome)
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut downloaded = 0;
+    let mut failed = 0;
+    for (i, (display, outcome)) in results.into_iter().enumerate() {
+        println!("[{}/{}] {}", i + 1, total, display);
+        match outcome {
+            Ok(_) => {
+                downloaded += 1;
+                println!("  [ok] Downloaded successfully");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  [err] Failed: {}", e);
+            }
+        }
+    }
+    (downloaded, failed)
+}
+
 /// Download a playlist by ID
 pub async fn download_playlist(
     api: &DeezerApi,
@@ -419,24 +463,8 @@ pub async fn download_playlist(
 
     println!("Found {} tracks\n", total);
 
-    let mut downloaded = 0;
-    let mut failed = 0;
-
-    for (i, track) in tracks.iter().enumerate() {
-        let display = track.display_name();
-        println!("[{}/{}] {}", i + 1, total, display);
-
-        match download_track(api, track, format, &playlist_dir, true).await {
-            Ok(_) => {
-                downloaded += 1;
-                println!("  [ok] Downloaded successfully");
-            }
-            Err(e) => {
-                failed += 1;
-                eprintln!("  [err] Failed: {}", e);
-            }
-        }
-    }
+    let (downloaded, failed) =
+        download_tracks_concurrently(api, &tracks, format, &playlist_dir).await;
 
     println!(
         "\nPlaylist complete: {} downloaded, {} failed out of {} tracks",
@@ -461,33 +489,18 @@ pub async fn download_favorites(
 
     println!("Found {} favorite tracks\n", ids.len());
 
-    // Fetch track data in batches
+    // Fetch track data and download in batches of 50
     let favorites_dir = output_dir.join("Favorites");
     let total = ids.len();
     let mut downloaded = 0;
     let mut failed = 0;
 
-    // Process in batches of 50
-    for (batch_start, batch) in ids.chunks(50).enumerate() {
-        let batch_ids: Vec<String> = batch.to_vec();
-        let tracks = api.get_tracks_by_ids(&batch_ids).await?;
-
-        for (j, track) in tracks.iter().enumerate() {
-            let i = batch_start * 50 + j + 1;
-            let display = track.display_name();
-            println!("[{}/{}] {}", i, total, display);
-
-            match download_track(api, track, format, &favorites_dir, true).await {
-                Ok(_) => {
-                    downloaded += 1;
-                    println!("  [ok] Downloaded successfully");
-                }
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("  [err] Failed: {}", e);
-                }
-            }
-        }
+    for batch in ids.chunks(50) {
+        let tracks = api.get_tracks_by_ids(batch).await?;
+        let (downloaded_in_batch, failed_in_batch) =
+            download_tracks_concurrently(api, &tracks, format, &favorites_dir).await;
+        downloaded += downloaded_in_batch;
+        failed += failed_in_batch;
     }
 
     println!(
@@ -588,6 +601,36 @@ pub async fn download_artist(
     Ok(())
 }
 
+/// Download all tracks from an album
+pub async fn download_album(
+    api: &DeezerApi,
+    alb_id: &str,
+    format: TrackFormat,
+    output_dir: &Path,
+) -> Result<()> {
+    let info = api.get_album_info(alb_id).await?;
+    let album_title = info["ALB_TITLE"].as_str().unwrap_or("Unknown Album");
+    let artist_name = info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
+
+    println!("Downloading album: {} - {}\n", artist_name, album_title);
+
+    let tracks = api.get_album_tracks(alb_id).await?;
+    let total = tracks.len();
+    println!("Found {} tracks\n", total);
+
+    let album_dir = output_dir
+        .join(sanitize_filename(artist_name))
+        .join(sanitize_filename(album_title));
+
+    let (downloaded, failed) = download_tracks_concurrently(api, &tracks, format, &album_dir).await;
+
+    println!(
+        "\nAlbum complete: {} downloaded, {} failed out of {} tracks",
+        downloaded, failed, total
+    );
+    Ok(())
+}
+
 /// Download a single track by URL or ID
 pub async fn download_single_track(
     api: &DeezerApi,
@@ -601,14 +644,10 @@ pub async fn download_single_track(
     let display = track.display_name();
     println!("Downloading: {}\n", display);
 
-    match download_track(api, &track, format, output_dir, true).await {
-        Ok(path) => {
-            println!("\nSaved to: {}", path.display());
-        }
-        Err(e) => {
-            eprintln!("\nFailed to download: {}", e);
-        }
-    }
+    let path = download_track(api, &track, format, output_dir, true)
+        .await
+        .context("Failed to download track")?;
+    println!("\nSaved to: {}", path.display());
 
     Ok(())
 }

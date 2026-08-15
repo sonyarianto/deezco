@@ -416,6 +416,11 @@ impl DeezerApi {
         Ok(tracks)
     }
 
+    pub async fn get_album_info(&self, alb_id: &str) -> Result<Value> {
+        self.gw_call("album.getData", json!({ "ALB_ID": alb_id }))
+            .await
+    }
+
     pub async fn search_artist(&self, query: &str) -> Result<Value> {
         let result = self
             .client

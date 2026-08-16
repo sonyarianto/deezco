@@ -18,6 +18,8 @@ hex = "0.4"
 anyhow = "1"
 futures-util = "0.3"
 dirs = "6"
+axum = "0.8"
+rand = "0.8"
 
 [lints.rust]
 warnings = "deny"

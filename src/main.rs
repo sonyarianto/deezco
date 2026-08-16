@@ -3,6 +3,7 @@ mod auth;
 mod crypto;
 mod download;
 mod models;
+mod serve;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -16,7 +17,7 @@ use crate::api::DeezerApi;
 use crate::models::{FollowedArtist, GwTrack, TrackFormat};
 
 #[derive(Parser)]
-#[command(name = "deezco", version, about = "Deezer music downloader CLI")]
+#[command(name = "deezco", version, about = "Deezer music downloader.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -156,6 +157,18 @@ enum Commands {
     Following,
     /// Remove stored login credentials
     Logout,
+    /// Serve playlists as HTTP audio to a media player (e.g. Crabsoup)
+    Serve {
+        /// Address to bind the HTTP server to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind the HTTP server to
+        #[arg(long, default_value_t = 9001)]
+        port: u16,
+        /// How often to refetch playlists so web edits are picked up
+        #[arg(long, default_value_t = 300)]
+        refresh_secs: u64,
+    },
 }
 
 fn parse_format(quality: &str) -> TrackFormat {
@@ -985,8 +998,11 @@ async fn main() -> Result<()> {
         {
             println!("Logged in as: {}\n", u.name);
         }
+        drop(user);
 
-        tokio::fs::create_dir_all(&output).await?;
+        if !matches!(command, Commands::Serve { .. }) {
+            tokio::fs::create_dir_all(&output).await?;
+        }
     }
 
     match command {
@@ -1145,6 +1161,11 @@ async fn main() -> Result<()> {
             auth::remove_arl().await?;
             println!("Logged out. Stored ARL removed.");
         }
+        Commands::Serve {
+            host,
+            port,
+            refresh_secs,
+        } => serve::serve(api, format, &host, port, refresh_secs).await?,
     }
 
     Ok(())

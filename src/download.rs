@@ -334,6 +334,95 @@ async fn download_to_file(api: &DeezerApi, url: &str, filepath: &Path) -> Result
     Ok(())
 }
 
+/// Download and decrypt a single track into memory.
+pub struct FetchedTrack {
+    pub data: Vec<u8>,
+}
+
+/// Resolve a track's download URL and fetch its decrypted audio.
+pub async fn fetch_track_audio(
+    api: &DeezerApi,
+    track: &GwTrack,
+    format: TrackFormat,
+    show_progress: bool,
+) -> Result<FetchedTrack> {
+    let (url, _) = get_download_url(api, track, format).await?;
+    fetch_track_audio_from_url(api, &url, &track.id_str(), show_progress).await
+}
+
+/// Fetch and decrypt audio from an already-resolved stream URL.
+pub async fn fetch_track_audio_from_url(
+    api: &DeezerApi,
+    url: &str,
+    sng_id: &str,
+    show_progress: bool,
+) -> Result<FetchedTrack> {
+    // Download using the shared API client
+    let response = api
+        .client()
+        .get(url)
+        .send()
+        .await
+        .context("Failed to download track")?;
+
+    if !response.status().is_success() {
+        bail!("Download failed with status: {}", response.status());
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+
+    let pb = if show_progress && total_size > 0 {
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Download to memory (needed for decryption)
+    let mut data = Vec::with_capacity(total_size as usize);
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Error reading download stream")?;
+        if let Some(ref pb) = pb {
+            pb.inc(chunk.len() as u64);
+        }
+        data.extend_from_slice(&chunk);
+    }
+
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    if data.is_empty() {
+        bail!("Downloaded file is empty");
+    }
+
+    // Decrypt the stream
+    let blowfish_key = crypto::generate_blowfish_key(sng_id);
+    let final_data = crypto::decrypt_stream(&data, &blowfish_key);
+
+    // Remove leading null bytes (depadding) - but not for ftyp (MP4)
+    let output_data = if !final_data.is_empty() && final_data[0] == 0 {
+        if final_data.len() > 8 && &final_data[4..8] == b"ftyp" {
+            final_data
+        } else {
+            let start = final_data.iter().position(|&b| b != 0).unwrap_or(0);
+            final_data[start..].to_vec()
+        }
+    } else {
+        final_data
+    };
+
+    Ok(FetchedTrack { data: output_data })
+}
+
 pub async fn download_track(
     api: &DeezerApi,
     track: &GwTrack,
@@ -400,72 +489,12 @@ pub async fn download_track(
         return Ok(filepath);
     }
 
-    // Download using the shared API client
-    let response = api
-        .client()
-        .get(&url)
-        .send()
-        .await
-        .context("Failed to download track")?;
-
-    if !response.status().is_success() {
-        bail!("Download failed with status: {}", response.status());
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
-
-    let pb = if show_progress && total_size > 0 {
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("##-"),
-        );
-        Some(pb)
-    } else {
-        None
-    };
-
-    // Download to memory (needed for decryption)
-    let mut data = Vec::with_capacity(total_size as usize);
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Error reading download stream")?;
-        if let Some(ref pb) = pb {
-            pb.inc(chunk.len() as u64);
-        }
-        data.extend_from_slice(&chunk);
-    }
-
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
-
-    if data.is_empty() {
-        bail!("Downloaded file is empty");
-    }
-
-    // Decrypt the stream
-    let blowfish_key = crypto::generate_blowfish_key(&sng_id);
-    let final_data = crypto::decrypt_stream(&data, &blowfish_key);
-
-    // Remove leading null bytes (depadding) - but not for ftyp (MP4)
-    let output_data = if !final_data.is_empty() && final_data[0] == 0 {
-        if final_data.len() > 8 && &final_data[4..8] == b"ftyp" {
-            final_data
-        } else {
-            let start = final_data.iter().position(|&b| b != 0).unwrap_or(0);
-            final_data[start..].to_vec()
-        }
-    } else {
-        final_data
-    };
+    let fetched =
+        fetch_track_audio_from_url(api, &url, &sng_id, show_progress).await?;
 
     // Write to file
     let mut file = tokio::fs::File::create(&filepath).await?;
-    file.write_all(&output_data).await?;
+    file.write_all(&fetched.data).await?;
     file.flush().await?;
 
     Ok(filepath)

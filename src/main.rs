@@ -157,7 +157,7 @@ enum Commands {
     Following,
     /// Remove stored login credentials
     Logout,
-    /// Serve playlists as HTTP audio to a media player (e.g. Crabsoup)
+    /// Serve playlists as HTTP audio to an external service consumer
     Serve {
         /// Address to bind the HTTP server to
         #[arg(long, default_value = "127.0.0.1")]

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -482,55 +484,67 @@ impl Producer {
             return Some(Ok(chunk));
         }
     }
+
+    /// The bitrate advertised to Icecast, matching the actual output stream.
+    fn advertised_kbps(&self) -> u32 {
+        if self.stereo.is_some() {
+            target_bitrate(self.fetch_format, self.transcode)
+        } else {
+            self.transcode
+                .unwrap_or_else(|| (nominal_bytes_per_sec(self.fetch_format) * 8 / 1000) as u32)
+        }
+    }
 }
 
 /// Run one source connection: PUT the endless body to Icecast, then wait
 /// until Icecast drops the connection. Returns when the connection ends.
+/// The producer survives reconnects, so a dropped connection resumes the
+/// buffered track instead of starting over from scratch.
 async fn run_connection(
-    api: &DeezerApi,
-    queue: &TrackQueue,
-    fetch_format: TrackFormat,
-    transcode: Option<u32>,
-    stereo: Option<StereoConfig>,
+    producer: &Arc<Mutex<Producer>>,
     config: &IcecastConfig,
 ) -> Result<(), StreamError> {
     let url = format!("{}{}", config.server.trim_end_matches('/'), config.mount);
-    let advertised_kbps = if stereo.is_some() {
-        target_bitrate(fetch_format, transcode)
-    } else {
-        transcode.unwrap_or_else(|| (nominal_bytes_per_sec(fetch_format) * 8 / 1000) as u32)
-    };
-    let preparation_note = if stereo.is_some() {
-        " (Stereo Tool processing can take a minute)"
-    } else {
-        ""
-    };
-    let mut producer = Producer::new(
-        api.clone(),
-        queue.clone(),
-        fetch_format,
-        transcode,
-        stereo,
-        config.playlist.clone(),
-    );
-    // Wait until the first track is fully ready (fetched, processed, encoded)
+    // Wait until a track is fully ready (fetched, processed, encoded)
     // before registering the source: once connected, audio must flow
-    // immediately or silent-source hosts drop the connection.
-    println!("deezco: preparing the first track before connecting{preparation_note}");
+    // immediately or silent-source hosts drop the connection. When the
+    // producer already holds a ready track (e.g. after a reconnect), this
+    // returns instantly.
+    let mut prepared = false;
+    let advertised_kbps;
+    let client;
     loop {
-        match producer.warm_up().await {
-            Ok(()) => break,
+        let mut p = producer.lock().await;
+        if p.current.is_none() && !prepared {
+            let note = if p.stereo.is_some() {
+                " (Stereo Tool processing can take a minute)"
+            } else {
+                ""
+            };
+            println!("deezco: preparing the first track before connecting{note}");
+            prepared = true;
+        }
+        match p.warm_up().await {
+            Ok(()) => {
+                advertised_kbps = p.advertised_kbps();
+                client = p.api.client().clone();
+                break;
+            }
             Err(err) => {
                 eprintln!("deezco: first track not ready: {err}; retrying");
+                drop(p);
                 sleep(RETRY_DELAY).await;
             }
         }
     }
-    let body = stream::unfold(producer, |mut producer| async move {
-        producer.next_chunk().await.map(|chunk| (chunk, producer))
+    let body = stream::unfold(producer.clone(), |producer| async move {
+        let chunk = {
+            let mut p = producer.lock().await;
+            p.next_chunk().await
+        };
+        chunk.map(|chunk| (chunk, producer))
     });
-    let mut request = api
-        .client()
+    let mut request = client
         .put(&url)
         .basic_auth(&config.username, Some(&config.password))
         .header(header::CONTENT_TYPE, "audio/mpeg")
@@ -608,17 +622,20 @@ pub async fn stream(
         refresh_secs
     );
 
+    // The producer outlives individual connections: after a reconnect it
+    // resumes the buffered track and its background prefetch, so dropped
+    // connections cost a few seconds instead of a full track preparation.
+    let producer = Arc::new(Mutex::new(Producer::new(
+        api.clone(),
+        queue.clone(),
+        fetch_format,
+        transcode,
+        stereo,
+        config.playlist.clone(),
+    )));
+
     loop {
-        match run_connection(
-            &api,
-            &queue,
-            fetch_format,
-            transcode,
-            stereo.clone(),
-            &config,
-        )
-        .await
-        {
+        match run_connection(&producer, &config).await {
             Ok(()) => eprintln!("deezco: source connection closed by Icecast; reconnecting"),
             Err(StreamError::Transient(err)) => {
                 eprintln!("deezco: stream error: {err}; reconnecting")

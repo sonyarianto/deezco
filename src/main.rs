@@ -184,6 +184,9 @@ enum Commands {
         /// Icecast mount point, e.g. /radio
         #[arg(long)]
         mount: String,
+        /// Icecast source username
+        #[arg(long, default_value = "source")]
+        username: String,
         /// Icecast source password (or set DEEZCO_ICECAST_PASSWORD)
         #[arg(long)]
         password: Option<String>,
@@ -1221,6 +1224,7 @@ async fn main() -> Result<()> {
             playlist,
             server,
             mount,
+            username,
             password,
             name,
             genre,
@@ -1267,6 +1271,7 @@ async fn main() -> Result<()> {
             let config = icecast::IcecastConfig {
                 server,
                 mount,
+                username,
                 password,
                 name,
                 genre,

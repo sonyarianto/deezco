@@ -38,6 +38,8 @@ enum StreamError {
 pub struct IcecastConfig {
     pub server: String,
     pub mount: String,
+    /// Source username for basic auth (usually `source`)
+    pub username: String,
     pub password: String,
     pub name: Option<String>,
     pub genre: Option<String>,
@@ -500,7 +502,7 @@ async fn run_connection(
     let mut request = api
         .client()
         .put(&url)
-        .basic_auth("source", Some(&config.password))
+        .basic_auth(&config.username, Some(&config.password))
         .header(header::CONTENT_TYPE, "audio/mpeg")
         .header("icy-metaint", META_INTERVAL.to_string())
         .header("ice-metadata", "1")

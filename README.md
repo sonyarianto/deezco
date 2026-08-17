@@ -266,6 +266,10 @@ export DEEZCO_ICECAST_PASSWORD=hackme
 deezco stream https://www.deezer.com/en/playlist/908622995 \
   --server http://localhost:8000 --mount /radio --public
 
+# Non-default source username (defaults to "source")
+deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
+  --mount /hDQFK --password hackme --username source
+
 # Listeners tune in at the mount; playlist edits are picked up periodically
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --refresh-secs 60

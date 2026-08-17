@@ -27,6 +27,10 @@ const CHUNK_SIZE: usize = 32768;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// How long to wait before reconnecting after Icecast drops the source.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Cap for the exponential backoff between connection attempts, so a host
+/// that keeps resetting connections (edge proxies, rate limiters) gets time
+/// to clear instead of being hammered every few seconds.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
 /// Errors from a single source connection. Transient errors (drops,
 /// unreachable server) are worth reconnecting; fatal ones (rejected by
@@ -634,15 +638,28 @@ pub async fn stream(
         config.playlist.clone(),
     )));
 
+    let mut reconnect_delay = RECONNECT_DELAY;
     loop {
-        match run_connection(&producer, &config).await {
-            Ok(()) => eprintln!("deezco: source connection closed by Icecast; reconnecting"),
+        let connected = match run_connection(&producer, &config).await {
+            Ok(()) => {
+                eprintln!("deezco: source connection closed by Icecast; reconnecting");
+                true
+            }
             Err(StreamError::Transient(err)) => {
-                eprintln!("deezco: stream error: {err}; reconnecting")
+                eprintln!("deezco: stream error: {err}; reconnecting");
+                false
             }
             Err(StreamError::Fatal(err)) => bail!("{err}"),
+        };
+        // Back off after failed attempts (hosts like caster.fm reset rapid
+        // reconnects, and hammering every 5s keeps the block alive); reset
+        // after a connection that actually lasted.
+        if connected {
+            reconnect_delay = RECONNECT_DELAY;
         }
-        sleep(RECONNECT_DELAY).await;
+        eprintln!("deezco: next connection attempt in {:?}", reconnect_delay);
+        sleep(reconnect_delay).await;
+        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
     }
 }
 

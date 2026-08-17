@@ -390,6 +390,18 @@ impl Producer {
         }
     }
 
+    /// Ensure the first track is loaded and ready. Used before opening the
+    /// Icecast connection so audio flows immediately upon registration:
+    /// hosts like caster.fm drop silent sources within seconds, and the
+    /// first track can take a while to prepare (download + Stereo Tool
+    /// processing + encoding).
+    async fn warm_up(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            return Ok(());
+        }
+        self.load_next_track().await
+    }
+
     /// Load the next track: await the prefetch (or fetch it directly on the
     /// first run) and kick off the prefetch for the following one.
     async fn load_next_track(&mut self) -> Result<()> {
@@ -488,7 +500,7 @@ async fn run_connection(
     } else {
         transcode.unwrap_or_else(|| (nominal_bytes_per_sec(fetch_format) * 8 / 1000) as u32)
     };
-    let producer = Producer::new(
+    let mut producer = Producer::new(
         api.clone(),
         queue.clone(),
         fetch_format,
@@ -496,6 +508,18 @@ async fn run_connection(
         stereo,
         config.playlist.clone(),
     );
+    // Wait until the first track is fully ready (fetched, processed, encoded)
+    // before registering the source: once connected, audio must flow
+    // immediately or silent-source hosts drop the connection.
+    loop {
+        match producer.warm_up().await {
+            Ok(()) => break,
+            Err(err) => {
+                eprintln!("deezco: first track not ready: {err}; retrying");
+                sleep(RETRY_DELAY).await;
+            }
+        }
+    }
     let body = stream::unfold(producer, |mut producer| async move {
         producer.next_chunk().await.map(|chunk| (chunk, producer))
     });

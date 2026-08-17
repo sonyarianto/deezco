@@ -272,6 +272,19 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 # (8-320) is fetched as MP3 320 and re-encoded with ffmpeg
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --bitrate 96
+
+# Run every track through the Thimeo Stereo Tool (a licensed
+# stereo_tool_cmd_64 binary) for FM-style processing: each track is decoded
+# to PCM, processed, and re-encoded to the target bitrate
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --stereo-tool ~/tools/stereo_tool_cmd_64
+
+# Custom Stereo Tool settings file and processing rate (defaults: audio.sts
+# next to the binary if present, 44100 Hz). A license key is passed with
+# --stereo-tool-key when the tool requires one
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --stereo-tool ~/tools/stereo_tool_cmd_64 \
+  --sts ~/tools/audio.sts --stereo-rate 48000 --bitrate 128
 ```
 
 ### Output layout
@@ -313,7 +326,8 @@ src/
   models.rs    Data structures (tracks, playlists, albums, formats)
   queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
   serve.rs     HTTP playlist server for media players
-  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
+  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing,
+               ffmpeg transcoding, Thimeo Stereo Tool processing)
 ```
 
 ### Technical Details

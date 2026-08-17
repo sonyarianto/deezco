@@ -131,6 +131,9 @@ enum SortDir {
     Desc,
 }
 
+/// The Stream variant carries many small CLI fields, making it larger than
+/// the other variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Download a track by URL or ID (names print search results)
@@ -200,6 +203,20 @@ enum Commands {
         /// when set; 128 and 320 stream natively without transcoding
         #[arg(long)]
         bitrate: Option<u32>,
+        /// Path to the Thimeo Stereo Tool CLI binary (stereo_tool_cmd_64).
+        /// When set, every track runs through it (decode -> process -> encode)
+        #[arg(long)]
+        stereo_tool: Option<PathBuf>,
+        /// Stereo Tool processor settings file (.sts); defaults to audio.sts
+        /// next to the binary when present
+        #[arg(long)]
+        sts: Option<PathBuf>,
+        /// Stereo Tool license key (visible in `ps aux` while running)
+        #[arg(long)]
+        stereo_tool_key: Option<String>,
+        /// Sample rate (Hz) of the Stereo Tool processing bus
+        #[arg(long, default_value_t = 44100)]
+        stereo_rate: u32,
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 300)]
         refresh_secs: u64,
@@ -1210,6 +1227,10 @@ async fn main() -> Result<()> {
             url,
             public,
             bitrate,
+            stereo_tool,
+            sts,
+            stereo_tool_key,
+            stereo_rate,
             refresh_secs,
         } => {
             let password = password.or_else(|| {
@@ -1222,6 +1243,27 @@ async fn main() -> Result<()> {
                     "an Icecast source password is required (--password or DEEZCO_ICECAST_PASSWORD)"
                 );
             };
+            let stereo = match stereo_tool {
+                Some(binary) => {
+                    if !binary.exists() {
+                        anyhow::bail!("--stereo-tool binary not found: {}", binary.display());
+                    }
+                    let settings = match sts {
+                        Some(path) => Some(path),
+                        None => binary
+                            .parent()
+                            .map(|dir| dir.join("audio.sts"))
+                            .filter(|path| path.exists()),
+                    };
+                    Some(icecast::StereoConfig {
+                        binary,
+                        settings,
+                        key: stereo_tool_key,
+                        rate: stereo_rate,
+                    })
+                }
+                None => None,
+            };
             let config = icecast::IcecastConfig {
                 server,
                 mount,
@@ -1232,7 +1274,7 @@ async fn main() -> Result<()> {
                 public,
                 playlist: extract_id(&playlist, "playlist"),
             };
-            icecast::stream(api, format, config, refresh_secs, bitrate).await?;
+            icecast::stream(api, format, config, refresh_secs, bitrate, stereo).await?;
         }
     }
 

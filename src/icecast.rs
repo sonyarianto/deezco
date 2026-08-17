@@ -500,6 +500,11 @@ async fn run_connection(
     } else {
         transcode.unwrap_or_else(|| (nominal_bytes_per_sec(fetch_format) * 8 / 1000) as u32)
     };
+    let preparation_note = if stereo.is_some() {
+        " (Stereo Tool processing can take a minute)"
+    } else {
+        ""
+    };
     let mut producer = Producer::new(
         api.clone(),
         queue.clone(),
@@ -511,6 +516,7 @@ async fn run_connection(
     // Wait until the first track is fully ready (fetched, processed, encoded)
     // before registering the source: once connected, audio must flow
     // immediately or silent-source hosts drop the connection.
+    println!("deezco: preparing the first track before connecting{preparation_note}");
     loop {
         match producer.warm_up().await {
             Ok(()) => break,

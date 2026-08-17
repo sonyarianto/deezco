@@ -291,7 +291,7 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 # --stereo-tool-key when the tool requires one
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --stereo-tool ~/tools/stereo_tool_cmd_64 \
-  --sts ~/tools/audio.sts --stereo-rate 48000 --bitrate 128
+  --stereo-tool-sts ~/tools/audio.sts --stereo-rate 48000 --bitrate 128
 ```
 
 ### Output layout

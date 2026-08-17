@@ -213,7 +213,7 @@ enum Commands {
         /// Stereo Tool processor settings file (.sts); defaults to audio.sts
         /// next to the binary when present
         #[arg(long)]
-        sts: Option<PathBuf>,
+        stereo_tool_sts: Option<PathBuf>,
         /// Stereo Tool license key (visible in `ps aux` while running)
         #[arg(long)]
         stereo_tool_key: Option<String>,
@@ -1232,7 +1232,7 @@ async fn main() -> Result<()> {
             public,
             bitrate,
             stereo_tool,
-            sts,
+            stereo_tool_sts,
             stereo_tool_key,
             stereo_rate,
             refresh_secs,
@@ -1252,7 +1252,7 @@ async fn main() -> Result<()> {
                     if !binary.exists() {
                         anyhow::bail!("--stereo-tool binary not found: {}", binary.display());
                     }
-                    let settings = match sts {
+                    let settings = match stereo_tool_sts {
                         Some(path) => Some(path),
                         None => binary
                             .parent()

@@ -1,6 +1,4 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
@@ -10,13 +8,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use rand::seq::SliceRandom;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
 use crate::api::DeezerApi;
 use crate::download;
 use crate::models::{GwTrack, TrackFormat};
+use crate::queue::{NextTrackError, TrackQueue};
 
 #[derive(Clone)]
 struct ServeState {
@@ -24,32 +21,7 @@ struct ServeState {
     format: TrackFormat,
     host: String,
     port: u16,
-    refresh: Duration,
-    queues: Arc<Mutex<HashMap<String, PlaylistQueue>>>,
-}
-
-struct PlaylistQueue {
-    tracks: VecDeque<GwTrack>,
-    last_fetch: Option<Instant>,
-    recent: VecDeque<String>,
-}
-
-/// The no-repeat guard: a reshuffled queue never opens with a track that
-/// was served recently (the last few pops, up to `RECENT_WINDOW`). Swaps the
-/// front with the first id outside the window; a playlist smaller than the
-/// window has nothing left to swap with and plays as shuffled.
-const RECENT_WINDOW: usize = 3;
-
-fn avoid_recent_repeat(tracks: &mut [GwTrack], recent: &VecDeque<String>) {
-    let Some(front) = tracks.first().map(|t| t.id_str()) else {
-        return;
-    };
-    if !recent.contains(&front) {
-        return;
-    }
-    if let Some(swap_idx) = tracks.iter().position(|t| !recent.contains(&t.id_str())) {
-        tracks.swap(0, swap_idx);
-    }
+    queue: TrackQueue,
 }
 
 struct ApiError {
@@ -88,53 +60,28 @@ fn track_json(track: &GwTrack, url: &str) -> Value {
     })
 }
 
-/// Pop the next track for a playlist. Each playlist is fetched once, shuffled,
-/// and walked in order; it is refetched and reshuffled when the queue runs
-/// out or when the last fetch is older than `refresh` — so edits made on the
-/// Deezer web page show up within one refresh interval. A failed fetch keeps
-/// the cached queue rather than interrupting playback.
-async fn next_track(state: &ServeState, playlist_id: &str) -> Result<GwTrack, ApiError> {
-    let mut queues = state.queues.lock().await;
-    let queue = queues.entry(playlist_id.to_string()).or_insert_with(|| PlaylistQueue {
-        tracks: VecDeque::new(),
-        last_fetch: None,
-        recent: VecDeque::new(),
-    });
-    let stale = queue
-        .last_fetch
-        .is_none_or(|fetched| fetched.elapsed() >= state.refresh);
-    if queue.tracks.is_empty() || stale {
-        match state.api.get_playlist_tracks(playlist_id).await {
-            Ok(tracks) if !tracks.is_empty() => {
-                let mut tracks = tracks;
-                tracks.shuffle(&mut rand::thread_rng());
-                avoid_recent_repeat(&mut tracks, &queue.recent);
-                queue.tracks = tracks.into();
-                queue.last_fetch = Some(Instant::now());
+/// Pop the next track for a playlist, mapping queue errors to HTTP errors.
+async fn playlist_next(
+    State(state): State<ServeState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let track = state
+        .queue
+        .next_track(&state.api, &id)
+        .await
+        .map_err(|err| match err {
+            NextTrackError::Empty => {
+                ApiError::new(StatusCode::NOT_FOUND, "playlist has no playable tracks")
             }
-            Ok(_) => {} // Deezer returned no tracks: keep the cached queue.
-            Err(err) if !queue.tracks.is_empty() => {
-                eprintln!("deezco: playlist fetch failed, keeping cache: {err}");
-            }
-            Err(err) => {
-                return Err(ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    err.to_string(),
-                ));
-            }
-        }
-    }
-    let track = queue
-        .tracks
-        .pop_front()
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "playlist has no playable tracks"));
-    if let Ok(t) = &track {
-        queue.recent.push_back(t.id_str());
-        if queue.recent.len() > RECENT_WINDOW {
-            queue.recent.pop_front();
-        }
-    }
-    track
+            NextTrackError::Fetch(message) => ApiError::new(StatusCode::BAD_GATEWAY, message),
+        })?;
+    let url = format!(
+        "{}/tracks/{}",
+        request_base_url(&headers, &state),
+        track.id_str()
+    );
+    Ok(Json(track_json(&track, &url)))
 }
 
 fn request_base_url(headers: &HeaderMap, state: &ServeState) -> String {
@@ -151,16 +98,6 @@ fn request_base_url(headers: &HeaderMap, state: &ServeState) -> String {
     }
 }
 
-async fn playlist_next(
-    State(state): State<ServeState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let track = next_track(&state, &id).await?;
-    let url = format!("{}/tracks/{}", request_base_url(&headers, &state), track.id_str());
-    Ok(Json(track_json(&track, &url)))
-}
-
 async fn playlist_list(
     State(state): State<ServeState>,
     Path(id): Path<String>,
@@ -174,17 +111,14 @@ async fn playlist_list(
     let base = request_base_url(&headers, &state);
     let items: Vec<Value> = tracks
         .iter()
-        .map(|track| {
-            track_json(track, &format!("{}/tracks/{}", base, track.id_str()))
-        })
+        .map(|track| track_json(track, &format!("{}/tracks/{}", base, track.id_str())))
         .collect();
-    Ok(Json(json!({ "id": id, "count": items.len(), "tracks": items })))
+    Ok(Json(
+        json!({ "id": id, "count": items.len(), "tracks": items }),
+    ))
 }
 
-async fn track_audio(
-    State(state): State<ServeState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn track_audio(State(state): State<ServeState>, Path(id): Path<String>) -> Response {
     let track = match state.api.get_track(&id).await {
         Ok(track) => track,
         Err(err) => {
@@ -218,8 +152,7 @@ pub async fn serve(
         format,
         host: host.to_string(),
         port,
-        refresh: Duration::from_secs(refresh_secs),
-        queues: Arc::new(Mutex::new(HashMap::new())),
+        queue: TrackQueue::new(Duration::from_secs(refresh_secs)),
     };
 
     let app = Router::new()
@@ -235,52 +168,4 @@ pub async fn serve(
     );
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn track(id: &str) -> GwTrack {
-        GwTrack {
-            sng_id: serde_json::json!(id),
-            sng_title: None,
-            md5_origin: None,
-            media_version: None,
-            art_name: None,
-            art_id: None,
-            track_token: None,
-            filesize_mp3_128: None,
-            filesize_mp3_320: None,
-            filesize_flac: None,
-            duration: None,
-        }
-    }
-
-    fn recent(ids: &[&str]) -> VecDeque<String> {
-        ids.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn no_repeat_guard_swaps_a_recent_front_track_out() {
-        let mut tracks = vec![track("1"), track("2"), track("3")];
-        avoid_recent_repeat(&mut tracks, &recent(&["1", "9"]));
-        assert_ne!(tracks[0].id_str(), "1", "front must not be recently served");
-        assert!(tracks.iter().any(|t| t.id_str() == "1"));
-    }
-
-    #[test]
-    fn no_repeat_guard_leaves_a_fresh_front_untouched() {
-        let mut tracks = vec![track("7"), track("1"), track("2")];
-        avoid_recent_repeat(&mut tracks, &recent(&["1", "2"]));
-        assert_eq!(tracks[0].id_str(), "7");
-    }
-
-    #[test]
-    fn no_repeat_guard_handles_a_playlist_smaller_than_the_window() {
-        // Everything is recent: nothing to swap with, play as shuffled.
-        let mut tracks = vec![track("1")];
-        avoid_recent_repeat(&mut tracks, &recent(&["1"]));
-        assert_eq!(tracks[0].id_str(), "1");
-    }
 }

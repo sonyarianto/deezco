@@ -489,8 +489,7 @@ pub async fn download_track(
         return Ok(filepath);
     }
 
-    let fetched =
-        fetch_track_audio_from_url(api, &url, &sng_id, show_progress).await?;
+    let fetched = fetch_track_audio_from_url(api, &url, &sng_id, show_progress).await?;
 
     // Write to file
     let mut file = tokio::fs::File::create(&filepath).await?;

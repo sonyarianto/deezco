@@ -2,7 +2,9 @@ mod api;
 mod auth;
 mod crypto;
 mod download;
+mod icecast;
 mod models;
+mod queue;
 mod serve;
 
 use anyhow::Result;
@@ -169,6 +171,39 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         refresh_secs: u64,
     },
+    /// Stream a playlist to an Icecast server as a live radio source
+    Stream {
+        /// Deezer playlist URL or playlist ID
+        playlist: String,
+        /// Icecast server base URL, e.g. http://localhost:8000
+        #[arg(long)]
+        server: String,
+        /// Icecast mount point, e.g. /radio
+        #[arg(long)]
+        mount: String,
+        /// Icecast source password (or set DEEZCO_ICECAST_PASSWORD)
+        #[arg(long)]
+        password: Option<String>,
+        /// Stream name shown to listeners
+        #[arg(long)]
+        name: Option<String>,
+        /// Stream genre shown to listeners
+        #[arg(long)]
+        genre: Option<String>,
+        /// Station website URL
+        #[arg(long)]
+        url: Option<String>,
+        /// Advertise the stream in public directories
+        #[arg(long)]
+        public: bool,
+        /// Target stream bitrate in kbps (e.g. 96). Transcodes via ffmpeg
+        /// when set; 128 and 320 stream natively without transcoding
+        #[arg(long)]
+        bitrate: Option<u32>,
+        /// How often to refetch the playlist so web edits are picked up
+        #[arg(long, default_value_t = 300)]
+        refresh_secs: u64,
+    },
 }
 
 fn parse_format(quality: &str) -> TrackFormat {
@@ -196,7 +231,6 @@ fn extract_id(input: &str, _entity: &str) -> String {
     // Already an ID
     input.to_string()
 }
-
 
 /// Default output directory: the user's OS Downloads folder.
 fn default_output_dir() -> PathBuf {
@@ -1000,7 +1034,7 @@ async fn main() -> Result<()> {
         }
         drop(user);
 
-        if !matches!(command, Commands::Serve { .. }) {
+        if !matches!(command, Commands::Serve { .. } | Commands::Stream { .. }) {
             tokio::fs::create_dir_all(&output).await?;
         }
     }
@@ -1166,6 +1200,40 @@ async fn main() -> Result<()> {
             port,
             refresh_secs,
         } => serve::serve(api, format, &host, port, refresh_secs).await?,
+        Commands::Stream {
+            playlist,
+            server,
+            mount,
+            password,
+            name,
+            genre,
+            url,
+            public,
+            bitrate,
+            refresh_secs,
+        } => {
+            let password = password.or_else(|| {
+                std::env::var("DEEZCO_ICECAST_PASSWORD")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+            let Some(password) = password else {
+                anyhow::bail!(
+                    "an Icecast source password is required (--password or DEEZCO_ICECAST_PASSWORD)"
+                );
+            };
+            let config = icecast::IcecastConfig {
+                server,
+                mount,
+                password,
+                name,
+                genre,
+                url,
+                public,
+                playlist: extract_id(&playlist, "playlist"),
+            };
+            icecast::stream(api, format, config, refresh_secs, bitrate).await?;
+        }
     }
 
     Ok(())

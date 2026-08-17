@@ -50,6 +50,8 @@ deezco [OPTIONS] [COMMAND]
 | `artist` | Download all songs from an artist (names print search results) |
 | `album` | Download an album by URL or ID |
 | `following` | Download all releases from every artist you follow |
+| `serve` | Serve playlists as HTTP audio for external media players (crabsoup, etc.) |
+| `stream` | Stream a playlist to an Icecast server as a live radio source |
 | `logout` | Remove stored login credentials |
 
 ### Options
@@ -83,6 +85,7 @@ deezco [OPTIONS] [COMMAND]
 |----------|-------------|
 | `DEEZCO_OUTPUT_DIR` | Overrides the default output directory. Takes precedence over the default, but `-o, --output` still wins. |
 | `DEEZCO_ARL` | Deezer ARL cookie used for login when no ARL is stored. Takes precedence over the stored cookie, but `--arl` still wins. |
+| `DEEZCO_ICECAST_PASSWORD` | Icecast source password used by `stream` when `--password` is not given. |
 
 ```bash
 # Set it once for your session
@@ -219,6 +222,58 @@ deezco --dry-run following
 deezco --dry-run --pick 1 track "Get Lucky"
 ```
 
+### Serving playlists to media players
+
+`serve` exposes playlists over HTTP for external consumers (e.g. the crabsoup
+media player) that pull track-by-track:
+
+```bash
+# Serve every playlist on http://127.0.0.1:9001 (pick a host/port if needed)
+deezco serve
+deezco serve --host 0.0.0.0 --port 9002
+
+# Each playlist is fetched once, shuffled, and walked in order; the no-repeat
+# guard never opens a reshuffle with a track played recently
+curl http://127.0.0.1:9001/playlists/908622995/next
+curl http://127.0.0.1:9001/playlists/908622995            # list tracks
+curl http://127.0.0.1:9001/tracks/3135556 -o track.mp3     # fetch audio
+
+# Playlist edits made on deezer.com show up within the refresh interval
+deezco serve --refresh-secs 60
+```
+
+### Live streaming to Icecast
+
+`stream` pushes a playlist to an Icecast server as a live radio source (MP3
+320/128 only — FLAC is rejected). It sends track titles to listeners via ICY
+metadata, paces playback in real time, prefetches the next track so changes
+are seamless, and reconnects automatically if the connection drops.
+
+```bash
+# Stream a playlist to an Icecast mount as a 24/7 radio source
+deezco stream 908622995 \
+  --server http://localhost:8000 \
+  --mount /radio \
+  --password hackme \
+  --name "My Radio" \
+  --genre "Electronic"
+
+# The password can also come from the environment
+export DEEZCO_ICECAST_PASSWORD=hackme
+deezco stream https://www.deezer.com/en/playlist/908622995 \
+  --server http://localhost:8000 --mount /radio --public
+
+# Listeners tune in at the mount; playlist edits are picked up periodically
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --refresh-secs 60
+
+# Stream at a custom bitrate, e.g. for a server capped at 96 kbps.
+# 128 and 320 stream natively without transcoding; any other bitrate
+# (8-320) is fetched as MP3 320 and re-encoded with ffmpeg
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --bitrate 96
+```
+
 ### Output layout
 
 Within the output directory, downloads are organized by type:
@@ -256,6 +311,9 @@ src/
   crypto.rs    Blowfish CBC decryption, AES-128-ECB stream path, key generation
   download.rs  Track/playlist/favorites/artist download orchestration
   models.rs    Data structures (tracks, playlists, albums, formats)
+  queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
+  serve.rs     HTTP playlist server for media players
+  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
 ```
 
 ### Technical Details

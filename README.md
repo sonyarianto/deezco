@@ -1,6 +1,6 @@
 # Deezco
 
-A fast, lightweight Deezer music downloader written in Rust. Single binary, no runtime dependencies.
+A fast, lightweight Deezer music downloader written in Rust. Single binary; the only runtime dependency is optional — ffmpeg, needed only for live-stream bitrate transcoding and Stereo Tool processing.
 
 ## Features
 
@@ -27,12 +27,13 @@ cd deezco
 cargo build --release
 ```
 
-The binary will be at `target/release/deezco` (approx. 2.7 MB).
+The binary will be at `target/release/deezco` (approx. 3.2 MB).
 
 ### Requirements
 
 - Rust 1.88+ (edition 2024)
 - A valid Deezer ARL cookie (see [Authentication](#authentication))
+- `ffmpeg` on PATH — optional, required only by `stream` for custom bitrates (anything other than 128/320) and for Stereo Tool processing
 
 ## Usage
 
@@ -245,9 +246,11 @@ deezco serve --refresh-secs 60
 ### Live streaming to Icecast
 
 `stream` pushes a playlist to an Icecast server as a live radio source (MP3
-320/128 only — FLAC is rejected). It sends track titles to listeners via ICY
-metadata, paces playback in real time, prefetches the next track so changes
-are seamless, and reconnects automatically if the connection drops.
+only — FLAC is rejected unless a custom `--bitrate` or `--stereo-tool` is
+active, in which case it is decoded via ffmpeg). It sends track titles to
+listeners via ICY metadata, paces playback in real time, prefetches the next
+track so changes are seamless, and reconnects automatically if the
+connection drops.
 
 ```bash
 # Stream a playlist to an Icecast mount as a 24/7 radio source

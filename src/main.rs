@@ -202,7 +202,8 @@ enum Commands {
         /// Advertise the stream in public directories
         #[arg(long)]
         public: bool,
-        /// Disable ICY track titles; use for source proxies that reset
+        /// Disable in-stream ICY track titles; titles still reach listeners via
+        /// Icecast's admin endpoint. Use for source proxies that reset
         /// connections on metadata updates (e.g. caster.fm)
         #[arg(long)]
         no_metadata: bool,

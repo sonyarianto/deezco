@@ -57,6 +57,75 @@ pub struct IcecastConfig {
     pub playlist: String,
 }
 
+/// Out-of-band "now playing" title updates via Icecast's admin metadata
+/// endpoint (`/admin/metadata?mode=updinfo`), used instead of in-stream ICY
+/// blocks on hosts that reset the source connection on metadata updates
+/// (e.g. caster.fm). Each update is a fresh short request on its own
+/// connection, so the source stream is never disturbed.
+#[derive(Clone)]
+struct TitleUpdater {
+    /// `http://host:port/admin/metadata`
+    url_base: String,
+    mount: String,
+    username: String,
+    password: String,
+    client: reqwest::Client,
+}
+
+impl TitleUpdater {
+    fn new(config: &IcecastConfig) -> Self {
+        Self {
+            url_base: format!("{}/admin/metadata", config.server.trim_end_matches('/')),
+            mount: config.mount.clone(),
+            username: config.username.clone(),
+            password: config.password.clone(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn update(&self, title: &str) -> Result<()> {
+        let params = format!(
+            "mode=updinfo&charset=UTF-8&mount={}&song={}",
+            percent_encode(self.mount.as_bytes()),
+            percent_encode(title.as_bytes())
+        );
+        let response = self
+            .client
+            .get(format!("{}?{params}", self.url_base))
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .context("Icecast title update request failed")?;
+        if !response.status().is_success() {
+            bail!("Icecast title update rejected: HTTP {}", response.status());
+        }
+        // Icecast answers HTTP 200 even when refusing the update; only the
+        // body reveals the rejection.
+        let text = response.text().await.unwrap_or_default();
+        if text.contains("will not accept") {
+            bail!("Icecast refused the title update: {}", text.trim());
+        }
+        Ok(())
+    }
+}
+
+/// RFC 3986 percent-encoding (unreserved chars pass through, everything else
+/// becomes uppercase `%XX`).
+fn percent_encode(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for &b in input {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
+}
+
 /// Thimeo Stereo Tool processing configuration.
 #[derive(Clone)]
 pub struct StereoConfig {
@@ -353,6 +422,7 @@ struct Producer {
     transcode: Option<u32>,
     stereo: Option<StereoConfig>,
     metadata: bool,
+    updater: Option<TitleUpdater>,
     nominal_bps: u64,
     playlist: String,
     current: Option<CurrentTrack>,
@@ -369,6 +439,7 @@ impl Producer {
         transcode: Option<u32>,
         stereo: Option<StereoConfig>,
         metadata: bool,
+        updater: Option<TitleUpdater>,
         playlist: String,
     ) -> Self {
         let nominal_bps = if stereo.is_some() {
@@ -394,6 +465,7 @@ impl Producer {
             transcode,
             stereo,
             metadata,
+            updater,
             nominal_bps,
             playlist,
             current: None,
@@ -432,6 +504,15 @@ impl Producer {
             }
         };
         println!("deezco: now playing: {}", track.display_name());
+        if let Some(updater) = &self.updater {
+            let updater = updater.clone();
+            let title = track.display_name();
+            tokio::spawn(async move {
+                if let Err(err) = updater.update(&title).await {
+                    eprintln!("deezco: title update failed: {err}");
+                }
+            });
+        }
         self.prefetch = Some(tokio::spawn(fetch_next_track(
             self.api.clone(),
             self.queue.clone(),
@@ -452,6 +533,12 @@ impl Producer {
             meta_remaining: META_INTERVAL,
         });
         Ok(())
+    }
+
+    /// Current track title, for out-of-band updates after a reconnect (the
+    /// server loses the title when the source drops).
+    fn current_title(&self) -> Option<String> {
+        self.current.as_ref().map(|current| current.title.clone())
     }
 
     /// Next body chunk: audio (paced) or a metadata block. `None` never
@@ -526,6 +613,7 @@ impl Producer {
 async fn run_connection(
     producer: &Arc<Mutex<Producer>>,
     config: &IcecastConfig,
+    updater: Option<&TitleUpdater>,
 ) -> Result<(), StreamError> {
     let url = format!("{}{}", config.server.trim_end_matches('/'), config.mount);
     // Wait until a track is fully ready (fetched, processed, encoded)
@@ -599,6 +687,17 @@ async fn run_connection(
         )));
     }
     println!("deezco: connected to {url} (listeners can tune in at {url})");
+    if let Some(updater) = updater {
+        let title = producer.lock().await.current_title();
+        if let Some(title) = title {
+            let updater = updater.clone();
+            tokio::spawn(async move {
+                if let Err(err) = updater.update(&title).await {
+                    eprintln!("deezco: title update failed: {err}");
+                }
+            });
+        }
+    }
 
     // Icecast keeps the response open for the whole stream; the body ends
     // only when the source connection is dropped.
@@ -651,6 +750,7 @@ pub async fn stream(
     // The producer outlives individual connections: after a reconnect it
     // resumes the buffered track and its background prefetch, so dropped
     // connections cost a few seconds instead of a full track preparation.
+    let updater = TitleUpdater::new(&config);
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
         queue.clone(),
@@ -658,12 +758,13 @@ pub async fn stream(
         transcode,
         stereo,
         config.metadata,
+        Some(updater.clone()),
         config.playlist.clone(),
     )));
 
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
-        let connected = match run_connection(&producer, &config).await {
+        let connected = match run_connection(&producer, &config, Some(&updater)).await {
             Ok(()) => {
                 eprintln!("deezco: source connection closed by Icecast; reconnecting");
                 true

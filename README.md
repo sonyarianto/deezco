@@ -294,8 +294,10 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --stereo-tool-sts ~/tools/audio.sts --stereo-rate 48000 --bitrate 128
 
 # Some source proxies (notably caster.fm's custom Icecast) reset the source
-# connection whenever the ICY track title changes. If the connection keeps
-# dropping at track changes, disable metadata:
+# connection whenever the in-stream ICY track title changes. If the
+# connection keeps dropping at track changes, disable in-stream metadata;
+# track titles then still update through Icecast's admin endpoint, so
+# listeners keep seeing "now playing":
 deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
 ```

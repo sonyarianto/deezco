@@ -202,6 +202,10 @@ enum Commands {
         /// Advertise the stream in public directories
         #[arg(long)]
         public: bool,
+        /// Disable ICY track titles; use for source proxies that reset
+        /// connections on metadata updates (e.g. caster.fm)
+        #[arg(long)]
+        no_metadata: bool,
         /// Target stream bitrate in kbps (e.g. 96). Transcodes via ffmpeg
         /// when set; 128 and 320 stream natively without transcoding
         #[arg(long)]
@@ -1230,6 +1234,7 @@ async fn main() -> Result<()> {
             genre,
             url,
             public,
+            no_metadata,
             bitrate,
             stereo_tool,
             stereo_tool_sts,
@@ -1273,6 +1278,7 @@ async fn main() -> Result<()> {
                 mount,
                 username,
                 password,
+                metadata: !no_metadata,
                 name,
                 genre,
                 url,

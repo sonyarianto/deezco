@@ -30,7 +30,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Cap for the exponential backoff between connection attempts, so a host
 /// that keeps resetting connections (edge proxies, rate limiters) gets time
 /// to clear instead of being hammered every few seconds.
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 
 /// Errors from a single source connection. Transient errors (drops,
 /// unreachable server) are worth reconnecting; fatal ones (rejected by
@@ -47,6 +47,9 @@ pub struct IcecastConfig {
     /// Source username for basic auth (usually `source`)
     pub username: String,
     pub password: String,
+    /// Send track titles to listeners as ICY metadata blocks; some source
+    /// proxies (e.g. caster.fm) reset the connection on metadata updates
+    pub metadata: bool,
     pub name: Option<String>,
     pub genre: Option<String>,
     pub url: Option<String>,
@@ -349,6 +352,7 @@ struct Producer {
     fetch_format: TrackFormat,
     transcode: Option<u32>,
     stereo: Option<StereoConfig>,
+    metadata: bool,
     nominal_bps: u64,
     playlist: String,
     current: Option<CurrentTrack>,
@@ -364,6 +368,7 @@ impl Producer {
         fetch_format: TrackFormat,
         transcode: Option<u32>,
         stereo: Option<StereoConfig>,
+        metadata: bool,
         playlist: String,
     ) -> Self {
         let nominal_bps = if stereo.is_some() {
@@ -388,6 +393,7 @@ impl Producer {
             fetch_format,
             transcode,
             stereo,
+            metadata,
             nominal_bps,
             playlist,
             current: None,
@@ -455,27 +461,40 @@ impl Producer {
             sleep(dur).await;
         }
         loop {
-            if self.current.is_none()
-                && let Err(err) = self.load_next_track().await
-            {
-                eprintln!(
-                    "deezco: track fetch failed: {err}; retrying in {:?}",
-                    RETRY_DELAY
-                );
-                sleep(RETRY_DELAY).await;
-                continue;
+            if self.current.is_none() {
+                let started = std::time::Instant::now();
+                if let Err(err) = self.load_next_track().await {
+                    eprintln!(
+                        "deezco: track fetch failed: {err}; retrying in {:?}",
+                        RETRY_DELAY
+                    );
+                    sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                // A slow prep makes the stream go silent: silent-source hosts
+                // drop the connection, so surface the stall.
+                if started.elapsed() > Duration::from_secs(2) {
+                    eprintln!(
+                        "deezco: next track took {:?} to prepare (stream was silent)",
+                        started.elapsed()
+                    );
+                }
             }
             let Some(current) = self.current.as_mut() else {
                 continue;
             };
-            if current.meta_remaining == 0 {
+            if self.metadata && current.meta_remaining == 0 {
                 current.meta_remaining = META_INTERVAL;
                 return Some(Ok(icy_metadata_block(&current.title)));
             }
-            let take = current
-                .meta_remaining
-                .min(CHUNK_SIZE)
-                .min(current.data.len() - current.pos);
+            let take = if self.metadata {
+                current
+                    .meta_remaining
+                    .min(CHUNK_SIZE)
+                    .min(current.data.len() - current.pos)
+            } else {
+                CHUNK_SIZE.min(current.data.len() - current.pos)
+            };
             let chunk = current.data[current.pos..current.pos + take].to_vec();
             let finished = current.pos + take >= current.data.len();
             current.pos += take;
@@ -552,10 +571,13 @@ async fn run_connection(
         .put(&url)
         .basic_auth(&config.username, Some(&config.password))
         .header(header::CONTENT_TYPE, "audio/mpeg")
-        .header("icy-metaint", META_INTERVAL.to_string())
-        .header("ice-metadata", "1")
         .header("ice-public", if config.public { "1" } else { "0" })
         .header("ice-bitrate", advertised_kbps.to_string());
+    if config.metadata {
+        request = request
+            .header("icy-metaint", META_INTERVAL.to_string())
+            .header("ice-metadata", "1");
+    }
     if let Some(name) = &config.name {
         request = request.header("ice-name", name);
     }
@@ -635,6 +657,7 @@ pub async fn stream(
         fetch_format,
         transcode,
         stereo,
+        config.metadata,
         config.playlist.clone(),
     )));
 

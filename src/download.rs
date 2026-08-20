@@ -12,8 +12,8 @@ use crate::track::{available_format, download_track, dry_run_track_label};
 
 // Re-export items that other modules reach via `crate::download::` so the
 // public surface stays stable after the split.
-pub use crate::track::{DownloadOptions, FetchedTrack, fetch_track_audio};
 pub(crate) use crate::track::format_annotation;
+pub use crate::track::{DownloadOptions, FetchedTrack, fetch_track_audio};
 
 /// Download a playlist by ID
 pub async fn download_playlist(
@@ -458,7 +458,7 @@ pub async fn download_single_track(
 mod tests {
     use crate::files::{is_audio_file, sanitize_filename};
     use crate::models::{AlbumInfo, GwTrack, TrackFormat};
-    use crate::track::{available_format, dry_run_track_label, format_annotation, DownloadOptions};
+    use crate::track::{DownloadOptions, available_format, dry_run_track_label, format_annotation};
 
     use super::*;
 

@@ -1,6 +1,6 @@
 use crate::api::DeezerApi;
 use crate::auth;
-use crate::cli::{parse_format, Cli, OutputFormat, SortDir, SortKey};
+use crate::cli::{Cli, OutputFormat, SortDir, SortKey, parse_format};
 use crate::download::DownloadOptions;
 use crate::models::{FollowedArtist, TrackFormat};
 use crate::resolve::{best_available_format, direction, env_output_dir};

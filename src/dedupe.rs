@@ -27,7 +27,12 @@ async fn remove_empty_dirs(root: &Path) -> Result<()> {
             continue;
         }
 
-        if tokio::fs::read_dir(&dir).await?.next_entry().await?.is_none() {
+        if tokio::fs::read_dir(&dir)
+            .await?
+            .next_entry()
+            .await?
+            .is_none()
+        {
             tokio::fs::remove_dir(&dir).await?;
         }
     }
@@ -109,9 +114,7 @@ pub async fn collect_audio_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-pub async fn build_audio_hash_index(
-    root: &Path,
-) -> Result<(HashMap<String, PathBuf>, usize)> {
+pub async fn build_audio_hash_index(root: &Path) -> Result<(HashMap<String, PathBuf>, usize)> {
     let mut index = HashMap::new();
     let mut linked = 0;
 

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::DeezerApi;
-use crate::cli::{extract_id, parse_format, Cli, Commands, OutputFormat, SortDir, SortKey};
+use crate::cli::{Cli, Commands, OutputFormat, SortDir, SortKey, extract_id, parse_format};
 use crate::models::GwTrack;
 use crate::output::{
     artist_header, enrich_followed_artists, print_album_json, print_defaults, print_favorites_json,
@@ -562,7 +562,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{extract_id, parse_format, SortDir, SortKey};
+    use crate::cli::{SortDir, SortKey, extract_id, parse_format};
     use crate::models::{FollowedArtist, GwTrack, TrackFormat};
     use crate::output::artist_header;
     use crate::resolve::{
@@ -570,7 +570,7 @@ mod tests {
     };
     use crate::sort::{
         duration_sorted_indices, format_duration, reorder_results_data, sort_by_quality,
-        sort_followed_by_quality, sort_favorites, with_duration,
+        sort_favorites, sort_followed_by_quality, with_duration,
     };
     use serde_json::Value;
     use std::collections::HashMap;

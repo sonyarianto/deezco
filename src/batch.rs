@@ -5,7 +5,7 @@ use futures_util::{StreamExt, stream};
 
 use crate::api::DeezerApi;
 use crate::models::GwTrack;
-use crate::track::{available_format, download_track, dry_run_track_label, DownloadOptions};
+use crate::track::{DownloadOptions, available_format, download_track, dry_run_track_label};
 
 /// Download a list of tracks with bounded concurrency.
 /// Each job pairs an output directory with a track.

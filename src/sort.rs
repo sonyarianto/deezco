@@ -1,5 +1,5 @@
 use crate::api::DeezerApi;
-use crate::cli::{parse_format, SortDir, SortKey};
+use crate::cli::{SortDir, SortKey, parse_format};
 use crate::models::{FollowedArtist, GwTrack};
 use crate::resolve::{direction, quality_rank};
 use anyhow::Result;
@@ -9,11 +9,7 @@ use std::collections::HashMap;
 /// Result indices sorted by available quality (stable, so relevance order is
 /// kept within equal quality; results without a track ID or missing from
 /// `by_id` sort last). Descending = best quality first.
-pub fn sort_by_quality(
-    data: &[Value],
-    by_id: &HashMap<String, GwTrack>,
-    desc: bool,
-) -> Vec<usize> {
+pub fn sort_by_quality(data: &[Value], by_id: &HashMap<String, GwTrack>, desc: bool) -> Vec<usize> {
     let rank = |i: usize| {
         data[i]["id"]
             .as_u64()

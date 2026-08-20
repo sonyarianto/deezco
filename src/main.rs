@@ -1,8 +1,11 @@
 mod api;
 mod auth;
+mod batch;
 mod cli;
 mod crypto;
+mod dedupe;
 mod download;
+mod files;
 mod icecast;
 mod models;
 mod output;
@@ -10,6 +13,7 @@ mod queue;
 mod resolve;
 mod serve;
 mod sort;
+mod track;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};

@@ -1,571 +1,33 @@
 mod api;
 mod auth;
+mod cli;
 mod crypto;
 mod download;
 mod icecast;
 mod models;
+mod output;
 mod queue;
+mod resolve;
 mod serve;
+mod sort;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use futures_util::{StreamExt, stream};
-use serde_json::json;
-use std::path::{Path, PathBuf};
-
+use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::api::DeezerApi;
-use crate::models::{FollowedArtist, GwTrack, TrackFormat};
-
-#[derive(Parser)]
-#[command(name = "deezco", version, about = "Deezer music downloader.")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Output directory for downloads
-    #[arg(short, long, global = true)]
-    output: Option<PathBuf>,
-
-    /// Audio quality: flac, 320, 128
-    #[arg(short, long, global = true, default_value = "320")]
-    quality: String,
-
-    /// Minimum acceptable quality: fail instead of falling back below it
-    #[arg(long, global = true)]
-    min_quality: Option<String>,
-
-    /// Maximum quality to download: caps the bitrate, never exceeding it
-    #[arg(long, global = true)]
-    max_quality: Option<String>,
-
-    /// Shorthand for --min-quality + --max-quality: download exactly this quality
-    #[arg(long, global = true)]
-    exact: Option<String>,
-
-    /// Deezer ARL cookie (overrides any stored login)
-    #[arg(long, global = true)]
-    arl: Option<String>,
-
-    /// Number of search results to print (default: 10); also caps favorites JSON output
-    #[arg(short, long, global = true)]
-    limit: Option<u32>,
-
-    /// Skip the first N tracks in favorites JSON output
-    #[arg(long, global = true, default_value_t = 0)]
-    offset: u32,
-
-    /// Number of parallel downloads (minimum 1)
-    #[arg(
-        short,
-        long,
-        global = true,
-        default_value_t = 4,
-        value_parser = clap::builder::RangedI64ValueParser::<usize>::new().range(1..)
-    )]
-    concurrency: usize,
-
-    /// 1-based index of the search result to download instead of printing the list
-    #[arg(long, global = true)]
-    pick: Option<usize>,
-
-    /// Print search results as JSON instead of the human-readable list
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// List what would be downloaded without touching disk
-    #[arg(long, global = true)]
-    dry_run: bool,
-
-    /// JSON output style used with --json
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Pretty)]
-    output_format: OutputFormat,
-
-    /// Sort key for search and listing results
-    #[arg(long, global = true, value_enum, default_value_t = SortKey::Quality)]
-    sort: SortKey,
-
-    /// Sort direction; defaults to each key's natural order
-    /// (quality: best first, duration: shortest first)
-    #[arg(long, global = true, value_enum)]
-    sort_dir: Option<SortDir>,
-
-    /// Download 30-second previews instead of full tracks
-    #[arg(long, global = true)]
-    preview: bool,
-
-    /// Download both the 30-second preview and the full track (implies --preview)
-    #[arg(long, global = true)]
-    preview_and_full: bool,
-
-    /// Print the effective defaults for every setting, then exit without
-    /// logging in or touching the network
-    #[arg(long, global = true)]
-    show_defaults: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum OutputFormat {
-    /// Human-friendly multi-line JSON
-    Pretty,
-    /// Single-line JSON, ideal for piping
-    Compact,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum SortKey {
-    /// Highest available quality first
-    Quality,
-    /// Original API order
-    Relevance,
-    /// Shortest duration first
-    Duration,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum SortDir {
-    /// Lowest quality / shortest duration first
-    Asc,
-    /// Highest quality / longest duration first
-    Desc,
-}
-
-/// The Stream variant carries many small CLI fields, making it larger than
-/// the other variants.
-#[allow(clippy::large_enum_variant)]
-#[derive(Subcommand)]
-enum Commands {
-    /// Download a track by URL or ID (names print search results)
-    Track {
-        /// Deezer track URL, track ID, or search name
-        query: String,
-    },
-    /// Download a playlist by URL or ID
-    Playlist {
-        /// Deezer playlist URL or playlist ID
-        url: String,
-    },
-    /// Download your liked/favorite songs
-    Favorites,
-    /// Download all songs from an artist (names print search results)
-    Artist {
-        /// Deezer artist URL, artist ID, or search name
-        query: String,
-    },
-    /// Download an album by URL or ID
-    Album {
-        /// Deezer album URL or album ID
-        url: String,
-    },
-    /// Download all releases from every artist you follow
-    Following,
-    /// Remove stored login credentials
-    Logout,
-    /// Serve playlists as HTTP audio to an external service consumer
-    Serve {
-        /// Address to bind the HTTP server to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port to bind the HTTP server to
-        #[arg(long, default_value_t = 9001)]
-        port: u16,
-        /// How often to refetch playlists so web edits are picked up
-        #[arg(long, default_value_t = 300)]
-        refresh_secs: u64,
-    },
-    /// Stream a playlist to an Icecast server as a live radio source
-    Stream {
-        /// Deezer playlist URL or playlist ID
-        playlist: String,
-        /// Icecast server base URL, e.g. http://localhost:8000
-        #[arg(long)]
-        server: String,
-        /// Icecast mount point, e.g. /radio
-        #[arg(long)]
-        mount: String,
-        /// Icecast source username
-        #[arg(long, default_value = "source")]
-        username: String,
-        /// Icecast source password (or set DEEZCO_ICECAST_PASSWORD)
-        #[arg(long)]
-        password: Option<String>,
-        /// Stream name shown to listeners
-        #[arg(long)]
-        name: Option<String>,
-        /// Stream genre shown to listeners
-        #[arg(long)]
-        genre: Option<String>,
-        /// Station website URL
-        #[arg(long)]
-        url: Option<String>,
-        /// Advertise the stream in public directories
-        #[arg(long)]
-        public: bool,
-        /// Disable in-stream ICY track titles; titles still reach listeners via
-        /// Icecast's admin endpoint. Use for source proxies that reset
-        /// connections on metadata updates (e.g. caster.fm)
-        #[arg(long)]
-        no_metadata: bool,
-        /// Target stream bitrate in kbps (e.g. 96). Transcodes via ffmpeg
-        /// when set; 128 and 320 stream natively without transcoding
-        #[arg(long)]
-        bitrate: Option<u32>,
-        /// Path to the Thimeo Stereo Tool CLI binary (stereo_tool_cmd_64).
-        /// When set, every track runs through it (decode -> process -> encode)
-        #[arg(long)]
-        stereo_tool: Option<PathBuf>,
-        /// Stereo Tool processor settings file (.sts); defaults to audio.sts
-        /// next to the binary when present
-        #[arg(long)]
-        stereo_tool_sts: Option<PathBuf>,
-        /// Stereo Tool license key (visible in `ps aux` while running)
-        #[arg(long)]
-        stereo_tool_key: Option<String>,
-        /// Sample rate (Hz) of the Stereo Tool processing bus
-        #[arg(long, default_value_t = 44100)]
-        stereo_rate: u32,
-        /// How often to refetch the playlist so web edits are picked up
-        #[arg(long, default_value_t = 300)]
-        refresh_secs: u64,
-    },
-}
-
-fn parse_format(quality: &str) -> TrackFormat {
-    match quality.to_lowercase().as_str() {
-        "flac" | "lossless" | "9" => TrackFormat::Flac,
-        "320" | "mp3_320" | "3" => TrackFormat::Mp3_320,
-        "128" | "mp3_128" | "1" => TrackFormat::Mp3_128,
-        _ => TrackFormat::Mp3_320,
-    }
-}
-
-/// Extract ID from a Deezer URL or return the input as-is if it's already an ID
-fn extract_id(input: &str, _entity: &str) -> String {
-    // Handle URLs like https://www.deezer.com/en/track/12345
-    let trimmed = input.trim_end_matches('/');
-    if trimmed.contains("deezer.com")
-        && let Some(pos) = trimmed.rfind('/')
-    {
-        // Drop query params and fragments
-        let id = trimmed[pos + 1..].split(['?', '#']).next().unwrap_or("");
-        if !id.is_empty() {
-            return id.to_string();
-        }
-    }
-    // Already an ID
-    input.to_string()
-}
-
-/// Default output directory: the user's OS Downloads folder.
-fn default_output_dir() -> PathBuf {
-    dirs::download_dir().unwrap_or_else(|| PathBuf::from("./downloads"))
-}
-
-/// Output directory from the `DEEZCO_OUTPUT_DIR` environment variable.
-fn env_output_dir() -> Option<PathBuf> {
-    std::env::var_os("DEEZCO_OUTPUT_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Resolve the output directory: CLI flag, then env var, then the default.
-fn resolve_output_dir(cli_output: Option<PathBuf>, env_output: Option<PathBuf>) -> PathBuf {
-    cli_output.or(env_output).unwrap_or_else(default_output_dir)
-}
-
-/// Resolve the quality bounds: `--exact` sets both min and max (overriding
-/// individual flags), otherwise the individual flags pass through as given.
-fn resolve_quality_bounds(
-    exact: Option<TrackFormat>,
-    min: Option<TrackFormat>,
-    max: Option<TrackFormat>,
-) -> (Option<TrackFormat>, Option<TrackFormat>) {
-    match exact {
-        Some(e) => (Some(e), Some(e)),
-        None => (min, max),
-    }
-}
-
-/// The best format actually available for a track (None when no filesize data)
-fn best_available_format(track: &GwTrack) -> Option<TrackFormat> {
-    [
-        TrackFormat::Flac,
-        TrackFormat::Mp3_320,
-        TrackFormat::Mp3_128,
-    ]
-    .into_iter()
-    .find(|&fmt| track.filesize_for_format(fmt) > 0)
-}
-
-/// Rank of the highest quality format available for a track (3=FLAC … 0=none)
-fn quality_rank(track: &GwTrack) -> u8 {
-    best_available_format(track).map_or(0, TrackFormat::rank)
-}
-
-/// Effective sort direction: an explicit `--sort-dir` wins, otherwise the
-/// key's natural direction (quality best-first, duration shortest-first).
-fn direction(sort_dir: Option<SortDir>, natural_desc: bool) -> bool {
-    match sort_dir {
-        Some(SortDir::Desc) => true,
-        Some(SortDir::Asc) => false,
-        None => natural_desc,
-    }
-}
-
-/// Print the effective defaults for every setting. Runs before any login or
-/// network access, so `deezco --show-defaults` works offline and never
-/// touches disk. With `--json` the same values are emitted as JSON instead.
-fn print_defaults(
-    cli: &Cli,
-    format: TrackFormat,
-    min_format: Option<TrackFormat>,
-    max_format: Option<TrackFormat>,
-    options: download::DownloadOptions,
-    output: &Path,
-    sort: SortKey,
-) -> Result<()> {
-    let fmt_opt = |opt: Option<TrackFormat>| match opt {
-        Some(fmt) => fmt.to_string(),
-        None => "none".to_string(),
-    };
-    let preview = if options.preview_and_full {
-        "preview_and_full"
-    } else if options.preview {
-        "preview"
-    } else {
-        "full"
-    };
-    let preview_label = match preview {
-        "preview_and_full" => "preview + full (--preview-and-full)",
-        "preview" => "preview only (--preview)",
-        _ => "full track only",
-    };
-    let sort_key = match sort {
-        SortKey::Quality => "quality",
-        SortKey::Relevance => "relevance",
-        SortKey::Duration => "duration",
-    };
-    let (sort_direction, sort_dir_label) = match sort {
-        SortKey::Quality => {
-            let desc = direction(cli.sort_dir, true);
-            (
-                Some(if desc { "desc" } else { "asc" }),
-                if desc {
-                    "best first (desc)"
-                } else {
-                    "lowest first (asc)"
-                },
-            )
-        }
-        SortKey::Duration => {
-            let desc = direction(cli.sort_dir, false);
-            (
-                Some(if desc { "desc" } else { "asc" }),
-                if desc {
-                    "longest first (desc)"
-                } else {
-                    "shortest first (asc)"
-                },
-            )
-        }
-        SortKey::Relevance => (None, "API order (--sort-dir has no effect)"),
-    };
-    let output_source = if cli.output.is_some() {
-        "flag"
-    } else if env_output_dir().is_some() {
-        "env"
-    } else {
-        "default"
-    };
-    let output_source_label = match output_source {
-        "flag" => "(--output)",
-        "env" => "(DEEZCO_OUTPUT_DIR)",
-        _ => "(default)",
-    };
-    let arl_source = if cli.arl.is_some() {
-        "flag"
-    } else if std::env::var("DEEZCO_ARL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        "env"
-    } else if auth::config_dir().join(".arl").exists() {
-        "stored"
-    } else {
-        "none"
-    };
-    let arl_source_label = match arl_source {
-        "flag" => "--arl flag",
-        "env" => "DEEZCO_ARL environment variable",
-        "stored" => "stored login",
-        _ => "none (will prompt interactively)",
-    };
-    let json_output = if cli.json {
-        match cli.output_format {
-            OutputFormat::Pretty => "pretty",
-            OutputFormat::Compact => "compact",
-        }
-    } else {
-        "off"
-    };
-    let json_label = match json_output {
-        "pretty" => "pretty JSON (--json)",
-        "compact" => "compact JSON (--json --output-format compact)",
-        _ => "off (human-readable output)",
-    };
-
-    let value = json!({
-        "requested_quality": cli.quality,
-        "min_quality": min_format.map(|fmt| fmt.to_string()),
-        "max_quality": max_format.map(|fmt| fmt.to_string()),
-        "exact_quality": cli.exact.as_deref().map(parse_format).map(|fmt| fmt.to_string()),
-        "effective_quality": format.to_string(),
-        "preview": preview,
-        "sort_key": sort_key,
-        "sort_direction": sort_direction,
-        "output": output.display().to_string(),
-        "output_source": output_source,
-        "concurrency": cli.concurrency,
-        "dry_run": cli.dry_run,
-        "search_limit": cli.limit.unwrap_or(10),
-        "json_output": json_output,
-        "arl_source": arl_source,
-    });
-
-    if cli.json {
-        print_json(&value, cli.output_format)?;
-        return Ok(());
-    }
-
-    println!("Effective defaults (no login or network needed):");
-    println!(
-        "  Requested quality:  {} (-q {})",
-        parse_format(&cli.quality),
-        cli.quality
-    );
-    println!("  Min quality:        {}", fmt_opt(min_format));
-    println!("  Max quality:        {}", fmt_opt(max_format));
-    if let Some(exact) = cli.exact.as_deref().map(parse_format) {
-        println!("  Exact quality:      {} (--exact)", exact);
-    }
-    println!("  Effective quality:  {}", format);
-    println!("  Preview:            {}", preview_label);
-    println!("  Sort key:           {}", sort_key);
-    println!("  Sort direction:     {}", sort_dir_label);
-    println!(
-        "  Output dir:         {} {}",
-        output.display(),
-        output_source_label
-    );
-    println!("  Concurrency:        {}", cli.concurrency);
-    println!(
-        "  Dry run:            {}",
-        if cli.dry_run { "on" } else { "off" }
-    );
-    println!(
-        "  Search limit:       {} (--limit)",
-        cli.limit.unwrap_or(10)
-    );
-    println!("  JSON output:        {}", json_label);
-    println!("  ARL:                {}", arl_source_label);
-    Ok(())
-}
-
-/// Result indices sorted by available quality (stable, so relevance order is
-/// kept within equal quality; results without a track ID or missing from
-/// `by_id` sort last). Descending = best quality first.
-fn sort_by_quality(
-    data: &[serde_json::Value],
-    by_id: &HashMap<String, GwTrack>,
-    desc: bool,
-) -> Vec<usize> {
-    let rank = |i: usize| {
-        data[i]["id"]
-            .as_u64()
-            .and_then(|id| by_id.get(&id.to_string()))
-            .map(quality_rank)
-            .unwrap_or(0)
-    };
-    let mut indices: Vec<usize> = (0..data.len()).collect();
-    indices.sort_by(|&a, &b| {
-        let (ra, rb) = (rank(a), rank(b));
-        if desc { rb.cmp(&ra) } else { ra.cmp(&rb) }
-    });
-    indices
-}
-
-/// Reorder `results["data"]` by the given indices (stable, so the source
-/// order is kept for equal sort keys).
-fn reorder_results_data(results: &mut serde_json::Value, indices: Vec<usize>) {
-    if let Some(data) = results["data"].as_array_mut() {
-        let sorted: Vec<serde_json::Value> = indices.into_iter().map(|i| data[i].clone()).collect();
-        *data = sorted;
-    }
-}
-
-/// Order two durations (None = unknown, which sorts last in either direction).
-fn duration_ordering(da: Option<u64>, db: Option<u64>, desc: bool) -> std::cmp::Ordering {
-    match (da, db) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(x), Some(y)) => {
-            if desc {
-                y.cmp(&x)
-            } else {
-                x.cmp(&y)
-            }
-        }
-    }
-}
-
-/// Indices sorted by the search response's `duration` field. Tracks without a
-/// duration sort last regardless of direction.
-fn duration_sorted_indices(data: &[serde_json::Value], desc: bool) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..data.len()).collect();
-    indices.sort_by(|&a, &b| {
-        duration_ordering(
-            data[a]["duration"].as_u64(),
-            data[b]["duration"].as_u64(),
-            desc,
-        )
-    });
-    indices
-}
-
-/// Format seconds as `m:ss` (or `h:mm:ss` for an hour or more)
-fn format_duration(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
-    } else {
-        format!("{}:{:02}", secs / 60, secs % 60)
-    }
-}
-
-/// Fetch full track data (with filesizes) for the search results in one
-/// batched call, then return the quality-sorted indices and the track map.
-async fn quality_sorted_indices(
-    api: &DeezerApi,
-    data: &[serde_json::Value],
-    desc: bool,
-) -> Result<(Vec<usize>, HashMap<String, GwTrack>)> {
-    let ids: Vec<String> = data
-        .iter()
-        .filter_map(|track| track["id"].as_u64())
-        .map(|id| id.to_string())
-        .collect();
-
-    let mut by_id: HashMap<String, GwTrack> = HashMap::new();
-    if !ids.is_empty() {
-        for track in api.get_tracks_by_ids(&ids).await? {
-            by_id.insert(track.id_str(), track);
-        }
-    }
-
-    Ok((sort_by_quality(data, &by_id, desc), by_id))
-}
+use crate::cli::{extract_id, parse_format, Cli, Commands, OutputFormat, SortDir, SortKey};
+use crate::models::GwTrack;
+use crate::output::{
+    artist_header, enrich_followed_artists, print_album_json, print_defaults, print_favorites_json,
+    print_following_json, print_json, print_playlist_json,
+};
+use crate::resolve::{direction, env_output_dir, resolve_output_dir, resolve_quality_bounds};
+use crate::sort::{
+    duration_sorted_indices, format_duration, quality_sorted_indices, sort_by_quality,
+    sort_followed_by_quality,
+};
 
 /// Download a track from a URL or ID, or print search results for a name.
 /// Returns `false` when nothing was downloaded (search results shown).
@@ -630,12 +92,12 @@ async fn download_track_query(
             SortKey::Duration => {
                 let data = results["data"].as_array().cloned().unwrap_or_default();
                 let indices = duration_sorted_indices(&data, duration_desc);
-                reorder_results_data(&mut results, indices);
+                crate::sort::reorder_results_data(&mut results, indices);
             }
             SortKey::Quality => {
                 let data = results["data"].as_array().cloned().unwrap_or_default();
                 let (indices, _) = quality_sorted_indices(api, &data, quality_desc).await?;
-                reorder_results_data(&mut results, indices);
+                crate::sort::reorder_results_data(&mut results, indices);
             }
         }
         print_json(&results, format)?;
@@ -780,205 +242,6 @@ async fn download_artist_query(
     }
     println!("\nRun `deezco artist <ID>` to download the discography.");
     Ok(false)
-}
-
-/// Print a value as JSON in the requested style
-fn print_json(value: &serde_json::Value, format: OutputFormat) -> Result<()> {
-    let out = match format {
-        OutputFormat::Pretty => serde_json::to_string_pretty(value)?,
-        OutputFormat::Compact => serde_json::to_string(value)?,
-    };
-    println!("{out}");
-    Ok(())
-}
-
-/// Print playlist contents as JSON instead of downloading
-async fn print_playlist_json(api: &DeezerApi, id: &str, format: OutputFormat) -> Result<()> {
-    let info = api.get_playlist_info(id).await?;
-    let title = info["DATA"]["TITLE"].as_str().unwrap_or("Unknown Playlist");
-    let tracks = api.get_playlist_tracks(id).await?;
-    print_json(
-        &json!({ "type": "playlist", "id": id, "title": title, "tracks": tracks }),
-        format,
-    )
-}
-
-/// Print album contents as JSON instead of downloading
-async fn print_album_json(api: &DeezerApi, id: &str, format: OutputFormat) -> Result<()> {
-    let info = api.get_album_info(id).await?;
-    let title = info["ALB_TITLE"].as_str().unwrap_or("Unknown Album");
-    let artist = info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
-    let tracks = api.get_album_tracks(id).await?;
-    print_json(
-        &json!({
-            "type": "album",
-            "id": id,
-            "title": title,
-            "artist": artist,
-            "tracks": tracks,
-        }),
-        format,
-    )
-}
-
-/// Print followed artists as JSON instead of downloading
-fn print_following_json(format: OutputFormat, artists: Vec<FollowedArtist>) -> Result<()> {
-    print_json(&json!({ "type": "following", "artists": artists }), format)
-}
-
-/// Header line for a followed artist, including their release count and,
-/// when known, their best available quality.
-fn artist_header(artist: &FollowedArtist) -> String {
-    let noun = if artist.nb_album == 1 {
-        "album"
-    } else {
-        "albums"
-    };
-    match &artist.best_quality {
-        Some(quality) => format!(
-            "--- {} ({} {}, best {}) ---",
-            artist.name, artist.nb_album, noun, quality
-        ),
-        None => format!("--- {} ({} {}) ---", artist.name, artist.nb_album, noun),
-    }
-}
-
-/// Best quality available across an artist's discography, derived from the
-/// filesizes of every album's tracks (None when unknown).
-async fn artist_best_quality(api: &DeezerApi, art_id: &str) -> Result<Option<TrackFormat>> {
-    let albums = api.get_artist_discography(art_id).await?;
-    let mut best: Option<TrackFormat> = None;
-    for album in &albums {
-        let tracks = api.get_album_tracks(&album.id_str()).await?;
-        for track in &tracks {
-            if let Some(fmt) = best_available_format(track) {
-                let better = match best {
-                    Some(current) => fmt.rank() > current.rank(),
-                    None => true,
-                };
-                if better {
-                    best = Some(fmt);
-                }
-            }
-        }
-    }
-    Ok(best)
-}
-
-/// Fetch the best available quality for every followed artist, concurrently.
-/// Artists whose quality can't be determined keep `best_quality` unset.
-async fn enrich_followed_artists(
-    api: &DeezerApi,
-    artists: Vec<FollowedArtist>,
-) -> Result<Vec<FollowedArtist>> {
-    let futures = artists.into_iter().map(|mut artist| {
-        let api = api.clone();
-        async move {
-            let best = artist_best_quality(&api, &artist.id.to_string())
-                .await
-                .ok()
-                .flatten();
-            artist.best_quality = best.map(|fmt| fmt.api_name().to_string());
-            artist
-        }
-    });
-    Ok(stream::iter(futures).buffer_unordered(4).collect().await)
-}
-
-/// Sort followed artists by best available quality (stable; the followed-list
-/// order is kept within equal quality, unknown quality sorts last).
-/// Descending = best quality first.
-fn sort_followed_by_quality(artists: &mut [FollowedArtist], desc: bool) {
-    let rank = |artist: &FollowedArtist| {
-        artist
-            .best_quality
-            .as_deref()
-            .map_or(0, |quality| parse_format(quality).rank())
-    };
-    artists.sort_by(|a, b| {
-        let (ra, rb) = (rank(a), rank(b));
-        if desc { rb.cmp(&ra) } else { ra.cmp(&rb) }
-    });
-}
-
-/// Sort tracks for favorites JSON by the selected key and direction. The
-/// artist/title/id tiebreakers are deterministic so pagination pages stay
-/// stable across calls.
-fn sort_favorites(tracks: &mut [GwTrack], key: SortKey, sort_dir: Option<SortDir>) {
-    let quality_desc = direction(sort_dir, true);
-    let duration_desc = direction(sort_dir, false);
-    let tiebreakers = |a: &GwTrack, b: &GwTrack| {
-        a.artist()
-            .to_lowercase()
-            .cmp(&b.artist().to_lowercase())
-            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
-            .then_with(|| a.id_str().cmp(&b.id_str()))
-    };
-    match key {
-        SortKey::Relevance => {} // raw liked order
-        SortKey::Duration => {
-            let known = |t: &GwTrack| (t.duration_secs() != 0).then_some(t.duration_secs());
-            tracks.sort_by(|a, b| {
-                duration_ordering(known(a), known(b), duration_desc).then_with(|| tiebreakers(a, b))
-            });
-        }
-        SortKey::Quality => {
-            tracks.sort_by(|a, b| {
-                let (ra, rb) = (quality_rank(a), quality_rank(b));
-                let ord = if quality_desc {
-                    rb.cmp(&ra)
-                } else {
-                    ra.cmp(&rb)
-                };
-                ord.then_with(|| tiebreakers(a, b))
-            });
-        }
-    }
-}
-
-/// Serialize tracks with a normalized numeric `duration` (seconds) added,
-/// matching the search JSON's field name, alongside the raw GW fields.
-fn with_duration(tracks: Vec<GwTrack>) -> Vec<serde_json::Value> {
-    tracks
-        .into_iter()
-        .map(|track| {
-            let duration = track.duration_secs();
-            let mut value = serde_json::to_value(&track).unwrap_or_default();
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("duration".to_string(), json!(duration));
-            }
-            value
-        })
-        .collect()
-}
-
-/// Print favorite tracks as JSON instead of downloading.
-/// Tracks are sorted by the selected key and direction (then artist/title),
-/// carry a normalized `duration` field, and are paginated with
-/// `--offset`/`--limit`.
-async fn print_favorites_json(
-    api: &DeezerApi,
-    format: OutputFormat,
-    limit: Option<u32>,
-    offset: u32,
-    sort: SortKey,
-    sort_dir: Option<SortDir>,
-) -> Result<()> {
-    let ids = api.get_favorite_track_ids().await?;
-    let mut tracks = Vec::new();
-    for batch in ids.chunks(50) {
-        tracks.extend(api.get_tracks_by_ids(batch).await?);
-    }
-
-    sort_favorites(&mut tracks, sort, sort_dir);
-
-    let tracks: Vec<_> = tracks
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit.map_or(usize::MAX, |l| l as usize))
-        .collect();
-    let tracks = with_duration(tracks);
-    print_json(&json!({ "type": "favorites", "tracks": tracks }), format)
 }
 
 #[tokio::main]
@@ -1295,7 +558,19 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::cli::{extract_id, parse_format, SortDir, SortKey};
+    use crate::models::{FollowedArtist, GwTrack, TrackFormat};
+    use crate::output::artist_header;
+    use crate::resolve::{
+        default_output_dir, direction, quality_rank, resolve_output_dir, resolve_quality_bounds,
+    };
+    use crate::sort::{
+        duration_sorted_indices, format_duration, reorder_results_data, sort_by_quality,
+        sort_followed_by_quality, sort_favorites, with_duration,
+    };
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// A track with the given reported filesizes (0 = unavailable)
     fn track_with_filesizes(flac: u64, mp3_320: u64, mp3_128: u64) -> GwTrack {
@@ -1335,7 +610,7 @@ mod tests {
             ("3".to_string(), track_with_filesizes(0, 100, 100)),
             ("4".to_string(), track_with_filesizes(100, 100, 100)),
         ]);
-        let data: Vec<serde_json::Value> = (1..=4)
+        let data: Vec<Value> = (1..=4)
             .map(|i| serde_json::json!({ "id": i, "title": format!("t{i}") }))
             .collect();
 
@@ -1351,7 +626,7 @@ mod tests {
             ("2".to_string(), track_with_filesizes(100, 100, 100)),
             ("3".to_string(), track_with_filesizes(0, 100, 100)),
         ]);
-        let data: Vec<serde_json::Value> = (1..=3)
+        let data: Vec<Value> = (1..=3)
             .map(|i| serde_json::json!({ "id": i, "title": format!("t{i}") }))
             .collect();
 
@@ -1606,7 +881,7 @@ mod tests {
 
     #[test]
     fn duration_sorted_indices_orders_ascending_with_missing_last() {
-        let data: Vec<serde_json::Value> = vec![
+        let data: Vec<Value> = vec![
             serde_json::json!({ "duration": 300 }),
             serde_json::json!({}),
             serde_json::json!({ "duration": 100 }),
@@ -1631,7 +906,7 @@ mod tests {
     #[test]
     fn sort_by_quality_puts_missing_ids_last() {
         let by_id = HashMap::from([("2".to_string(), track_with_filesizes(0, 100, 100))]);
-        let data: Vec<serde_json::Value> = (1..=3)
+        let data: Vec<Value> = (1..=3)
             .map(|i| serde_json::json!({ "id": i, "title": format!("t{i}") }))
             .collect();
 

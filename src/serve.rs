@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde_json::{Value, json};
@@ -58,6 +58,28 @@ fn track_json(track: &GwTrack, url: &str) -> Value {
         "duration": track.duration_secs(),
         "url": url,
     })
+}
+
+async fn web_index() -> Html<&'static str> {
+    Html(crate::web_assets::INDEX_HTML)
+}
+
+async fn api_health(State(state): State<ServeState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "deezco-serve",
+        "host": state.host,
+        "port": state.port,
+        "format": state.format.api_name(),
+        "crabsoup_compatible": true,
+        "endpoints": [
+            "GET /",
+            "GET /api/health",
+            "GET /playlists/{id}",
+            "GET /playlists/{id}/next",
+            "GET /tracks/{id}"
+        ]
+    }))
 }
 
 /// Pop the next track for a playlist, mapping queue errors to HTTP errors.
@@ -156,15 +178,23 @@ pub async fn serve(
     };
 
     let app = Router::new()
+        // --- crabsoup contract: MUST NOT BREAK ---
         .route("/playlists/{id}/next", get(playlist_next))
         .route("/playlists/{id}", get(playlist_list))
         .route("/tracks/{id}", get(track_audio))
+        // --- web player + control-plane (additive, no conflict) ---
+        .route("/", get(web_index))
+        .route("/api/health", get(api_health))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     println!(
         "deezco serving playlists on http://{}:{} (refresh every {}s)",
         host, port, refresh_secs
+    );
+    println!(
+        "web player: http://{}:{}/  |  health: http://{}:{}/api/health  |  crabsoup: /playlists/{{id}}/next, /playlists/{{id}}, /tracks/{{id}}",
+        host, port, host, port
     );
     axum::serve(listener, app).await?;
     Ok(())

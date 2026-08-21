@@ -14,6 +14,7 @@ mod resolve;
 mod serve;
 mod sort;
 mod track;
+mod web_assets;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};

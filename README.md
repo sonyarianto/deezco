@@ -329,6 +329,15 @@ deezco uses Deezer's ARL cookie for authentication. To obtain it:
 3. Go to **Application** > **Cookies** > `https://www.deezer.com`
 4. Copy the value of the `arl` cookie
 
+There are four ways to provide the ARL (priority order, highest first):
+
+| Priority | Method | Example | Notes |
+|----------|--------|---------|-------|
+| 1 | `--arl` flag | `deezco --arl 123abc track 3135556` | Overrides everything; on success saved to `~/.config/deezco/.arl` |
+| 2 | `DEEZCO_ARL` env var | `DEEZCO_ARL=123abc deezco track 3135556` | For scripting/CI; also saved on success |
+| 3 | Stored file `~/.config/deezco/.arl` | (auto-created) | Reused across runs; invalid/expired ARL is auto-removed and you are prompted again |
+| 4 | Interactive prompt | (stdin) | Shown when 1–3 are missing; input is trimmed and saved on success |
+
 On first launch, the CLI will prompt you to enter your ARL. For scripting, pass it with `--arl <COOKIE>` or the `DEEZCO_ARL` environment variable instead. It is then stored locally at `~/.config/deezco/.arl` for subsequent sessions.
 
 To clear your credentials:

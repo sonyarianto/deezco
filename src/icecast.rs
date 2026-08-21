@@ -508,12 +508,12 @@ impl Producer {
             let updater = updater.clone();
             let title = track.display_name();
             tokio::spawn(async move {
-                if let Err(err) = updater.update(&title).await {
-                    // 404 is common on hosted Icecast proxies (e.g. caster.fm)
-                    // that don't expose /admin/metadata — best-effort, don't spam.
-                    if !err.to_string().contains("404") {
-                        eprintln!("deezco: title update failed: {err}");
-                    }
+                // 404 is common on hosted Icecast proxies (e.g. caster.fm)
+                // that don't expose /admin/metadata — best-effort, don't spam.
+                if let Err(err) = updater.update(&title).await
+                    && !err.to_string().contains("404")
+                {
+                    eprintln!("deezco: title update failed: {err}");
                 }
             });
         }
@@ -696,10 +696,10 @@ async fn run_connection(
         if let Some(title) = title {
             let updater = updater.clone();
             tokio::spawn(async move {
-                if let Err(err) = updater.update(&title).await {
-                    if !err.to_string().contains("404") {
-                        eprintln!("deezco: title update failed: {err}");
-                    }
+                if let Err(err) = updater.update(&title).await
+                    && !err.to_string().contains("404")
+                {
+                    eprintln!("deezco: title update failed: {err}");
                 }
             });
         }

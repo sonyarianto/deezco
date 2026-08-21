@@ -154,6 +154,8 @@ pub enum Commands {
     Following,
     /// Remove stored login credentials
     Logout,
+    /// Save ARL and verify login (prompts if no --arl / DEEZCO_ARL)
+    Login,
     /// Serve playlists as HTTP audio to an external service consumer
     Serve {
         /// Address to bind the HTTP server to

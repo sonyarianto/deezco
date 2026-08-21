@@ -72,15 +72,27 @@ pub fn mask_arl(arl: &str) -> String {
 }
 
 /// Attempt login: explicit ARL first, then the stored one, else prompt.
-/// `provided` is the `--arl` flag or `DEEZCO_ARL` environment variable.
-pub async fn login(api: &DeezerApi, provided: Option<&str>) -> Result<bool> {
-    // An explicitly provided ARL is authoritative
-    if let Some(arl) = provided {
+/// `flag_arl` is `--arl` (persisted on success); `env_arl` is `DEEZCO_ARL` (transient).
+pub async fn login(api: &DeezerApi, flag_arl: Option<&str>, env_arl: Option<&str>) -> Result<bool> {
+    // --arl flag is authoritative and persisted on success
+    if let Some(arl) = flag_arl {
         return match api.login_via_arl(arl).await {
             Ok(true) => {
                 save_arl_to(&config_dir(), arl).await?;
                 Ok(true)
             }
+            Ok(false) => {
+                eprintln!("Login failed. Invalid ARL.");
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        };
+    }
+
+    // DEEZCO_ARL is transient: validate but do not persist
+    if let Some(arl) = env_arl {
+        return match api.login_via_arl(arl).await {
+            Ok(true) => Ok(true),
             Ok(false) => {
                 eprintln!("Login failed. Invalid ARL.");
                 Ok(false)

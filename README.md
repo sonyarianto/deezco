@@ -53,6 +53,7 @@ deezco [OPTIONS] [COMMAND]
 | `following` | Download all releases from every artist you follow |
 | `serve` | Serve playlists as HTTP audio for external media players (crabsoup, etc.) |
 | `stream` | Stream a playlist to an Icecast server as a live radio source |
+| `login` | Save ARL and verify login (uses `--arl`, `DEEZCO_ARL`, or prompt; only `--arl`/prompt is persisted) |
 | `logout` | Remove stored login credentials |
 
 ### Options
@@ -85,7 +86,7 @@ deezco [OPTIONS] [COMMAND]
 | Variable | Description |
 |----------|-------------|
 | `DEEZCO_OUTPUT_DIR` | Overrides the default output directory. Takes precedence over the default, but `-o, --output` still wins. |
-| `DEEZCO_ARL` | Deezer ARL cookie used for login when no ARL is stored. Takes precedence over the stored cookie, but `--arl` still wins. |
+| `DEEZCO_ARL` | Deezer ARL cookie used for login when no ARL is stored. Takes precedence over the stored cookie, but `--arl` still wins. Transient — never written to `~/.config/deezco/.arl` (use `--arl` or `login` to persist). |
 | `DEEZCO_ICECAST_PASSWORD` | Icecast source password used by `stream` when `--password` is not given. |
 
 ```bash
@@ -333,16 +334,20 @@ There are four ways to provide the ARL (priority order, highest first):
 
 | Priority | Method | Example | Notes |
 |----------|--------|---------|-------|
-| 1 | `--arl` flag | `deezco --arl 123abc track 3135556` | Overrides everything; on success saved to `~/.config/deezco/.arl` |
-| 2 | `DEEZCO_ARL` env var | `DEEZCO_ARL=123abc deezco track 3135556` | For scripting/CI; also saved on success |
+| 1 | `--arl` flag | `deezco --arl 123abc track 3135556` | Overrides everything; on success saved to `~/.config/deezco/.arl` (also: `deezco --arl 123abc` or `deezco --arl 123abc login` to just persist) |
+| 2 | `DEEZCO_ARL` env var | `DEEZCO_ARL=123abc deezco track 3135556` | For scripting/CI; transient — never saved (use `--arl` to persist) |
 | 3 | Stored file `~/.config/deezco/.arl` | (auto-created) | Reused across runs; invalid/expired ARL is auto-removed and you are prompted again |
-| 4 | Interactive prompt | (stdin) | Shown when 1–3 are missing; input is trimmed and saved on success |
+| 4 | Interactive prompt | (stdin) | Shown when 1–3 are missing; input is trimmed and saved on success (`deezco login` to force prompt) |
 
-On first launch, the CLI will prompt you to enter your ARL. For scripting, pass it with `--arl <COOKIE>` or the `DEEZCO_ARL` environment variable instead. It is then stored locally at `~/.config/deezco/.arl` for subsequent sessions.
+On first launch, the CLI will prompt you to enter your ARL. For scripting, pass it with `--arl <COOKIE>` (persisted) or the `DEEZCO_ARL` environment variable (transient) instead. `--arl` is then stored locally at `~/.config/deezco/.arl` for subsequent sessions; `DEEZCO_ARL` is not.
+Use `deezco login` to save/verify without downloading, or `deezco --arl <COOKIE>` / `deezco --arl <COOKIE> login` to persist directly. Bare `deezco --arl <COOKIE>` also persists and exits without requiring a download command.
 
 To inspect or clear your credentials:
 
 ```bash
+deezco login                      # verify/persist via prompt (or --arl / DEEZCO_ARL)
+deezco --arl 123abc login         # save with flag (DEEZCO_ARL stays transient)
+deezco --arl 123abc               # also persists and exits (no download)
 deezco --show-arl                 # masked: 1234****cdef (safe for screenshots)
 deezco --show-arl --reveal        # full ARL — careful, it's a password (also: cat ~/.config/deezco/.arl)
 deezco logout                     # remove stored ARL

@@ -326,27 +326,54 @@ async fn main() -> Result<()> {
         anyhow::bail!("--reveal requires --show-arl");
     }
 
-    // No command: print help and exit
+    // ARL sources: --arl is persisted on success, DEEZCO_ARL is transient
+    let flag_arl: Option<String> = cli.arl.clone();
+    let env_arl: Option<String> = std::env::var("DEEZCO_ARL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let api = DeezerApi::new()?;
+
+    // Keep stdout clean when emitting JSON for scripts
+    let json_output = cli.json.then_some(cli.output_format);
+    let search_limit = cli.limit.unwrap_or(10);
+
+    // Explicit login command: validate and persist only --arl (env stays transient, prompt saves)
+    if matches!(cli.command, Some(Commands::Login)) {
+        if !auth::login(&api, flag_arl.as_deref(), env_arl.as_deref()).await? {
+            return Ok(());
+        }
+        let user = api.current_user.lock().await;
+        if let Some(u) = user.as_ref() {
+            println!("Logged in as: {}", u.name);
+        }
+        drop(user);
+        println!("ARL saved to {}", auth::config_dir().join(".arl").display());
+        return Ok(());
+    }
+
+    // No command: bare --arl auto-saves, otherwise print help
     let Some(command) = cli.command else {
+        if flag_arl.is_some() {
+            if !auth::login(&api, flag_arl.as_deref(), env_arl.as_deref()).await? {
+                return Ok(());
+            }
+            let user = api.current_user.lock().await;
+            if let Some(u) = user.as_ref() {
+                println!("Logged in as: {}", u.name);
+            }
+            drop(user);
+            println!("ARL saved to {}", auth::config_dir().join(".arl").display());
+            return Ok(());
+        }
         let mut cmd = Cli::command();
         cmd.print_help()?;
         println!();
         return Ok(());
     };
 
-    // Keep stdout clean when emitting JSON for scripts
-    let json_output = cli.json.then_some(cli.output_format);
-    let search_limit = cli.limit.unwrap_or(10);
-    let api = DeezerApi::new()?;
-
     // Login and prepare the output dir for every command except logout
     if !matches!(command, Commands::Logout) {
-        let arl: Option<String> = cli.arl.clone().or_else(|| {
-            std::env::var("DEEZCO_ARL")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-        if !auth::login(&api, arl.as_deref()).await? {
+        if !auth::login(&api, flag_arl.as_deref(), env_arl.as_deref()).await? {
             return Ok(());
         }
 
@@ -519,6 +546,7 @@ async fn main() -> Result<()> {
             auth::remove_arl().await?;
             println!("Logged out. Stored ARL removed.");
         }
+        Commands::Login => unreachable!("login handled before match"),
         Commands::Serve {
             host,
             port,

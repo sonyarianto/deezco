@@ -196,10 +196,9 @@ pub enum Commands {
         /// Advertise the stream in public directories
         #[arg(long)]
         public: bool,
-        /// Disable all track title updates (in-stream ICY blocks and the
-        /// out-of-band /admin/metadata request). Use for source proxies that
-        /// reset connections on metadata updates or don't expose the admin
-        /// endpoint (e.g. caster.fm returns 404 on /admin/metadata)
+        /// Disable in-stream ICY track titles; titles still reach listeners via
+        /// Icecast's admin endpoint. Use for source proxies that reset
+        /// connections on metadata updates (e.g. caster.fm)
         #[arg(long)]
         no_metadata: bool,
         /// Target stream bitrate in kbps (e.g. 96). Transcodes via ffmpeg

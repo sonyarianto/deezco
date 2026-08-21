@@ -509,7 +509,11 @@ impl Producer {
             let title = track.display_name();
             tokio::spawn(async move {
                 if let Err(err) = updater.update(&title).await {
-                    eprintln!("deezco: title update failed: {err}");
+                    // 404 is common on hosted Icecast proxies (e.g. caster.fm)
+                    // that don't expose /admin/metadata — best-effort, don't spam.
+                    if !err.to_string().contains("404") {
+                        eprintln!("deezco: title update failed: {err}");
+                    }
                 }
             });
         }
@@ -693,7 +697,9 @@ async fn run_connection(
             let updater = updater.clone();
             tokio::spawn(async move {
                 if let Err(err) = updater.update(&title).await {
-                    eprintln!("deezco: title update failed: {err}");
+                    if !err.to_string().contains("404") {
+                        eprintln!("deezco: title update failed: {err}");
+                    }
                 }
             });
         }
@@ -750,7 +756,14 @@ pub async fn stream(
     // The producer outlives individual connections: after a reconnect it
     // resumes the buffered track and its background prefetch, so dropped
     // connections cost a few seconds instead of a full track preparation.
-    let updater = TitleUpdater::new(&config);
+    // When --no-metadata is set we skip the out-of-band /admin/metadata
+    // updates entirely: hosts like caster.fm don't expose that endpoint
+    // (404) and the periodic 404 spam is worse than no titles.
+    let updater = if config.metadata {
+        Some(TitleUpdater::new(&config))
+    } else {
+        None
+    };
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
         queue.clone(),
@@ -758,13 +771,13 @@ pub async fn stream(
         transcode,
         stereo,
         config.metadata,
-        Some(updater.clone()),
+        updater.clone(),
         config.playlist.clone(),
     )));
 
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
-        let connected = match run_connection(&producer, &config, Some(&updater)).await {
+        let connected = match run_connection(&producer, &config, updater.as_ref()).await {
             Ok(()) => {
                 eprintln!("deezco: source connection closed by Icecast; reconnecting");
                 true

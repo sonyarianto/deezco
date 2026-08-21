@@ -55,6 +55,22 @@ pub async fn remove_arl() -> Result<()> {
     remove_arl_from(&config_dir()).await
 }
 
+/// Read the stored ARL if present (trimmed, None when missing/empty)
+pub async fn stored_arl() -> Option<String> {
+    let arl = read_stored_arl_from(&config_dir()).await?;
+    if arl.is_empty() { None } else { Some(arl) }
+}
+
+/// Mask an ARL for safe display: keep first 4 + last 4, or **** when short
+pub fn mask_arl(arl: &str) -> String {
+    let arl = arl.trim();
+    if arl.len() <= 8 {
+        "****".to_string()
+    } else {
+        format!("{}****{}", &arl[..4], &arl[arl.len() - 4..])
+    }
+}
+
 /// Attempt login: explicit ARL first, then the stored one, else prompt.
 /// `provided` is the `--arl` flag or `DEEZCO_ARL` environment variable.
 pub async fn login(api: &DeezerApi, provided: Option<&str>) -> Result<bool> {

@@ -87,6 +87,14 @@ pub struct Cli {
     /// logging in or touching the network
     #[arg(long, global = true)]
     pub show_defaults: bool,
+
+    /// Show stored ARL and exit without logging in (masked by default)
+    #[arg(long, global = true)]
+    pub show_arl: bool,
+
+    /// With --show-arl, reveal the full ARL instead of masked (careful: ARL is a password)
+    #[arg(long, global = true)]
+    pub reveal: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]

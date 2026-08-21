@@ -340,10 +340,12 @@ There are four ways to provide the ARL (priority order, highest first):
 
 On first launch, the CLI will prompt you to enter your ARL. For scripting, pass it with `--arl <COOKIE>` or the `DEEZCO_ARL` environment variable instead. It is then stored locally at `~/.config/deezco/.arl` for subsequent sessions.
 
-To clear your credentials:
+To inspect or clear your credentials:
 
 ```bash
-deezco logout
+deezco --show-arl                 # masked: 1234****cdef (safe for screenshots)
+deezco --show-arl --reveal        # full ARL — careful, it's a password (also: cat ~/.config/deezco/.arl)
+deezco logout                     # remove stored ARL
 ```
 
 ## Architecture

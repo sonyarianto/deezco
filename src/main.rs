@@ -295,6 +295,37 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --show-arl: print stored ARL (masked by default) and exit before login
+    if cli.show_arl {
+        match auth::stored_arl().await {
+            Some(arl) => {
+                if cli.reveal {
+                    println!("{arl}");
+                    eprintln!("warning: ARL is a password — do not share it");
+                } else {
+                    println!("{}", auth::mask_arl(&arl));
+                    eprintln!(
+                        "stored at {} (use --show-arl --reveal to show full)",
+                        auth::config_dir().join(".arl").display()
+                    );
+                }
+            }
+            None => {
+                println!(
+                    "No stored ARL found at {}",
+                    auth::config_dir().join(".arl").display()
+                );
+                if cli.reveal {
+                    eprintln!("hint: log in once (or use --arl / DEEZCO_ARL) to store it");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if cli.reveal && !cli.show_arl {
+        anyhow::bail!("--reveal requires --show-arl");
+    }
+
     // No command: print help and exit
     let Some(command) = cli.command else {
         let mut cmd = Cli::command();

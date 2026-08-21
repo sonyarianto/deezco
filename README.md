@@ -226,7 +226,8 @@ deezco --dry-run --pick 1 track "Get Lucky"
 ### Serving playlists to media players
 
 `serve` exposes playlists over HTTP for external consumers (e.g. the crabsoup
-media player) that pull track-by-track:
+media player) that pull track-by-track. It also serves a built-in web player
+at `http://127.0.0.1:9001/` — the 3 crabsoup endpoints stay compatible:
 
 ```bash
 # Serve every playlist on http://127.0.0.1:9001 (pick a host/port if needed)
@@ -238,6 +239,13 @@ deezco serve --host 0.0.0.0 --port 9002
 curl http://127.0.0.1:9001/playlists/908622995/next
 curl http://127.0.0.1:9001/playlists/908622995            # list tracks
 curl http://127.0.0.1:9001/tracks/3135556 -o track.mp3     # fetch audio
+
+# Web player (control plane): open in a browser, no extra install
+# - GET /                → single-file player (calls the 3 endpoints above)
+# - GET /api/health      → {"status":"ok","crabsoup_compatible":true}
+# - POST /playlists/{id}/next also works (GET kept for crabsoup compat)
+xdg-open http://127.0.0.1:9001/
+curl http://127.0.0.1:9001/api/health
 
 # Playlist edits made on deezer.com show up within the refresh interval
 deezco serve --refresh-secs 60

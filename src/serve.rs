@@ -77,6 +77,7 @@ async fn api_health(State(state): State<ServeState>) -> Json<Value> {
             "GET /api/health",
             "GET /playlists/{id}",
             "GET /playlists/{id}/next",
+            "POST /playlists/{id}/next",
             "GET /tracks/{id}"
         ]
     }))
@@ -179,7 +180,10 @@ pub async fn serve(
 
     let app = Router::new()
         // --- crabsoup contract: MUST NOT BREAK ---
-        .route("/playlists/{id}/next", get(playlist_next))
+        .route(
+            "/playlists/{id}/next",
+            get(playlist_next).post(playlist_next),
+        )
         .route("/playlists/{id}", get(playlist_list))
         .route("/tracks/{id}", get(track_audio))
         // --- web player + control-plane (additive, no conflict) ---

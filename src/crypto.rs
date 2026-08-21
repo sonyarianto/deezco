@@ -44,11 +44,10 @@ pub fn decrypt_chunk(chunk: &[u8], blowfish_key: &[u8]) -> Vec<u8> {
     let mut decryptor =
         BlowfishCbcDec::new_from_slices(blowfish_key, &iv).expect("Invalid blowfish key/iv length");
 
-    for block_data in buf.chunks_exact_mut(8) {
-        let block: [u8; 8] = block_data.try_into().expect("block must be 8 bytes");
-        let mut block = Array::from(block);
+    for block_data in buf.as_chunks_mut::<8>().0 {
+        let mut block = Array::from(*block_data);
         decryptor.decrypt_block(&mut block);
-        block_data.copy_from_slice(&block);
+        *block_data = block.into();
     }
 
     buf
@@ -116,11 +115,10 @@ mod tests {
         let mut buf = data.to_vec();
         let mut encryptor =
             cbc::Encryptor::<Blowfish>::new_from_slices(key, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
-        for block_data in buf.chunks_exact_mut(8) {
-            let block: [u8; 8] = block_data.try_into().expect("block must be 8 bytes");
-            let mut block = Array::from(block);
+        for block_data in buf.as_chunks_mut::<8>().0 {
+            let mut block = Array::from(*block_data);
             encryptor.encrypt_block(&mut block);
-            block_data.copy_from_slice(&block);
+            *block_data = block.into();
         }
         buf
     }

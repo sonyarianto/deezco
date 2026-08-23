@@ -28,6 +28,13 @@ const META_INTERVAL: usize = 16000;
 const CHUNK_SIZE: usize = 32768;
 /// How long to wait before retrying after a transient failure.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Initial delay before retrying a failed track fetch inside the stream loop.
+/// Kept short to minimise silence gaps that can cause Icecast to drop the
+/// source connection.
+const INITIAL_FETCH_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Cap for the exponential back-off between consecutive track-fetch retries
+/// so a persistently failing CDN URL does not hammer the API.
+const MAX_FETCH_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// How long to wait before reconnecting after Icecast drops the source.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Cap for the exponential backoff between connection attempts, so a host
@@ -385,37 +392,31 @@ fn target_bitrate(fetch_format: TrackFormat, transcode: Option<u32>) -> u32 {
     transcode.unwrap_or_else(|| native_bitrate(fetch_format).unwrap_or(320))
 }
 
-/// Fetch the next track from the queue, download its decrypted audio, and
-/// optionally process it (Stereo Tool) or transcode it to the target
-/// bitrate. Runs on a background task so the current track can finish
-/// streaming without a gap.
-async fn fetch_next_track(
-    api: DeezerApi,
-    queue: TrackQueue,
+/// Maximum number of times to retry fetching the same track with a fresh
+/// CDN URL before giving up and moving on to the next track in the queue.
+const MAX_TRACK_RETRIES: u8 = 3;
+
+/// Download, decrypt, and optionally process (Stereo Tool / transcode) audio
+/// for a track that is already known (e.g. a retry after a CDN failure).
+async fn prepare_track_audio(
+    api: &DeezerApi,
+    track: &GwTrack,
     fetch_format: TrackFormat,
     transcode: Option<u32>,
-    stereo: Option<StereoConfig>,
-    playlist: String,
-) -> Result<(GwTrack, FetchedTrack)> {
-    let track = queue
-        .next_track(&api, &playlist)
-        .await
-        .map_err(|err| match err {
-            NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
-            NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
-        })?;
+    stereo: &Option<StereoConfig>,
+) -> Result<FetchedTrack> {
     if debug_enabled() {
         eprintln!(
             "[deezco-debug] preparing track {} for stream",
             track.display_name()
         );
     }
-    let fetched = fetch_track_audio(&api, &track, fetch_format, false).await?;
+    let fetched = fetch_track_audio(api, track, fetch_format, false).await?;
     let data = match stereo {
         Some(config) => {
             let rate = config.rate;
             let pcm = decode_to_pcm(fetched.data).await?;
-            let pcm = match process_stereo(pcm.clone(), &config).await {
+            let pcm = match process_stereo(pcm.clone(), config).await {
                 Ok(processed) => processed,
                 Err(err) => {
                     eprintln!("deezco: Stereo Tool failed, bypassing: {err}");
@@ -429,7 +430,30 @@ async fn fetch_next_track(
             None => fetched.data,
         },
     };
-    Ok((track, FetchedTrack { data }))
+    Ok(FetchedTrack { data })
+}
+
+/// Fetch the next track from the queue and prepare its audio. Returns the
+/// track and the audio result separately so callers can retry the same
+/// track when the CDN URL fails (the track is always available even if
+/// the audio fetch errors).
+async fn fetch_next_track(
+    api: DeezerApi,
+    queue: TrackQueue,
+    fetch_format: TrackFormat,
+    transcode: Option<u32>,
+    stereo: Option<StereoConfig>,
+    playlist: String,
+) -> Result<(GwTrack, Result<FetchedTrack>)> {
+    let track = queue
+        .next_track(&api, &playlist)
+        .await
+        .map_err(|err| match err {
+            NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
+            NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
+        })?;
+    let result = prepare_track_audio(&api, &track, fetch_format, transcode, &stereo).await;
+    Ok((track, result))
 }
 
 /// The audio track currently being pushed, with pacing state.
@@ -466,8 +490,15 @@ struct Producer {
     /// `META_INTERVAL` at the start of every new source connection via
     /// `on_connected`, because a reconnect restarts Icecast's counter at 0.
     meta_remaining: usize,
-    prefetch: Option<JoinHandle<Result<(GwTrack, FetchedTrack)>>>,
+    prefetch: Option<JoinHandle<Result<(GwTrack, Result<FetchedTrack>)>>>,
     sleep_for: Option<Duration>,
+    /// Exponential back-off for track-fetch retries in `next_chunk`.
+    fetch_backoff: Duration,
+    /// A track whose audio fetch failed (CDN error). Retried with a fresh
+    /// URL before moving on to the next track in the queue.
+    failed_track: Option<GwTrack>,
+    /// How many consecutive retries have been attempted for `failed_track`.
+    failed_retries: u8,
 }
 
 impl Producer {
@@ -513,6 +544,9 @@ impl Producer {
             meta_remaining: META_INTERVAL,
             prefetch: Some(prefetch),
             sleep_for: None,
+            fetch_backoff: INITIAL_FETCH_RETRY_DELAY,
+            failed_track: None,
+            failed_retries: 0,
         }
     }
 
@@ -528,23 +562,9 @@ impl Producer {
         self.load_next_track().await
     }
 
-    /// Load the next track: await the prefetch (or fetch it directly on the
-    /// first run) and kick off the prefetch for the following one.
-    async fn load_next_track(&mut self) -> Result<()> {
-        let (track, fetched) = match self.prefetch.take() {
-            Some(handle) => handle.await.context("prefetch task panicked")??,
-            None => {
-                fetch_next_track(
-                    self.api.clone(),
-                    self.queue.clone(),
-                    self.fetch_format,
-                    self.transcode,
-                    self.stereo.clone(),
-                    self.playlist.clone(),
-                )
-                .await?
-            }
-        };
+    /// Activate a successfully fetched track: print "now playing", update
+    /// the Icecast title, kick off the next prefetch, and set `self.current`.
+    fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
         println!("deezco: now playing: {}", track.display_name());
         if let Some(updater) = &self.updater {
             let updater = updater.clone();
@@ -588,6 +608,77 @@ impl Producer {
         // Note: `meta_remaining` intentionally lives on the Producer and is
         // carried across track changes — the ICY interval must stay
         // continuous for as long as the source connection is open.
+    }
+
+    /// Load the next track: retry a previously failed track first, then fall
+    /// back to the prefetch (or a direct fetch). The track is always returned
+    /// by the fetch helper even when the CDN URL fails, so we can retry with
+    /// a fresh URL instead of skipping to the next track.
+    async fn load_next_track(&mut self) -> Result<()> {
+        // 1. Retry a previously failed track with a fresh CDN URL.
+        if let Some(track) = self.failed_track.clone() {
+            self.failed_retries += 1;
+            if self.failed_retries > MAX_TRACK_RETRIES {
+                eprintln!(
+                    "deezco: skipping {} after {} retries",
+                    track.display_name(),
+                    MAX_TRACK_RETRIES
+                );
+                self.failed_track = None;
+                self.failed_retries = 0;
+            } else {
+                match prepare_track_audio(
+                    &self.api,
+                    &track,
+                    self.fetch_format,
+                    self.transcode,
+                    &self.stereo,
+                )
+                .await
+                {
+                    Ok(fetched) => {
+                        self.failed_track = None;
+                        self.failed_retries = 0;
+                        self.activate_track(track, fetched);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        bail!(
+                            "retry {}/{} for {}: {err}",
+                            self.failed_retries,
+                            MAX_TRACK_RETRIES,
+                            track.display_name()
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Await the prefetch (or fetch directly on the first run).
+        let (track, fetch_result) = match self.prefetch.take() {
+            Some(handle) => handle.await.context("prefetch task panicked")??,
+            None => {
+                fetch_next_track(
+                    self.api.clone(),
+                    self.queue.clone(),
+                    self.fetch_format,
+                    self.transcode,
+                    self.stereo.clone(),
+                    self.playlist.clone(),
+                )
+                .await?
+            }
+        };
+        let fetched = match fetch_result {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                // Store the track so the next call retries it with a fresh URL.
+                self.failed_track = Some(track);
+                self.failed_retries = 0;
+                return Err(err);
+            }
+        };
+        self.activate_track(track, fetched);
         Ok(())
     }
 
@@ -620,11 +711,14 @@ impl Producer {
                 if let Err(err) = self.load_next_track().await {
                     eprintln!(
                         "deezco: track fetch failed: {err}; retrying in {:?}",
-                        RETRY_DELAY
+                        self.fetch_backoff
                     );
-                    sleep(RETRY_DELAY).await;
+                    sleep(self.fetch_backoff).await;
+                    self.fetch_backoff = (self.fetch_backoff * 2).min(MAX_FETCH_RETRY_DELAY);
                     continue;
                 }
+                // Backoff succeeded: reset for the next failure cycle.
+                self.fetch_backoff = INITIAL_FETCH_RETRY_DELAY;
                 // A slow prep makes the stream go silent: silent-source hosts
                 // drop the connection, so surface the stall.
                 if started.elapsed() > Duration::from_secs(2) {

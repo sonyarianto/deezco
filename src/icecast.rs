@@ -582,6 +582,7 @@ impl Producer {
                 }
             });
         }
+        eprintln!("deezco: prefetching next track in background");
         self.prefetch = Some(tokio::spawn(fetch_next_track(
             self.api.clone(),
             self.queue.clone(),

@@ -201,7 +201,7 @@ pub enum Commands {
         /// connections on metadata updates (e.g. caster.fm)
         #[arg(long)]
         no_metadata: bool,
-        /// Target stream bitrate in kbps (e.g. 96). Transcodes via ffmpeg
+        /// Target stream bitrate in kbps (e.g. 96). Transcodes via LAME
         /// when set; 128 and 320 stream natively without transcoding
         #[arg(long)]
         bitrate: Option<u32>,

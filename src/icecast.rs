@@ -1,5 +1,7 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -189,7 +191,7 @@ fn is_valid_bitrate(bitrate: u32) -> bool {
 
 /// Which format to fetch from Deezer and whether to transcode it. Bitrates
 /// that exist natively (128/320) stream directly; anything else is fetched
-/// as MP3 320 (falling back automatically) and re-encoded via ffmpeg.
+/// as MP3 320 (falling back automatically) and re-encoded via LAME.
 fn fetch_plan(format: TrackFormat, bitrate: Option<u32>) -> (TrackFormat, Option<u32>) {
     match bitrate {
         Some(128) => (TrackFormat::Mp3_128, None),
@@ -257,72 +259,93 @@ async fn run_filter(
     Ok(output)
 }
 
-/// Re-encode MP3 audio to a target bitrate via ffmpeg.
+/// Re-encode MP3 audio to a target bitrate via LAME (decode to PCM, then
+/// re-encode). Kept as a thin wrapper so the transcode and Stereo Tool paths
+/// share the same decode/encode helpers.
 async fn transcode_mp3(data: Vec<u8>, bitrate: u32) -> Result<Vec<u8>> {
-    let bitrate_arg = format!("{bitrate}k");
-    let mut command = tokio::process::Command::new("ffmpeg");
-    command.args([
-        "-v",
-        "error",
-        "-i",
-        "pipe:0",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        bitrate_arg.as_str(),
-        "-f",
-        "mp3",
-        "pipe:1",
-    ]);
-    run_filter(command, data, "ffmpeg").await
+    let pcm = decode_to_pcm(data).await?;
+    encode_mp3(pcm, 44100, bitrate).await
 }
 
-/// Decode MP3 to raw 16-bit little-endian stereo PCM via ffmpeg.
-async fn decode_to_pcm(data: Vec<u8>, rate: u32) -> Result<Vec<u8>> {
-    let rate_arg = rate.to_string();
-    let mut command = tokio::process::Command::new("ffmpeg");
-    command.args([
-        "-v",
-        "error",
-        "-i",
-        "pipe:0",
-        "-f",
-        "s16le",
-        "-ar",
-        rate_arg.as_str(),
-        "-ac",
-        "2",
-        "pipe:1",
-    ]);
-    run_filter(command, data, "ffmpeg").await
+/// Run LAME with `input` spilled to a temp file and output captured from
+/// stdout. LAME's input backends seek, so they cannot read from a pipe; the
+/// file path and `-` (stdout) are appended to `args` automatically. The temp
+/// file is removed whether or not LAME succeeds.
+async fn lame_temp_input(input: &[u8], ext: &str, args: &[&str], name: &str) -> Result<Vec<u8>> {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("deezco_{}_{}.{}", std::process::id(), seq, ext));
+    {
+        let mut file = std::fs::File::create(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        file.write_all(input)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    let mut command = tokio::process::Command::new("lame");
+    let mut full = args.to_vec();
+    full.push(path.to_str().unwrap_or("-"));
+    full.push("-");
+    command.args(full);
+    let result = run_filter(command, Vec::new(), name).await;
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
-/// Encode raw 16-bit little-endian stereo PCM back to MP3 via ffmpeg.
+/// Decode MP3 to raw 16-bit little-endian stereo PCM via LAME. LAME decodes at
+/// the source sample rate (Deezer MP3 is 44.1 kHz). `lame --decode` emits a
+/// WAV container (even on stdout), so we strip the header to recover the raw
+/// PCM that Stereo Tool and the encoder expect.
+async fn decode_to_pcm(data: Vec<u8>) -> Result<Vec<u8>> {
+    let wav = lame_temp_input(&data, "mp3", &["--decode"], "lame-decode").await?;
+    Ok(strip_wav_header(wav))
+}
+
+/// Drop a WAV container header, returning just the raw PCM samples. LAME's
+/// decoder wraps PCM in a WAV file; Stereo Tool and LAME's raw encoder need
+/// the bare samples. We locate the `data` chunk rather than assuming a fixed
+/// 44-byte header, so extra chunks don't confuse the offset.
+fn strip_wav_header(data: Vec<u8>) -> Vec<u8> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return data;
+    }
+    let mut pos = 12;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+            as usize;
+        if id == b"data" {
+            let start = pos + 8;
+            let end = (start + size).min(data.len());
+            return data[start..end].to_vec();
+        }
+        // Chunks are word-aligned (even size).
+        pos += 8 + size + (size & 1);
+    }
+    data
+}
+
+/// Encode raw 16-bit little-endian stereo PCM back to MP3 via LAME.
 async fn encode_mp3(pcm: Vec<u8>, rate: u32, bitrate: u32) -> Result<Vec<u8>> {
-    let rate_arg = rate.to_string();
-    let bitrate_arg = format!("{bitrate}k");
-    let mut command = tokio::process::Command::new("ffmpeg");
-    command.args([
-        "-v",
-        "error",
-        "-f",
-        "s16le",
-        "-ar",
-        rate_arg.as_str(),
-        "-ac",
-        "2",
-        "-i",
-        "pipe:0",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        bitrate_arg.as_str(),
-        "-f",
-        "mp3",
-        "pipe:1",
-    ]);
-    run_filter(command, pcm, "ffmpeg").await
+    let rate_khz = format!("{}", rate as f32 / 1000.0);
+    let bitrate_arg = format!("{bitrate}");
+    lame_temp_input(
+        &pcm,
+        "raw",
+        &[
+            "-r",
+            "-s",
+            rate_khz.as_str(),
+            "-m",
+            "s",
+            "-b",
+            bitrate_arg.as_str(),
+        ],
+        "lame-encode",
+    )
+    .await
 }
+
+/// Monotonic counter so concurrent temp files get distinct names.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Process raw PCM through the Thimeo Stereo Tool (raw PCM in, raw PCM out).
 async fn process_stereo(pcm: Vec<u8>, config: &StereoConfig) -> Result<Vec<u8>> {
@@ -344,10 +367,10 @@ async fn process_stereo(pcm: Vec<u8>, config: &StereoConfig) -> Result<Vec<u8>> 
     run_filter(command, pcm, "Stereo Tool").await
 }
 
-/// Whether the ffmpeg binary is available on PATH.
-async fn ffmpeg_available() -> bool {
-    tokio::process::Command::new("ffmpeg")
-        .arg("-version")
+/// Whether the LAME binary is available on PATH.
+async fn lame_available() -> bool {
+    tokio::process::Command::new("lame")
+        .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -384,7 +407,7 @@ async fn fetch_next_track(
     let data = match stereo {
         Some(config) => {
             let rate = config.rate;
-            let pcm = decode_to_pcm(fetched.data, rate).await?;
+            let pcm = decode_to_pcm(fetched.data).await?;
             let pcm = match process_stereo(pcm.clone(), &config).await {
                 Ok(processed) => processed,
                 Err(err) => {
@@ -742,7 +765,7 @@ async fn run_connection(
 }
 
 /// Stream a playlist to an Icecast mount forever, reconnecting whenever the
-/// source connection drops. `bitrate` (kbps) transcodes via ffmpeg when set;
+/// source connection drops. `bitrate` (kbps) transcodes via LAME when set;
 /// 128 and 320 stream natively without transcoding. `stereo` runs every
 /// track through the Thimeo Stereo Tool (decode -> process -> encode).
 pub async fn stream(
@@ -760,10 +783,10 @@ pub async fn stream(
         bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
     }
     let (fetch_format, transcode) = fetch_plan(format, bitrate);
-    if (transcode.is_some() || stereo.is_some()) && !ffmpeg_available().await {
+    if (transcode.is_some() || stereo.is_some()) && !lame_available().await {
         bail!(
             "--bitrate (transcoding) and --stereo-tool (decode/process/encode) \
-             require ffmpeg; install it"
+             require lame; install it (e.g. `apt-get install lame`)"
         );
     }
     let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
@@ -920,69 +943,53 @@ mod tests {
         assert_eq!(target_bitrate(TrackFormat::Flac, None), 320);
     }
 
-    /// End-to-end transcode check: needs ffmpeg on PATH. Run with
+    /// Build a raw 16-bit little-endian stereo PCM sine (44100 Hz) for tests.
+    fn sine_pcm(seconds: f32) -> Vec<u8> {
+        let rate = 44100u32;
+        let total = (rate as f32 * seconds) as usize;
+        let mut pcm = Vec::with_capacity(total * 4);
+        for i in 0..total {
+            let t = i as f32 / rate as f32;
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0;
+            let v = sample as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        pcm
+    }
+
+    /// Encode the test sine to an MP3 via LAME.
+    async fn sine_mp3() -> Vec<u8> {
+        let mut command = tokio::process::Command::new("lame");
+        command.args(["-r", "-s", "44.1", "-m", "s", "-b", "128", "-", "-"]);
+        run_filter(command, sine_pcm(2.0), "lame").await.unwrap()
+    }
+
+    /// End-to-end transcode check: needs LAME on PATH. Run with
     /// `cargo test -- --ignored transcode_pipeline`.
     #[tokio::test]
-    #[ignore = "requires ffmpeg on PATH"]
+    #[ignore = "requires lame on PATH"]
     async fn transcode_pipeline_produces_smaller_mp3() {
-        let source = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=2",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "128k",
-                "-f",
-                "mp3",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let output = source.wait_with_output().await.unwrap();
-        assert!(!output.stdout.is_empty(), "failed to generate source MP3");
+        let source = sine_mp3().await;
+        assert!(!source.is_empty(), "failed to generate source MP3");
 
-        let encoded = transcode_mp3(output.stdout.clone(), 96).await.unwrap();
+        let encoded = transcode_mp3(source.clone(), 96).await.unwrap();
         assert!(!encoded.is_empty(), "transcode produced no audio");
         assert!(
-            encoded.len() < output.stdout.len(),
+            encoded.len() < source.len(),
             "96 kbps output should be smaller than the 128 kbps source"
         );
     }
 
     /// End-to-end PCM decode/encode check (the Stereo Tool stages): needs
-    /// ffmpeg on PATH. Run with `cargo test -- --ignored decode_encode_pipeline`.
+    /// LAME on PATH. Run with `cargo test -- --ignored decode_encode_pipeline`.
     #[tokio::test]
-    #[ignore = "requires ffmpeg on PATH"]
+    #[ignore = "requires lame on PATH"]
     async fn decode_encode_pipeline_roundtrips_pcm() {
-        let source = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=2",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "128k",
-                "-f",
-                "mp3",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let output = source.wait_with_output().await.unwrap();
-        assert!(!output.stdout.is_empty(), "failed to generate source MP3");
+        let source = sine_mp3().await;
+        assert!(!source.is_empty(), "failed to generate source MP3");
 
-        let pcm = decode_to_pcm(output.stdout.clone(), 44100).await.unwrap();
+        let pcm = decode_to_pcm(source.clone()).await.unwrap();
         assert!(!pcm.is_empty(), "decode produced no PCM");
         // 2 seconds of stereo 16-bit 44.1 kHz PCM is 352,800 bytes; the MP3
         // encoder adds a short padding tail that survives decoding

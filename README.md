@@ -1,6 +1,6 @@
 # Deezco
 
-A fast, lightweight Deezer music downloader written in Rust. Single binary; the only runtime dependency is optional — ffmpeg, needed only for live-stream bitrate transcoding and Stereo Tool processing.
+A fast, lightweight Deezer music downloader written in Rust. Single binary; the only runtime dependency is optional — LAME, needed only for live-stream bitrate transcoding and Stereo Tool processing.
 
 ## Features
 
@@ -33,7 +33,7 @@ The binary will be at `target/release/deezco` (approx. 3.2 MB).
 
 - Rust 1.88+ (edition 2024)
 - A valid Deezer ARL cookie (see [Authentication](#authentication))
-- `ffmpeg` on PATH — optional, required only by `stream` for custom bitrates (anything other than 128/320) and for Stereo Tool processing
+- `lame` on PATH — optional, required only by `stream` for custom bitrates (anything other than 128/320) and for Stereo Tool processing
 
 ## Usage
 
@@ -256,7 +256,7 @@ deezco serve --refresh-secs 60
 
 `stream` pushes a playlist to an Icecast server as a live radio source (MP3
 only — FLAC is rejected unless a custom `--bitrate` or `--stereo-tool` is
-active, in which case it is decoded via ffmpeg). It sends track titles to
+active, in which case it is decoded via LAME). It sends track titles to
 listeners via ICY metadata, paces playback in real time, prefetches the next
 track so changes are seamless, and reconnects automatically if the
 connection drops.
@@ -285,7 +285,7 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 
 # Stream at a custom bitrate, e.g. for a server capped at 96 kbps.
 # 128 and 320 stream natively without transcoding; any other bitrate
-# (8-320) is fetched as MP3 320 and re-encoded with ffmpeg
+# (8-320) is fetched as MP3 320 and re-encoded with LAME
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --bitrate 96
 
@@ -366,7 +366,7 @@ src/
   queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
   serve.rs     HTTP playlist server for media players
   icecast.rs   Icecast source client (live streaming, ICY metadata, pacing,
-               ffmpeg transcoding, Thimeo Stereo Tool processing)
+               LAME transcoding, Thimeo Stereo Tool processing)
 ```
 
 ### Technical Details

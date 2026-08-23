@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -482,7 +483,7 @@ struct Producer {
     /// `META_INTERVAL` at the start of every new source connection via
     /// `on_connected`, because a reconnect restarts Icecast's counter at 0.
     meta_remaining: usize,
-    prefetch: Option<PrefetchHandle>,
+    prefetch: VecDeque<PrefetchHandle>,
     sleep_for: Option<Duration>,
 }
 
@@ -506,14 +507,15 @@ impl Producer {
                 None => nominal_bytes_per_sec(fetch_format),
             }
         };
-        let prefetch = tokio::spawn(fetch_next_track(
+        let mut prefetch = VecDeque::new();
+        prefetch.push_back(tokio::spawn(fetch_next_track(
             api.clone(),
             queue.clone(),
             fetch_format,
             transcode,
             stereo.clone(),
             playlist.clone(),
-        ));
+        )));
         Self {
             api,
             queue,
@@ -527,7 +529,7 @@ impl Producer {
             actual_kbps: None,
             current: None,
             meta_remaining: META_INTERVAL,
-            prefetch: Some(prefetch),
+            prefetch,
             sleep_for: None,
         }
     }
@@ -544,8 +546,24 @@ impl Producer {
         self.load_next_track().await
     }
 
+    /// Spawn a background prefetch for the next track and push it to
+    /// the prefetch queue.
+    fn spawn_prefetch(&mut self) {
+        self.prefetch.push_back(tokio::spawn(fetch_next_track(
+            self.api.clone(),
+            self.queue.clone(),
+            self.fetch_format,
+            self.transcode,
+            self.stereo.clone(),
+            self.playlist.clone(),
+        )));
+    }
+
+    /// Number of tracks prefetched ahead of the current one.
+    const PREFETCH_AHEAD: usize = 2;
+
     /// Activate a successfully fetched track: print "now playing", update
-    /// the Icecast title, kick off the next prefetch, and set `self.current`.
+    /// the Icecast title, top up the prefetch queue, and set `self.current`.
     fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
         println!("deezco: now playing: {}", track.display_name());
         if let Some(updater) = &self.updater {
@@ -561,15 +579,12 @@ impl Producer {
                 }
             });
         }
-        eprintln!("deezco: prefetching next track in background");
-        self.prefetch = Some(tokio::spawn(fetch_next_track(
-            self.api.clone(),
-            self.queue.clone(),
-            self.fetch_format,
-            self.transcode,
-            self.stereo.clone(),
-            self.playlist.clone(),
-        )));
+        // Top up the prefetch queue so there are always PREFETCH_AHEAD
+        // tracks ready (or being fetched) ahead of the current one.
+        while self.prefetch.len() < Self::PREFETCH_AHEAD {
+            eprintln!("deezco: prefetching next track in background");
+            self.spawn_prefetch();
+        }
         // Resolve the real output bitrate so the advertised rate matches what
         // listeners receive: the per-track Deezer fallback for native streams,
         // or the target bitrate for transcoded/Stereo Tool output.
@@ -593,26 +608,38 @@ impl Producer {
         // continuous for as long as the source connection is open.
     }
 
-    /// Load the next track: await the prefetch (or fetch directly on the
-    /// first run) and kick off the prefetch for the following one. On
-    /// failure, the track is skipped and the next one is tried.
+    /// Load the next track: pop from the prefetch queue (or fetch directly
+    /// on the first run) and top up the queue. On failure, the track is
+    /// skipped and the next prefetched track is tried.
     async fn load_next_track(&mut self) -> Result<()> {
-        let (track, fetched) = match self.prefetch.take() {
-            Some(handle) => handle.await.context("prefetch task panicked")??,
-            None => {
-                fetch_next_track(
+        loop {
+            let handle = if let Some(h) = self.prefetch.pop_front() {
+                h
+            } else {
+                // First run: no prefetch yet, fetch directly.
+                tokio::spawn(fetch_next_track(
                     self.api.clone(),
                     self.queue.clone(),
                     self.fetch_format,
                     self.transcode,
                     self.stereo.clone(),
                     self.playlist.clone(),
-                )
-                .await?
+                ))
+            };
+            match handle.await.context("prefetch task panicked") {
+                Ok(Ok((track, fetched))) => {
+                    self.activate_track(track, fetched);
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    eprintln!("deezco: track fetch failed: {err}; skipping");
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err);
+                }
             }
-        };
-        self.activate_track(track, fetched);
-        Ok(())
+        }
     }
 
     /// Current track title, for out-of-band updates after a reconnect (the

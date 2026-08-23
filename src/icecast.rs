@@ -463,6 +463,11 @@ struct CurrentTrack {
     bytes_per_sec: u64,
 }
 
+/// Background task that fetches and prepares the next track. Returns the
+/// track metadata plus the audio result — the track is always available
+/// even when the audio fetch errors, so callers can retry with a fresh URL.
+type PrefetchHandle = JoinHandle<Result<(GwTrack, Result<FetchedTrack>)>>;
+
 /// Produces the endless source body for Icecast: paced audio chunks with ICY
 /// metadata blocks interleaved every `META_INTERVAL` bytes. The next track is
 /// prefetched on a background task while the current one streams, so track
@@ -489,7 +494,7 @@ struct Producer {
     /// `META_INTERVAL` at the start of every new source connection via
     /// `on_connected`, because a reconnect restarts Icecast's counter at 0.
     meta_remaining: usize,
-    prefetch: Option<JoinHandle<Result<(GwTrack, Result<FetchedTrack>)>>>,
+    prefetch: Option<PrefetchHandle>,
     sleep_for: Option<Duration>,
     /// Exponential back-off for track-fetch retries in `next_chunk`.
     fetch_backoff: Duration,

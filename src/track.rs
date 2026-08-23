@@ -51,12 +51,10 @@ async fn get_download_url(
     api: &DeezerApi,
     track: &GwTrack,
     format: TrackFormat,
-    fresh_url: bool,
 ) -> Result<(String, TrackFormat)> {
     let current_format = format;
 
-    // Try the new media API first — this returns a fresh signed URL each
-    // call, so retries get a new CDN path even when the track is the same.
+    // Try the new media API first
     if let Some(token) = &track.track_token
         && !token.is_empty()
     {
@@ -71,16 +69,6 @@ async fn get_download_url(
             }
             fallback = fb.fallback();
         }
-    }
-
-    // When retrying (`fresh_url`), skip the legacy fallback because it is
-    // deterministic — the same track always produces the same CDN URL, so
-    // retrying would just hit the same failing URL again.
-    if fresh_url {
-        bail!(
-            "media API did not return a URL for track {}",
-            track.id_str()
-        );
     }
 
     // Fallback to legacy URL generation
@@ -132,9 +120,8 @@ pub async fn fetch_track_audio(
     track: &GwTrack,
     format: TrackFormat,
     show_progress: bool,
-    fresh_url: bool,
 ) -> Result<FetchedTrack> {
-    let (url, _) = get_download_url(api, track, format, fresh_url).await?;
+    let (url, _) = get_download_url(api, track, format).await?;
     fetch_track_audio_from_url(api, &url, &track.id_str(), show_progress).await
 }
 
@@ -263,7 +250,7 @@ pub async fn download_track(
     }
 
     // Get download URL
-    let (url, actual_format) = get_download_url(api, track, options.format, false).await?;
+    let (url, actual_format) = get_download_url(api, track, options.format).await?;
 
     // Refuse to silently fall back below the minimum quality
     if let Some(min) = options.min_format

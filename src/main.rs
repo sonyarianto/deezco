@@ -569,7 +569,6 @@ async fn main() -> Result<()> {
             stereo_tool_key,
             stereo_rate,
             refresh_secs,
-            max_retries,
         } => {
             let password = password.or_else(|| {
                 std::env::var("DEEZCO_ICECAST_PASSWORD")
@@ -614,16 +613,7 @@ async fn main() -> Result<()> {
                 public,
                 playlist: extract_id(&playlist, "playlist"),
             };
-            icecast::stream(
-                api,
-                format,
-                config,
-                refresh_secs,
-                bitrate,
-                stereo,
-                max_retries,
-            )
-            .await?;
+            icecast::stream(api, format, config, refresh_secs, bitrate, stereo).await?;
         }
     }
 

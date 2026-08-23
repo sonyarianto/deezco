@@ -222,10 +222,6 @@ pub enum Commands {
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 300)]
         refresh_secs: u64,
-        /// How many times to retry fetching a track with a fresh CDN URL
-        /// before skipping to the next track (default: 3)
-        #[arg(long, default_value_t = 3)]
-        max_retries: u8,
     },
 }
 

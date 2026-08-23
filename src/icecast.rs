@@ -400,6 +400,7 @@ async fn prepare_track_audio(
     fetch_format: TrackFormat,
     transcode: Option<u32>,
     stereo: &Option<StereoConfig>,
+    fresh_url: bool,
 ) -> Result<FetchedTrack> {
     if debug_enabled() {
         eprintln!(
@@ -407,7 +408,7 @@ async fn prepare_track_audio(
             track.display_name()
         );
     }
-    let fetched = fetch_track_audio(api, track, fetch_format, false).await?;
+    let fetched = fetch_track_audio(api, track, fetch_format, false, fresh_url).await?;
     // The actual format Deezer served, which may be lower than requested
     // (e.g. 128 on a free account when 320 was requested).
     let actual_format = available_format(track, fetch_format);
@@ -451,7 +452,7 @@ async fn fetch_next_track(
             NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
             NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
         })?;
-    let result = prepare_track_audio(&api, &track, fetch_format, transcode, &stereo).await;
+    let result = prepare_track_audio(&api, &track, fetch_format, transcode, &stereo, false).await;
     Ok((track, result))
 }
 
@@ -642,6 +643,7 @@ impl Producer {
                     self.fetch_format,
                     self.transcode,
                     &self.stereo,
+                    true,
                 )
                 .await
                 {

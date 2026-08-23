@@ -407,7 +407,6 @@ struct CurrentTrack {
     title: String,
     data: Vec<u8>,
     pos: usize,
-    meta_remaining: usize,
     bytes_per_sec: u64,
 }
 
@@ -426,6 +425,12 @@ struct Producer {
     nominal_bps: u64,
     playlist: String,
     current: Option<CurrentTrack>,
+    /// Audio bytes remaining until the next ICY metadata block. Counted
+    /// continuously across track changes (Icecast measures the interval from
+    /// the start of the connection, not per track) and re-aligned to
+    /// `META_INTERVAL` at the start of every new source connection via
+    /// `on_connected`, because a reconnect restarts Icecast's counter at 0.
+    meta_remaining: usize,
     prefetch: Option<JoinHandle<Result<(GwTrack, FetchedTrack)>>>,
     sleep_for: Option<Duration>,
 }
@@ -469,6 +474,7 @@ impl Producer {
             nominal_bps,
             playlist,
             current: None,
+            meta_remaining: META_INTERVAL,
             prefetch: Some(prefetch),
             sleep_for: None,
         }
@@ -534,8 +540,10 @@ impl Producer {
             ),
             data: fetched.data,
             pos: 0,
-            meta_remaining: META_INTERVAL,
         });
+        // Note: `meta_remaining` intentionally lives on the Producer and is
+        // carried across track changes — the ICY interval must stay
+        // continuous for as long as the source connection is open.
         Ok(())
     }
 
@@ -543,6 +551,17 @@ impl Producer {
     /// server loses the title when the source drops).
     fn current_title(&self) -> Option<String> {
         self.current.as_ref().map(|current| current.title.clone())
+    }
+
+    /// Re-align the ICY metadata interval for a new source connection.
+    /// Icecast counts audio bytes from the start of each connection, so the
+    /// first metadata block must land exactly `META_INTERVAL` bytes into the
+    /// new connection — even when a track resumes mid-interval after a
+    /// reconnect. Without this, Icecast reads audio bytes as metadata and
+    /// kills the source with "Incorrect metadata format, ending stream"
+    /// within about a second of connecting.
+    fn on_connected(&mut self) {
+        self.meta_remaining = META_INTERVAL;
     }
 
     /// Next body chunk: audio (paced) or a metadata block. `None` never
@@ -574,13 +593,12 @@ impl Producer {
             let Some(current) = self.current.as_mut() else {
                 continue;
             };
-            if self.metadata && current.meta_remaining == 0 {
-                current.meta_remaining = META_INTERVAL;
+            if self.metadata && self.meta_remaining == 0 {
+                self.meta_remaining = META_INTERVAL;
                 return Some(Ok(icy_metadata_block(&current.title)));
             }
             let take = if self.metadata {
-                current
-                    .meta_remaining
+                self.meta_remaining
                     .min(CHUNK_SIZE)
                     .min(current.data.len() - current.pos)
             } else {
@@ -589,7 +607,7 @@ impl Producer {
             let chunk = current.data[current.pos..current.pos + take].to_vec();
             let finished = current.pos + take >= current.data.len();
             current.pos += take;
-            current.meta_remaining -= take;
+            self.meta_remaining -= take;
             let bytes_per_sec = current.bytes_per_sec;
             if finished {
                 self.current = None;
@@ -652,6 +670,11 @@ async fn run_connection(
             }
         }
     }
+    // A fresh Icecast connection restarts the metadata-interval byte counter
+    // at 0; re-align our counter so the first ICY metadata block lands at
+    // exactly META_INTERVAL bytes into this connection (the body stream is
+    // lazy, so this happens before any audio is pushed).
+    producer.lock().await.on_connected();
     let body = stream::unfold(producer.clone(), |producer| async move {
         let chunk = {
             let mut p = producer.lock().await;

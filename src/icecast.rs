@@ -18,6 +18,7 @@ use crate::api::DeezerApi;
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
+use crate::track::available_format;
 
 /// How many bytes of audio between in-band ICY metadata blocks. The source
 /// picks the interval and tells Icecast about it via the `icy-metaint`
@@ -447,6 +448,11 @@ struct Producer {
     updater: Option<TitleUpdater>,
     nominal_bps: u64,
     playlist: String,
+    /// Actual output bitrate in kbps, resolved per track after Deezer's
+    /// quality fallback. Advertised to Icecast so the server's reported
+    /// bitrate matches what listeners actually receive (e.g. 128 on a free
+    /// account even when 320 was requested).
+    actual_kbps: Option<u32>,
     current: Option<CurrentTrack>,
     /// Audio bytes remaining until the next ICY metadata block. Counted
     /// continuously across track changes (Icecast measures the interval from
@@ -496,6 +502,7 @@ impl Producer {
             updater,
             nominal_bps,
             playlist,
+            actual_kbps: None,
             current: None,
             meta_remaining: META_INTERVAL,
             prefetch: Some(prefetch),
@@ -554,6 +561,14 @@ impl Producer {
             self.stereo.clone(),
             self.playlist.clone(),
         )));
+        // Resolve the real output bitrate so the advertised rate matches what
+        // listeners receive: the per-track Deezer fallback for native streams,
+        // or the target bitrate for transcoded/Stereo Tool output.
+        self.actual_kbps = Some(if self.transcode.is_some() || self.stereo.is_some() {
+            target_bitrate(self.fetch_format, self.transcode)
+        } else {
+            native_bitrate(available_format(&track, self.fetch_format)).unwrap_or(128)
+        });
         self.current = Some(CurrentTrack {
             title: track.display_name(),
             bytes_per_sec: bytes_per_sec(
@@ -642,6 +657,9 @@ impl Producer {
 
     /// The bitrate advertised to Icecast, matching the actual output stream.
     fn advertised_kbps(&self) -> u32 {
+        if let Some(kbps) = self.actual_kbps {
+            return kbps;
+        }
         if self.stereo.is_some() {
             target_bitrate(self.fetch_format, self.transcode)
         } else {
@@ -683,6 +701,9 @@ async fn run_connection(
         match p.warm_up().await {
             Ok(()) => {
                 advertised_kbps = p.advertised_kbps();
+                println!(
+                    "deezco: streaming at {advertised_kbps} kbps (actual, after quality fallback)"
+                );
                 client = p.api.client().clone();
                 break;
             }
@@ -791,11 +812,10 @@ pub async fn stream(
     }
     let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
     println!(
-        "deezco: streaming playlist {} to {}{} at {} kbps (refresh every {}s)",
+        "deezco: streaming playlist {} to {}{} (refresh every {}s)",
         config.playlist,
         config.server.trim_end_matches('/'),
         config.mount,
-        bitrate.unwrap_or_else(|| native_bitrate(format).unwrap_or(320)),
         refresh_secs
     );
 

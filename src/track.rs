@@ -10,6 +10,15 @@ use crate::crypto;
 use crate::files::sanitize_filename;
 use crate::models::*;
 
+/// Whether verbose debug logging is enabled. Set `DEEZCO_DEBUG=1` (or `true`)
+/// to print download-stage messages (start/finish, byte counts) that help
+/// diagnose stalls and throttling without cluttering normal output.
+pub(crate) fn debug_enabled() -> bool {
+    std::env::var("DEEZCO_DEBUG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Quality and format settings shared by every download command.
 #[derive(Clone, Copy)]
 pub struct DownloadOptions {
@@ -124,6 +133,9 @@ pub async fn fetch_track_audio_from_url(
     show_progress: bool,
 ) -> Result<FetchedTrack> {
     // Download using the shared API client
+    if debug_enabled() {
+        eprintln!("[deezco-debug] downloading track {sng_id} from {url}");
+    }
     let response = api
         .client()
         .get(url)
@@ -187,6 +199,13 @@ pub async fn fetch_track_audio_from_url(
     } else {
         final_data
     };
+
+    if debug_enabled() {
+        eprintln!(
+            "[deezco-debug] downloaded track {sng_id}: {} bytes",
+            output_data.len()
+        );
+    }
 
     Ok(FetchedTrack { data: output_data })
 }

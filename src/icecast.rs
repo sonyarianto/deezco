@@ -18,7 +18,7 @@ use crate::api::DeezerApi;
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
-use crate::track::available_format;
+use crate::track::{available_format, debug_enabled};
 
 /// How many bytes of audio between in-band ICY metadata blocks. The source
 /// picks the interval and tells Icecast about it via the `icy-metaint`
@@ -404,6 +404,12 @@ async fn fetch_next_track(
             NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
             NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
         })?;
+    if debug_enabled() {
+        eprintln!(
+            "[deezco-debug] preparing track {} for stream",
+            track.display_name()
+        );
+    }
     let fetched = fetch_track_audio(&api, &track, fetch_format, false).await?;
     let data = match stereo {
         Some(config) => {

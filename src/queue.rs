@@ -63,6 +63,7 @@ impl TrackQueue {
             .last_fetch
             .is_none_or(|fetched| fetched.elapsed() >= self.refresh);
         if queue.tracks.is_empty() || stale {
+            eprintln!("deezco: refreshing playlist {playlist_id}");
             match api.get_playlist_tracks(playlist_id).await {
                 Ok(tracks) if !tracks.is_empty() => {
                     let mut tracks = tracks;

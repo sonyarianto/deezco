@@ -129,10 +129,12 @@ pub async fn fetch_track_audio_from_url(
         .get(url)
         .send()
         .await
-        .context("Failed to download track")?;
+        .with_context(|| format!("Failed to download track {sng_id} from {url}"))?;
 
     if !response.status().is_success() {
-        bail!("Download failed with status: {}", response.status());
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("Download failed with status {status} for track {sng_id}: {body}");
     }
 
     let total_size = response.content_length().unwrap_or(0);

@@ -392,10 +392,6 @@ fn target_bitrate(fetch_format: TrackFormat, transcode: Option<u32>) -> u32 {
     transcode.unwrap_or_else(|| native_bitrate(fetch_format).unwrap_or(320))
 }
 
-/// Maximum number of times to retry fetching the same track with a fresh
-/// CDN URL before giving up and moving on to the next track in the queue.
-const MAX_TRACK_RETRIES: u8 = 3;
-
 /// Download, decrypt, and optionally process (Stereo Tool / transcode) audio
 /// for a track that is already known (e.g. a retry after a CDN failure).
 async fn prepare_track_audio(
@@ -412,6 +408,9 @@ async fn prepare_track_audio(
         );
     }
     let fetched = fetch_track_audio(api, track, fetch_format, false).await?;
+    // The actual format Deezer served, which may be lower than requested
+    // (e.g. 128 on a free account when 320 was requested).
+    let actual_format = available_format(track, fetch_format);
     let data = match stereo {
         Some(config) => {
             let rate = config.rate;
@@ -423,7 +422,7 @@ async fn prepare_track_audio(
                     pcm
                 }
             };
-            encode_mp3(pcm, rate, target_bitrate(fetch_format, transcode)).await?
+            encode_mp3(pcm, rate, target_bitrate(actual_format, transcode)).await?
         }
         None => match transcode {
             Some(bitrate) => transcode_mp3(fetched.data, bitrate).await?,
@@ -499,6 +498,8 @@ struct Producer {
     failed_track: Option<GwTrack>,
     /// How many consecutive retries have been attempted for `failed_track`.
     failed_retries: u8,
+    /// How many times to retry a failed track fetch before moving on.
+    max_retries: u8,
 }
 
 impl Producer {
@@ -512,6 +513,7 @@ impl Producer {
         metadata: bool,
         updater: Option<TitleUpdater>,
         playlist: String,
+        max_retries: u8,
     ) -> Self {
         let nominal_bps = if stereo.is_some() {
             target_bitrate(fetch_format, transcode) as u64 * 1000 / 8
@@ -547,6 +549,7 @@ impl Producer {
             fetch_backoff: INITIAL_FETCH_RETRY_DELAY,
             failed_track: None,
             failed_retries: 0,
+            max_retries,
         }
     }
 
@@ -591,7 +594,7 @@ impl Producer {
         // listeners receive: the per-track Deezer fallback for native streams,
         // or the target bitrate for transcoded/Stereo Tool output.
         self.actual_kbps = Some(if self.transcode.is_some() || self.stereo.is_some() {
-            target_bitrate(self.fetch_format, self.transcode)
+            target_bitrate(available_format(&track, self.fetch_format), self.transcode)
         } else {
             native_bitrate(available_format(&track, self.fetch_format)).unwrap_or(128)
         });
@@ -618,11 +621,11 @@ impl Producer {
         // 1. Retry a previously failed track with a fresh CDN URL.
         if let Some(track) = self.failed_track.clone() {
             self.failed_retries += 1;
-            if self.failed_retries > MAX_TRACK_RETRIES {
+            if self.failed_retries > self.max_retries {
                 eprintln!(
                     "deezco: skipping {} after {} retries",
                     track.display_name(),
-                    MAX_TRACK_RETRIES
+                    self.max_retries
                 );
                 self.failed_track = None;
                 self.failed_retries = 0;
@@ -646,7 +649,7 @@ impl Producer {
                         bail!(
                             "retry {}/{} for {}: {err}",
                             self.failed_retries,
-                            MAX_TRACK_RETRIES,
+                            self.max_retries,
                             track.display_name()
                         );
                     }
@@ -896,6 +899,7 @@ pub async fn stream(
     refresh_secs: u64,
     bitrate: Option<u32>,
     stereo: Option<StereoConfig>,
+    max_retries: u8,
 ) -> Result<()> {
     if bitrate.is_some_and(|br| !is_valid_bitrate(br)) {
         bail!("--bitrate must be between 8 and 320 kbps");
@@ -932,6 +936,7 @@ pub async fn stream(
         config.metadata,
         Some(updater.clone()),
         config.playlist.clone(),
+        max_retries,
     )));
 
     let mut reconnect_delay = RECONNECT_DELAY;

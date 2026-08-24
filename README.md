@@ -1,6 +1,6 @@
 # Deezco
 
-A fast, lightweight Deezer music downloader written in Rust. Single binary; the only runtime dependency is optional — LAME, needed only for live-stream bitrate transcoding and Stereo Tool processing.
+A fast, lightweight Deezer music downloader written in Rust. Zero runtime dependencies.
 
 ## Features
 
@@ -33,7 +33,6 @@ The binary will be at `target/release/deezco` (approx. 3.2 MB).
 
 - Rust 1.88+ (edition 2024)
 - A valid Deezer ARL cookie (see [Authentication](#authentication))
-- `lame` on PATH — optional, required only by `stream` for custom bitrates (anything other than 128/320) and for Stereo Tool processing
 
 ## Usage
 
@@ -255,11 +254,10 @@ deezco serve --refresh-secs 60
 ### Live streaming to Icecast
 
 `stream` pushes a playlist to an Icecast server as a live radio source (MP3
-only — FLAC is rejected unless a custom `--bitrate` or `--stereo-tool` is
-active, in which case it is decoded via LAME). It sends track titles to
-listeners via ICY metadata, paces playback in real time, prefetches the next
-track so changes are seamless, and reconnects automatically if the
-connection drops.
+128 or 320 — FLAC is rejected). It sends track titles to listeners via
+ICY metadata, paces playback in real time, prefetches the next track so
+changes are seamless, and reconnects automatically if the connection
+drops.
 
 ```bash
 # Stream a playlist to an Icecast mount as a 24/7 radio source
@@ -282,25 +280,6 @@ deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
 # Listeners tune in at the mount; playlist edits are picked up periodically
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --refresh-secs 60
-
-# Stream at a custom bitrate, e.g. for a server capped at 96 kbps.
-# 128 and 320 stream natively without transcoding; any other bitrate
-# (8-320) is fetched as MP3 320 and re-encoded with LAME
-deezco stream 908622995 --server http://localhost:8000 --mount /radio \
-  --password hackme --bitrate 96
-
-# Run every track through the Thimeo Stereo Tool (a licensed
-# stereo_tool_cmd_64 binary) for FM-style processing: each track is decoded
-# to PCM, processed, and re-encoded to the target bitrate
-deezco stream 908622995 --server http://localhost:8000 --mount /radio \
-  --password hackme --stereo-tool ~/tools/stereo_tool_cmd_64
-
-# Custom Stereo Tool settings file and processing rate (defaults: audio.sts
-# next to the binary if present, 44100 Hz). A license key is passed with
-# --stereo-tool-key when the tool requires one
-deezco stream 908622995 --server http://localhost:8000 --mount /radio \
-  --password hackme --stereo-tool ~/tools/stereo_tool_cmd_64 \
-  --stereo-tool-sts ~/tools/audio.sts --stereo-rate 48000 --bitrate 128
 
 # Some source proxies (notably caster.fm's custom Icecast) reset the source
 # connection whenever the in-stream ICY track title changes. If the
@@ -365,8 +344,7 @@ src/
   models.rs    Data structures (tracks, playlists, albums, formats)
   queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
   serve.rs     HTTP playlist server for media players
-  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing,
-               LAME transcoding, Thimeo Stereo Tool processing)
+  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
 ```
 
 ### Technical Details

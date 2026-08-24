@@ -563,11 +563,6 @@ async fn main() -> Result<()> {
             url,
             public,
             no_metadata,
-            bitrate,
-            stereo_tool,
-            stereo_tool_sts,
-            stereo_tool_key,
-            stereo_rate,
             refresh_secs,
         } => {
             let password = password.or_else(|| {
@@ -579,27 +574,6 @@ async fn main() -> Result<()> {
                 anyhow::bail!(
                     "an Icecast source password is required (--password or DEEZCO_ICECAST_PASSWORD)"
                 );
-            };
-            let stereo = match stereo_tool {
-                Some(binary) => {
-                    if !binary.exists() {
-                        anyhow::bail!("--stereo-tool binary not found: {}", binary.display());
-                    }
-                    let settings = match stereo_tool_sts {
-                        Some(path) => Some(path),
-                        None => binary
-                            .parent()
-                            .map(|dir| dir.join("audio.sts"))
-                            .filter(|path| path.exists()),
-                    };
-                    Some(icecast::StereoConfig {
-                        binary,
-                        settings,
-                        key: stereo_tool_key,
-                        rate: stereo_rate,
-                    })
-                }
-                None => None,
             };
             let config = icecast::IcecastConfig {
                 server,
@@ -613,7 +587,7 @@ async fn main() -> Result<()> {
                 public,
                 playlist: extract_id(&playlist, "playlist"),
             };
-            icecast::stream(api, format, config, refresh_secs, bitrate, stereo).await?;
+            icecast::stream(api, format, config, refresh_secs).await?;
         }
     }
 

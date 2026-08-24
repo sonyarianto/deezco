@@ -1,8 +1,5 @@
 use std::collections::VecDeque;
-use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -10,8 +7,6 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use futures_util::stream;
 use reqwest::header;
-use std::process::Stdio;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -130,21 +125,6 @@ fn percent_encode(input: &[u8]) -> String {
     out
 }
 
-/// Thimeo Stereo Tool processing configuration.
-#[derive(Clone)]
-pub struct StereoConfig {
-    /// Path to the licensed `stereo_tool_cmd_64` binary
-    pub binary: PathBuf,
-    /// Processor settings file (.sts); the tool falls back to its defaults
-    /// when unset
-    pub settings: Option<PathBuf>,
-    /// License key; passed on the command line like the official CLI expects
-    /// (visible in `ps aux`)
-    pub key: Option<String>,
-    /// Sample rate (Hz) the processing bus runs at
-    pub rate: u32,
-}
-
 /// A full ICY metadata block: one length byte (16-byte units) followed by
 /// `StreamTitle='...';` padded with null bytes.
 fn icy_metadata_block(title: &str) -> Vec<u8> {
@@ -186,214 +166,12 @@ fn native_bitrate(format: TrackFormat) -> Option<u32> {
     }
 }
 
-/// Whether a bitrate can be streamed natively.
-fn is_valid_bitrate(bitrate: u32) -> bool {
-    (8..=320).contains(&bitrate)
-}
-
-/// Which format to fetch from Deezer and whether to transcode it. Bitrates
-/// that exist natively (128/320) stream directly; anything else is fetched
-/// as MP3 320 (falling back automatically) and re-encoded via LAME.
-fn fetch_plan(format: TrackFormat, bitrate: Option<u32>) -> (TrackFormat, Option<u32>) {
-    match bitrate {
-        Some(128) => (TrackFormat::Mp3_128, None),
-        Some(320) => (TrackFormat::Mp3_320, None),
-        Some(br) => (TrackFormat::Mp3_320, Some(br)),
-        None => (format, None),
-    }
-}
-
-/// Run a filter process with piped stdin/stdout: write `input` to its stdin
-/// while reading its stdout, collecting everything. Writes and reads run
-/// concurrently so a full pipe buffer cannot deadlock the pipeline.
-async fn run_filter(
-    mut command: tokio::process::Command,
-    input: Vec<u8>,
-    name: &str,
-) -> Result<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start {name}"))?;
-
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let write_stdin = tokio::spawn(async move {
-        let result = stdin.write_all(&input).await;
-        let _ = stdin.shutdown().await;
-        result
-    });
-
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let read_stderr = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
-    });
-
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut output = Vec::new();
-    let mut buf = vec![0u8; 16384];
-    loop {
-        let n = stdout
-            .read(&mut buf)
-            .await
-            .with_context(|| format!("failed to read {name} output"))?;
-        if n == 0 {
-            break;
-        }
-        output.extend_from_slice(&buf[..n]);
-    }
-
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("failed to wait for {name}"))?;
-    let stderr_text = read_stderr.await.unwrap_or_default();
-    let _ = write_stdin.await;
-    if !status.success() {
-        bail!("{name} failed ({}): {}", status, stderr_text.trim());
-    }
-    if output.is_empty() {
-        bail!("{name} produced no output");
-    }
-    Ok(output)
-}
-
-/// Re-encode MP3 audio to a target bitrate via LAME (decode to PCM, then
-/// re-encode). Kept as a thin wrapper so the transcode and Stereo Tool paths
-/// share the same decode/encode helpers.
-async fn transcode_mp3(data: Vec<u8>, bitrate: u32) -> Result<Vec<u8>> {
-    let pcm = decode_to_pcm(data).await?;
-    encode_mp3(pcm, 44100, bitrate).await
-}
-
-/// Run LAME with `input` spilled to a temp file and output captured from
-/// stdout. LAME's input backends seek, so they cannot read from a pipe; the
-/// file path and `-` (stdout) are appended to `args` automatically. The temp
-/// file is removed whether or not LAME succeeds.
-async fn lame_temp_input(input: &[u8], ext: &str, args: &[&str], name: &str) -> Result<Vec<u8>> {
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("deezco_{}_{}.{}", std::process::id(), seq, ext));
-    {
-        let mut file = std::fs::File::create(&path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(input)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    let mut command = tokio::process::Command::new("lame");
-    let mut full = args.to_vec();
-    full.push(path.to_str().unwrap_or("-"));
-    full.push("-");
-    command.args(full);
-    let result = run_filter(command, Vec::new(), name).await;
-    let _ = std::fs::remove_file(&path);
-    result
-}
-
-/// Decode MP3 to raw 16-bit little-endian stereo PCM via LAME. LAME decodes at
-/// the source sample rate (Deezer MP3 is 44.1 kHz). `lame --decode` emits a
-/// WAV container (even on stdout), so we strip the header to recover the raw
-/// PCM that Stereo Tool and the encoder expect.
-async fn decode_to_pcm(data: Vec<u8>) -> Result<Vec<u8>> {
-    let wav = lame_temp_input(&data, "mp3", &["--decode"], "lame-decode").await?;
-    Ok(strip_wav_header(wav))
-}
-
-/// Drop a WAV container header, returning just the raw PCM samples. LAME's
-/// decoder wraps PCM in a WAV file; Stereo Tool and LAME's raw encoder need
-/// the bare samples. We locate the `data` chunk rather than assuming a fixed
-/// 44-byte header, so extra chunks don't confuse the offset.
-fn strip_wav_header(data: Vec<u8>) -> Vec<u8> {
-    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
-        return data;
-    }
-    let mut pos = 12;
-    while pos + 8 <= data.len() {
-        let id = &data[pos..pos + 4];
-        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-            as usize;
-        if id == b"data" {
-            let start = pos + 8;
-            let end = (start + size).min(data.len());
-            return data[start..end].to_vec();
-        }
-        // Chunks are word-aligned (even size).
-        pos += 8 + size + (size & 1);
-    }
-    data
-}
-
-/// Encode raw 16-bit little-endian stereo PCM back to MP3 via LAME.
-async fn encode_mp3(pcm: Vec<u8>, rate: u32, bitrate: u32) -> Result<Vec<u8>> {
-    let rate_khz = format!("{}", rate as f32 / 1000.0);
-    let bitrate_arg = format!("{bitrate}");
-    lame_temp_input(
-        &pcm,
-        "raw",
-        &[
-            "-r",
-            "-s",
-            rate_khz.as_str(),
-            "-m",
-            "s",
-            "-b",
-            bitrate_arg.as_str(),
-        ],
-        "lame-encode",
-    )
-    .await
-}
-
-/// Monotonic counter so concurrent temp files get distinct names.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Process raw PCM through the Thimeo Stereo Tool (raw PCM in, raw PCM out).
-async fn process_stereo(pcm: Vec<u8>, config: &StereoConfig) -> Result<Vec<u8>> {
-    let rate_arg = config.rate.to_string();
-    let mut command = tokio::process::Command::new(&config.binary);
-    command
-        .arg("-q")
-        .arg("-b")
-        .arg("16")
-        .arg("-r")
-        .arg(&rate_arg);
-    if let Some(settings) = &config.settings {
-        command.arg("-s").arg(settings);
-    }
-    if let Some(key) = &config.key {
-        command.arg("-k").arg(key);
-    }
-    command.arg("-").arg("-");
-    run_filter(command, pcm, "Stereo Tool").await
-}
-
-/// Whether the LAME binary is available on PATH.
-async fn lame_available() -> bool {
-    tokio::process::Command::new("lame")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
-}
-
-/// The bitrate the final encode step targets when transcoding or processing
-/// is involved: the requested one, or the native rate of the fetched format.
-fn target_bitrate(fetch_format: TrackFormat, transcode: Option<u32>) -> u32 {
-    transcode.unwrap_or_else(|| native_bitrate(fetch_format).unwrap_or(320))
-}
-
-/// Download, decrypt, and optionally process (Stereo Tool / transcode) audio
-/// for a track that is already known (e.g. a retry after a CDN failure).
+/// Download and decrypt audio for a track that is already known
+/// (e.g. a retry after a CDN failure).
 async fn prepare_track_audio(
     api: &DeezerApi,
     track: &GwTrack,
     fetch_format: TrackFormat,
-    transcode: Option<u32>,
-    stereo: &Option<StereoConfig>,
 ) -> Result<FetchedTrack> {
     if debug_enabled() {
         eprintln!(
@@ -402,28 +180,7 @@ async fn prepare_track_audio(
         );
     }
     let fetched = fetch_track_audio(api, track, fetch_format, false).await?;
-    // The actual format Deezer served, which may be lower than requested
-    // (e.g. 128 on a free account when 320 was requested).
-    let actual_format = available_format(track, fetch_format);
-    let data = match stereo {
-        Some(config) => {
-            let rate = config.rate;
-            let pcm = decode_to_pcm(fetched.data).await?;
-            let pcm = match process_stereo(pcm.clone(), config).await {
-                Ok(processed) => processed,
-                Err(err) => {
-                    eprintln!("deezco: Stereo Tool failed, bypassing: {err}");
-                    pcm
-                }
-            };
-            encode_mp3(pcm, rate, target_bitrate(actual_format, transcode)).await?
-        }
-        None => match transcode {
-            Some(bitrate) => transcode_mp3(fetched.data, bitrate).await?,
-            None => fetched.data,
-        },
-    };
-    Ok(FetchedTrack { data })
+    Ok(fetched)
 }
 
 /// Fetch the next track from the queue and prepare its audio.
@@ -431,8 +188,6 @@ async fn fetch_next_track(
     api: DeezerApi,
     queue: TrackQueue,
     fetch_format: TrackFormat,
-    transcode: Option<u32>,
-    stereo: Option<StereoConfig>,
     playlist: String,
 ) -> Result<(GwTrack, FetchedTrack)> {
     let track = queue
@@ -442,7 +197,7 @@ async fn fetch_next_track(
             NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
             NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
         })?;
-    let fetched = prepare_track_audio(&api, &track, fetch_format, transcode, &stereo).await?;
+    let fetched = prepare_track_audio(&api, &track, fetch_format).await?;
     Ok((track, fetched))
 }
 
@@ -465,8 +220,6 @@ struct Producer {
     api: DeezerApi,
     queue: TrackQueue,
     fetch_format: TrackFormat,
-    transcode: Option<u32>,
-    stereo: Option<StereoConfig>,
     metadata: bool,
     updater: Option<TitleUpdater>,
     nominal_bps: u64,
@@ -488,40 +241,26 @@ struct Producer {
 }
 
 impl Producer {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         api: DeezerApi,
         queue: TrackQueue,
         fetch_format: TrackFormat,
-        transcode: Option<u32>,
-        stereo: Option<StereoConfig>,
         metadata: bool,
         updater: Option<TitleUpdater>,
         playlist: String,
     ) -> Self {
-        let nominal_bps = if stereo.is_some() {
-            target_bitrate(fetch_format, transcode) as u64 * 1000 / 8
-        } else {
-            match transcode {
-                Some(bitrate) => bitrate as u64 * 1000 / 8,
-                None => nominal_bytes_per_sec(fetch_format),
-            }
-        };
+        let nominal_bps = nominal_bytes_per_sec(fetch_format);
         let mut prefetch = VecDeque::new();
         prefetch.push_back(tokio::spawn(fetch_next_track(
             api.clone(),
             queue.clone(),
             fetch_format,
-            transcode,
-            stereo.clone(),
             playlist.clone(),
         )));
         Self {
             api,
             queue,
             fetch_format,
-            transcode,
-            stereo,
             metadata,
             updater,
             nominal_bps,
@@ -536,9 +275,7 @@ impl Producer {
 
     /// Ensure the first track is loaded and ready. Used before opening the
     /// Icecast connection so audio flows immediately upon registration:
-    /// hosts like caster.fm drop silent sources within seconds, and the
-    /// first track can take a while to prepare (download + Stereo Tool
-    /// processing + encoding).
+    /// hosts like caster.fm drop silent sources within seconds.
     async fn warm_up(&mut self) -> Result<()> {
         if self.current.is_some() {
             return Ok(());
@@ -553,8 +290,6 @@ impl Producer {
             self.api.clone(),
             self.queue.clone(),
             self.fetch_format,
-            self.transcode,
-            self.stereo.clone(),
             self.playlist.clone(),
         )));
     }
@@ -586,13 +321,9 @@ impl Producer {
             self.spawn_prefetch();
         }
         // Resolve the real output bitrate so the advertised rate matches what
-        // listeners receive: the per-track Deezer fallback for native streams,
-        // or the target bitrate for transcoded/Stereo Tool output.
-        self.actual_kbps = Some(if self.transcode.is_some() || self.stereo.is_some() {
-            target_bitrate(available_format(&track, self.fetch_format), self.transcode)
-        } else {
-            native_bitrate(available_format(&track, self.fetch_format)).unwrap_or(128)
-        });
+        // listeners receive (the per-track Deezer quality fallback).
+        self.actual_kbps =
+            Some(native_bitrate(available_format(&track, self.fetch_format)).unwrap_or(128));
         self.current = Some(CurrentTrack {
             title: track.display_name(),
             bytes_per_sec: bytes_per_sec(
@@ -621,8 +352,6 @@ impl Producer {
                     self.api.clone(),
                     self.queue.clone(),
                     self.fetch_format,
-                    self.transcode,
-                    self.stereo.clone(),
                     self.playlist.clone(),
                 ))
             };
@@ -717,12 +446,7 @@ impl Producer {
         if let Some(kbps) = self.actual_kbps {
             return kbps;
         }
-        if self.stereo.is_some() {
-            target_bitrate(self.fetch_format, self.transcode)
-        } else {
-            self.transcode
-                .unwrap_or_else(|| (nominal_bytes_per_sec(self.fetch_format) * 8 / 1000) as u32)
-        }
+        (nominal_bytes_per_sec(self.fetch_format) * 8 / 1000) as u32
     }
 }
 
@@ -747,12 +471,7 @@ async fn run_connection(
     loop {
         let mut p = producer.lock().await;
         if p.current.is_none() && !prepared {
-            let note = if p.stereo.is_some() {
-                " (Stereo Tool processing can take a minute)"
-            } else {
-                ""
-            };
-            println!("deezco: preparing the first track before connecting{note}");
+            println!("deezco: preparing the first track before connecting");
             prepared = true;
         }
         match p.warm_up().await {
@@ -843,29 +562,15 @@ async fn run_connection(
 }
 
 /// Stream a playlist to an Icecast mount forever, reconnecting whenever the
-/// source connection drops. `bitrate` (kbps) transcodes via LAME when set;
-/// 128 and 320 stream natively without transcoding. `stereo` runs every
-/// track through the Thimeo Stereo Tool (decode -> process -> encode).
+/// source connection drops.
 pub async fn stream(
     api: DeezerApi,
     format: TrackFormat,
     config: IcecastConfig,
     refresh_secs: u64,
-    bitrate: Option<u32>,
-    stereo: Option<StereoConfig>,
 ) -> Result<()> {
-    if bitrate.is_some_and(|br| !is_valid_bitrate(br)) {
-        bail!("--bitrate must be between 8 and 320 kbps");
-    }
-    if format == TrackFormat::Flac && bitrate.is_none() && stereo.is_none() {
+    if format == TrackFormat::Flac {
         bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
-    }
-    let (fetch_format, transcode) = fetch_plan(format, bitrate);
-    if (transcode.is_some() || stereo.is_some()) && !lame_available().await {
-        bail!(
-            "--bitrate (transcoding) and --stereo-tool (decode/process/encode) \
-             require lame; install it (e.g. `apt-get install lame`)"
-        );
     }
     let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
     println!(
@@ -883,9 +588,7 @@ pub async fn stream(
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
         queue.clone(),
-        fetch_format,
-        transcode,
-        stereo,
+        format,
         config.metadata,
         Some(updater.clone()),
         config.playlist.clone(),
@@ -965,118 +668,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_plan_uses_native_formats_for_128_and_320() {
-        // Native bitrates stream without transcoding
-        assert_eq!(
-            fetch_plan(TrackFormat::Mp3_320, Some(128)),
-            (TrackFormat::Mp3_128, None)
-        );
-        assert_eq!(
-            fetch_plan(TrackFormat::Mp3_320, Some(320)),
-            (TrackFormat::Mp3_320, None)
-        );
-        // No bitrate: the requested format is used as-is
-        assert_eq!(
-            fetch_plan(TrackFormat::Mp3_320, None),
-            (TrackFormat::Mp3_320, None)
-        );
-    }
-
-    #[test]
-    fn fetch_plan_transcodes_other_bitrates_from_mp3_320() {
-        assert_eq!(
-            fetch_plan(TrackFormat::Mp3_320, Some(96)),
-            (TrackFormat::Mp3_320, Some(96))
-        );
-        assert_eq!(
-            fetch_plan(TrackFormat::Flac, Some(96)),
-            (TrackFormat::Mp3_320, Some(96))
-        );
-    }
-
-    #[test]
-    fn bitrate_validation_accepts_mp3_range() {
-        assert!(is_valid_bitrate(8));
-        assert!(is_valid_bitrate(96));
-        assert!(is_valid_bitrate(320));
-        assert!(!is_valid_bitrate(0));
-        assert!(!is_valid_bitrate(7));
-        assert!(!is_valid_bitrate(321));
-    }
-
-    #[test]
     fn native_bitrate_maps_formats() {
         assert_eq!(native_bitrate(TrackFormat::Mp3_320), Some(320));
         assert_eq!(native_bitrate(TrackFormat::Mp3_128), Some(128));
         assert_eq!(native_bitrate(TrackFormat::Flac), None);
-    }
-
-    #[test]
-    fn target_bitrate_uses_requested_or_native_rate() {
-        assert_eq!(target_bitrate(TrackFormat::Mp3_320, Some(96)), 96);
-        assert_eq!(target_bitrate(TrackFormat::Mp3_320, None), 320);
-        assert_eq!(target_bitrate(TrackFormat::Mp3_128, None), 128);
-        // Lossless has no native rate; the encode falls back to 320
-        assert_eq!(target_bitrate(TrackFormat::Flac, None), 320);
-    }
-
-    /// Build a raw 16-bit little-endian stereo PCM sine (44100 Hz) for tests.
-    fn sine_pcm(seconds: f32) -> Vec<u8> {
-        let rate = 44100u32;
-        let total = (rate as f32 * seconds) as usize;
-        let mut pcm = Vec::with_capacity(total * 4);
-        for i in 0..total {
-            let t = i as f32 / rate as f32;
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0;
-            let v = sample as i16;
-            pcm.extend_from_slice(&v.to_le_bytes());
-            pcm.extend_from_slice(&v.to_le_bytes());
-        }
-        pcm
-    }
-
-    /// Encode the test sine to an MP3 via LAME.
-    async fn sine_mp3() -> Vec<u8> {
-        let mut command = tokio::process::Command::new("lame");
-        command.args(["-r", "-s", "44.1", "-m", "s", "-b", "128", "-", "-"]);
-        run_filter(command, sine_pcm(2.0), "lame").await.unwrap()
-    }
-
-    /// End-to-end transcode check: needs LAME on PATH. Run with
-    /// `cargo test -- --ignored transcode_pipeline`.
-    #[tokio::test]
-    #[ignore = "requires lame on PATH"]
-    async fn transcode_pipeline_produces_smaller_mp3() {
-        let source = sine_mp3().await;
-        assert!(!source.is_empty(), "failed to generate source MP3");
-
-        let encoded = transcode_mp3(source.clone(), 96).await.unwrap();
-        assert!(!encoded.is_empty(), "transcode produced no audio");
-        assert!(
-            encoded.len() < source.len(),
-            "96 kbps output should be smaller than the 128 kbps source"
-        );
-    }
-
-    /// End-to-end PCM decode/encode check (the Stereo Tool stages): needs
-    /// LAME on PATH. Run with `cargo test -- --ignored decode_encode_pipeline`.
-    #[tokio::test]
-    #[ignore = "requires lame on PATH"]
-    async fn decode_encode_pipeline_roundtrips_pcm() {
-        let source = sine_mp3().await;
-        assert!(!source.is_empty(), "failed to generate source MP3");
-
-        let pcm = decode_to_pcm(source.clone()).await.unwrap();
-        assert!(!pcm.is_empty(), "decode produced no PCM");
-        // 2 seconds of stereo 16-bit 44.1 kHz PCM is 352,800 bytes; the MP3
-        // encoder adds a short padding tail that survives decoding
-        assert!(
-            (pcm.len() as i64 - 352_800).abs() < 10_000,
-            "unexpected PCM length: {}",
-            pcm.len()
-        );
-
-        let encoded = encode_mp3(pcm, 44100, 128).await.unwrap();
-        assert!(!encoded.is_empty(), "encode produced no MP3");
     }
 }

@@ -573,8 +573,17 @@ pub async fn stream(
         bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
     }
     let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
+    let playlist_name = match api.get_playlist_info(&config.playlist).await {
+        Ok(info) => info["DATA"]["TITLE"]
+            .as_str()
+            .unwrap_or("Unknown Playlist")
+            .to_string(),
+        Err(_) => config.playlist.clone(),
+    };
+    queue.set_name(&config.playlist, &playlist_name).await;
     println!(
-        "deezco: streaming playlist {} to {}{} (refresh every {}s)",
+        "deezco: streaming \"{}\" ({}) to {}{} (refresh every {}s)",
+        playlist_name,
         config.playlist,
         config.server.trim_end_matches('/'),
         config.mount,

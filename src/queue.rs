@@ -24,6 +24,7 @@ struct PlaylistQueue {
 pub struct TrackQueue {
     refresh: Duration,
     queues: Arc<Mutex<HashMap<String, PlaylistQueue>>>,
+    names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub enum NextTrackError {
@@ -38,7 +39,16 @@ impl TrackQueue {
         Self {
             refresh,
             queues: Arc::new(Mutex::new(HashMap::new())),
+            names: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Cache a playlist name for display in log messages.
+    pub async fn set_name(&self, playlist_id: &str, name: &str) {
+        self.names
+            .lock()
+            .await
+            .insert(playlist_id.to_string(), name.to_string());
     }
 
     /// Pop the next track for a playlist. Each playlist is fetched once,
@@ -63,7 +73,14 @@ impl TrackQueue {
             .last_fetch
             .is_none_or(|fetched| fetched.elapsed() >= self.refresh);
         if queue.tracks.is_empty() || stale {
-            eprintln!("deezco: refreshing playlist {playlist_id}");
+            let display = self
+                .names
+                .lock()
+                .await
+                .get(playlist_id)
+                .cloned()
+                .unwrap_or_else(|| playlist_id.to_string());
+            eprintln!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
             match api.get_playlist_tracks(playlist_id).await {
                 Ok(tracks) if !tracks.is_empty() => {
                     let mut tracks = tracks;

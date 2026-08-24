@@ -165,7 +165,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 9001)]
         port: u16,
         /// How often to refetch playlists so web edits are picked up
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
     },
     /// Stream a playlist to an Icecast server as a live radio source
@@ -202,7 +202,7 @@ pub enum Commands {
         #[arg(long)]
         no_metadata: bool,
         /// How often to refetch the playlist so web edits are picked up
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
     },
 }

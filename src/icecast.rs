@@ -64,13 +64,17 @@ pub struct IcecastConfig {
 /// PCM-bus pipeline configuration.
 ///
 /// When inactive (default) the audio path is native MP3 passthrough with
-/// zero extra dependencies. When active — crossfade, DSP gain, or an
-/// explicit `--bitrate` — every track runs decode → (crossfade) → DSP →
-/// CBR encode, so listeners hear one constant format for the whole session.
+/// zero extra dependencies. When active — crossfade, loudness target, DSP
+/// gain, or an explicit `--bitrate` — every track runs decode → loudnorm →
+/// (crossfade) → DSP → CBR encode, so listeners hear one constant format
+/// for the whole session.
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     /// Overlap between consecutive tracks (0 = hard cut).
     pub crossfade: CrossfadeConfig,
+    /// R128 loudness target in LUFS. `None` disables normalization; `Some`
+    /// measures each track and corrects toward the target before the mix.
+    pub loudness: Option<f32>,
     /// Static DSP gain in dB, applied post-crossfade pre-encode.
     pub gain_db: Option<f32>,
     /// Session encode bitrate in kbps. `None` keeps the fetched format's
@@ -89,6 +93,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             crossfade: CrossfadeConfig::disabled(),
+            loudness: None,
             gain_db: None,
             bitrate: None,
             stereo_tool: None,
@@ -117,6 +122,7 @@ impl PipelineConfig {
     /// True when any stage beyond native passthrough was requested.
     pub fn is_active(&self) -> bool {
         self.crossfade.is_enabled()
+            || self.loudness.is_some()
             || self.gain_db.is_some_and(|db| db != 0.0)
             || self.bitrate.is_some()
             || self.stereo_tool.is_some()
@@ -379,7 +385,7 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     // or every later task would wait forever on `claim_turn`.
     let decode_join =
         tokio::task::spawn_blocking(move || SymphoniaDecoder::new().decode(&fetched.data)).await;
-    let pcm = match decode_join {
+    let mut pcm = match decode_join {
         Ok(Ok(pcm)) => {
             crate::info!(
                 "deezco: decoded \"{title}\" in {:.1}s ({} frames)",
@@ -397,6 +403,24 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
             return Err(anyhow::anyhow!("decoder task panicked: {join_err}"));
         }
     };
+    // Loudness normalization (opt-in): measure this track's own integrated
+    // LUFS and correct toward the target BEFORE the mix, so the overlap
+    // blends already-leveled audio. Unmeasurable tracks pass through.
+    if let Some(target) = ctx.runtime.pipeline.loudness {
+        match crate::loudness::analyze(pcm.samples(), crate::audio::BUS_RATE, target) {
+            Some(correction) => {
+                crate::info!(
+                    "deezco: loudness \"{title}\": {:.1} LUFS -> {:+.1} dB (target {target:.0})",
+                    correction.integrated_lufs,
+                    correction.gain_db,
+                );
+                crate::loudness::apply_correction(pcm.samples_mut(), correction.gain_db);
+            }
+            None => {
+                crate::warn!("deezco: loudness \"{title}\": unmeasurable, passing through");
+            }
+        }
+    }
     // Ordered micro-step: mix the held tail, publish this track's own tail.
     // Encodes stay parallel — only this handoff is serialized.
     let out_pcm = if ctx.runtime.pipeline.crossfade.is_enabled() {
@@ -925,7 +949,7 @@ pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
     }
     if pipeline.is_active() && !LameEncoder::is_available() {
         bail!(
-            "the stream pipeline (--crossfade, --gain-db, --bitrate, --stereo-tool, or --stereo-tool-lib) needs the lame binary; install it (e.g. `apt-get install lame`)"
+            "the stream pipeline (--crossfade, --target-lufs, --gain-db, --bitrate, --stereo-tool, or --stereo-tool-lib) needs the lame binary; install it (e.g. `apt-get install lame`)"
         );
     }
     Ok(())
@@ -1142,6 +1166,7 @@ mod tests {
     fn pipeline_gain_builds_a_named_chain() {
         let pipeline = PipelineConfig {
             crossfade: CrossfadeConfig::disabled(),
+            loudness: None,
             gain_db: Some(6.0),
             bitrate: None,
             stereo_tool: None,
@@ -1158,6 +1183,7 @@ mod tests {
         // pipeline, empty chain.
         let pipeline = PipelineConfig {
             crossfade: CrossfadeConfig::new(6.0, crate::audio::CrossfadeCurve::EqualPower),
+            loudness: None,
             gain_db: None,
             bitrate: None,
             stereo_tool: None,
@@ -1171,6 +1197,7 @@ mod tests {
     fn pipeline_zero_gain_stays_passthrough() {
         let pipeline = PipelineConfig {
             crossfade: CrossfadeConfig::disabled(),
+            loudness: None,
             gain_db: Some(0.0),
             bitrate: None,
             stereo_tool: None,
@@ -1181,9 +1208,21 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_loudness_target_activates_alone() {
+        let pipeline = PipelineConfig {
+            loudness: Some(-14.0),
+            ..PipelineConfig::default()
+        };
+        assert!(pipeline.is_active());
+        // Loudness corrects pre-mix, not in the DSP chain.
+        assert!(pipeline.build_chain().is_empty());
+    }
+
+    #[test]
     fn pipeline_bitrate_activates_transcode_alone() {
         let pipeline = PipelineConfig {
             crossfade: CrossfadeConfig::disabled(),
+            loudness: None,
             gain_db: None,
             bitrate: Some(96),
             stereo_tool: None,
@@ -1197,6 +1236,7 @@ mod tests {
     fn pipeline_stereo_tool_docks_after_gain() {
         let pipeline = PipelineConfig {
             crossfade: CrossfadeConfig::disabled(),
+            loudness: None,
             gain_db: Some(3.0),
             bitrate: None,
             stereo_tool: Some(crate::dsp::StereoToolConfig {

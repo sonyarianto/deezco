@@ -10,6 +10,7 @@ mod dsp;
 mod files;
 mod icecast;
 mod log;
+mod loudness;
 mod models;
 mod output;
 mod queue;
@@ -569,6 +570,7 @@ async fn main() -> Result<()> {
             no_metadata,
             crossfade,
             gain_db,
+            target_lufs,
             bitrate,
             stereo_tool,
             stereo_tool_lib,
@@ -599,6 +601,16 @@ async fn main() -> Result<()> {
                 && !(-24.0..=24.0).contains(&db)
             {
                 anyhow::bail!("--gain-db must be between -24 and +24 dB");
+            }
+            if let Some(lufs) = target_lufs
+                && !(crate::loudness::TARGET_MIN_LUFS..=crate::loudness::TARGET_MAX_LUFS)
+                    .contains(&lufs)
+            {
+                anyhow::bail!(
+                    "--target-lufs must be between {} and {} LUFS",
+                    crate::loudness::TARGET_MIN_LUFS,
+                    crate::loudness::TARGET_MAX_LUFS
+                );
             }
             if let Some(br) = bitrate
                 && !(8..=320).contains(&br)
@@ -637,6 +649,7 @@ async fn main() -> Result<()> {
                     crossfade,
                     crate::audio::CrossfadeCurve::EqualPower,
                 ),
+                loudness: target_lufs,
                 gain_db,
                 bitrate,
                 stereo_tool,

@@ -209,6 +209,11 @@ pub enum Commands {
         /// pre-encode through the processor chain.
         #[arg(long)]
         gain_db: Option<f32>,
+        /// R128 loudness target in LUFS (-23..-6). Each track is measured
+        /// and corrected toward the target before the mix; unmeasurable
+        /// tracks pass through. Needs `lame` too. Example: `--target-lufs -14`.
+        #[arg(long)]
+        target_lufs: Option<f32>,
         /// Session MP3 bitrate in kbps (8..=320) when the pipeline is active;
         /// also activates the pipeline alone as a transcode. Without pipeline
         /// flags, 128/320 keep streaming natively.

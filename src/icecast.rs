@@ -12,8 +12,8 @@ use tokio::time::sleep;
 
 use crate::api::DeezerApi;
 use crate::audio::{
-    BUS_RATE, CrossfadeConfig, FrameDecoder, SessionEncoder, SymphoniaDecoder, nearest_bitrate,
-    render_track_overlap,
+    BUS_RATE, CrossfadeConfig, FrameDecoder, PcmBuffer, SessionEncoder, SymphoniaDecoder,
+    nearest_bitrate, render_track_overlap,
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
@@ -413,11 +413,38 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
     }
     crate::info!("deezco: decoding \"{title}\" ({} bytes MP3)...", mp3_len);
     let decode_started = std::time::Instant::now();
-    // A panicked/cancelled decode must still advance the crossfade sequence,
+    // Decode + loudness share one blocking hop: both are full-track CPU
+    // (Symphonia decode, then BS.1770's ~16M biquad ticks for a 3-minute
+    // track) that must never sit on an async worker.
+    // A panicked/cancelled task must still advance the crossfade sequence,
     // or every later task would wait forever on `claim_turn`.
-    let decode_join =
-        tokio::task::spawn_blocking(move || SymphoniaDecoder::new().decode(&fetched.data)).await;
-    let mut pcm = match decode_join {
+    let target = ctx.runtime.pipeline.loudness;
+    let task_title = title.clone();
+    let decode_join = tokio::task::spawn_blocking(move || -> Result<PcmBuffer> {
+        let mut pcm = SymphoniaDecoder::new().decode(&fetched.data)?;
+        // Loudness normalization (opt-in): measure this track's own
+        // integrated LUFS and correct toward the target BEFORE the mix, so
+        // the overlap blends already-leveled audio. Unmeasurable tracks
+        // pass through.
+        if let Some(target) = target {
+            match crate::loudness::analyze(pcm.samples(), crate::audio::BUS_RATE, target) {
+                Some(correction) => {
+                    crate::info!(
+                        "deezco: loudness \"{task_title}\": {:.1} LUFS -> {:+.1} dB (target {target:.0})",
+                        correction.integrated_lufs,
+                        correction.gain_db,
+                    );
+                    crate::loudness::apply_correction(pcm.samples_mut(), correction.gain_db);
+                }
+                None => {
+                    crate::warn!("deezco: loudness \"{task_title}\": unmeasurable, passing through");
+                }
+            }
+        }
+        Ok(pcm)
+    })
+    .await;
+    let pcm = match decode_join {
         Ok(Ok(pcm)) => {
             crate::info!(
                 "deezco: decoded \"{title}\" in {:.1}s ({} frames)",
@@ -435,24 +462,6 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
             return Err(anyhow::anyhow!("decoder task panicked: {join_err}"));
         }
     };
-    // Loudness normalization (opt-in): measure this track's own integrated
-    // LUFS and correct toward the target BEFORE the mix, so the overlap
-    // blends already-leveled audio. Unmeasurable tracks pass through.
-    if let Some(target) = ctx.runtime.pipeline.loudness {
-        match crate::loudness::analyze(pcm.samples(), crate::audio::BUS_RATE, target) {
-            Some(correction) => {
-                crate::info!(
-                    "deezco: loudness \"{title}\": {:.1} LUFS -> {:+.1} dB (target {target:.0})",
-                    correction.integrated_lufs,
-                    correction.gain_db,
-                );
-                crate::loudness::apply_correction(pcm.samples_mut(), correction.gain_db);
-            }
-            None => {
-                crate::warn!("deezco: loudness \"{title}\": unmeasurable, passing through");
-            }
-        }
-    }
     // Ordered micro-step: mix the held tail, publish this track's own tail.
     // Encodes stay parallel — only this handoff is serialized.
     let out_pcm = if ctx.runtime.pipeline.crossfade.is_enabled() {

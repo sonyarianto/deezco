@@ -733,10 +733,13 @@ impl Producer {
 
     /// Spawn a background prefetch for the next track and push it to
     /// the prefetch queue. Sequence numbers follow activation order so the
-    /// crossfade handoff stays aligned even though tasks run concurrently.
+    /// crossfade handoff stays aligned even though tasks run concurrently;
+    /// the number is logged so double top-ups (e.g. the two spawns that
+    /// fill an empty queue at startup) read as distinct tracks, not dupes.
     fn spawn_prefetch(&mut self) {
         let seq = self.next_seq;
         self.next_seq += 1;
+        crate::warn!("deezco: prefetching track #{seq} in background");
         self.prefetch
             .push_back(tokio::spawn(fetch_next_track(TaskCtx {
                 api: self.api.clone(),
@@ -780,8 +783,8 @@ impl Producer {
         }
         // Top up the prefetch queue so there are always PREFETCH_AHEAD
         // tracks ready (or being fetched) ahead of the current one.
+        // (Each spawn logs its own seq number; see `spawn_prefetch`.)
         while self.prefetch.len() < Self::PREFETCH_AHEAD {
-            crate::warn!("deezco: prefetching next track in background");
             self.spawn_prefetch();
         }
         // Resolve the real output bitrate so the advertised rate matches what
@@ -822,16 +825,10 @@ impl Producer {
             let handle = if let Some(h) = self.prefetch.pop_front() {
                 h
             } else {
-                let seq = self.next_seq;
-                self.next_seq += 1;
-                tokio::spawn(fetch_next_track(TaskCtx {
-                    api: self.api.clone(),
-                    queue: self.queue.clone(),
-                    fetch_format: self.fetch_format,
-                    playlist: self.playlist.clone(),
-                    seq,
-                    runtime: self.runtime.clone(),
-                }))
+                // Queue drained (e.g. after skips): spawn one through the
+                // shared path so seq numbering and logging stay uniform.
+                self.spawn_prefetch();
+                self.prefetch.pop_front().expect("just spawned")
             };
             match handle.await.context("prefetch task panicked") {
                 Ok(Ok((track, fetched))) => {

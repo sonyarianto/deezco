@@ -84,7 +84,7 @@ impl TrackQueue {
             match api.get_playlist_tracks(playlist_id).await {
                 Ok(tracks) if !tracks.is_empty() => {
                     let mut tracks = tracks;
-                    tracks.shuffle(&mut rand::thread_rng());
+                    tracks.shuffle(&mut rand::rng());
                     avoid_recent_repeat(&mut tracks, &queue.recent);
                     queue.tracks = tracks.into();
                     queue.last_fetch = Some(Instant::now());

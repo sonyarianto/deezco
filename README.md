@@ -305,6 +305,17 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 # (320, or 128 on quality fallback):
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --bitrate 128
+
+# Broadcast processing via the licensed Thimeo Stereo Tool CLI. Every track
+# runs decode -> Stereo Tool -> encode (needs `lame` too); processor state
+# resets at each track boundary, and a tool failure bypasses the track
+# instead of killing the stream. The key is visible in `ps aux` while
+# running, like the official CLI:
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --crossfade 6 \
+  --stereo-tool /opt/stereo_tool_cmd_64 \
+  --stereo-tool-sts /etc/stereo/audio.sts \
+  --stereo-tool-key "$STEREO_KEY"
 ```
 
 ### Output layout
@@ -382,7 +393,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain, and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, or `--bitrate` is set)
+- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, or `--stereo-tool` is set)
 
 ## Support
 

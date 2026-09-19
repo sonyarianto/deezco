@@ -191,13 +191,127 @@ pub fn apply_crossfade(tail: &[f32], head: &[f32], curve: CrossfadeCurve) -> Vec
 }
 
 /// Phase 2 tap: MP3 bytes -> [`PcmBuffer`]. Implementations decode, upmix to
-/// stereo, and resample to [`BUS_RATE`]. Kept as a trait so Phase 1 builds
-/// with zero audio dependencies.
+/// stereo, and resample to [`BUS_RATE`]. Kept as a trait so the bus design
+/// does not dictate the backend.
 pub trait FrameDecoder: Send + Sync {
     /// Decoder name for logs (e.g. `"minimp3"`).
     fn name(&self) -> &str;
     /// Decode one whole track into bus PCM.
     fn decode(&self, mp3: &[u8]) -> Result<PcmBuffer>;
+}
+
+/// Whole-track MP3 -> bus PCM decoder backed by `minimp3` (C sources are
+/// compiled in, so the binary keeps zero runtime dependencies).
+///
+/// Each frame is upmixed to stereo on the fly; the assembled track is
+/// resampled to [`BUS_RATE`] only when the source rate differs (Deezer MP3s
+/// are 44100 Hz, so the resampler is a rarely-hit fallback — linear
+/// interpolation, upgradeable to `rubato` if a non-44.1k source ever shows
+/// up in practice).
+pub struct Mp3Decoder;
+
+impl Mp3Decoder {
+    /// Build a decoder (stateless; safe to share across prefetch tasks).
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Decode all frames of `mp3` into stereo `i16` at the source rate.
+    /// Returns `(samples, source_rate)`.
+    fn decode_frames(mp3: &[u8]) -> Result<(Vec<i16>, u32)> {
+        if mp3.is_empty() {
+            anyhow::bail!("cannot decode empty MP3 input");
+        }
+        let mut decoder = minimp3::Decoder::new(mp3);
+        let mut stereo: Vec<i16> = Vec::new();
+        let mut src_rate: Option<u32> = None;
+        loop {
+            match decoder.next_frame() {
+                Ok(frame) => {
+                    let rate = u32::try_from(frame.sample_rate).unwrap_or(BUS_RATE);
+                    src_rate.get_or_insert(rate);
+                    match frame.channels {
+                        1 => upmix_mono_to_stereo(&frame.data, &mut stereo),
+                        2 => stereo.extend_from_slice(&frame.data),
+                        // Surround MP3 is vanishingly rare: keep L/R, drop
+                        // the rest rather than breaking the stereo invariant.
+                        n => {
+                            let n = n.max(1);
+                            for chunk in frame.data.chunks(n) {
+                                if chunk.len() >= 2 {
+                                    stereo.push(chunk[0]);
+                                    stereo.push(chunk[1]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(minimp3::Error::Eof) => break,
+                Err(err) => {
+                    anyhow::bail!("MP3 decode failed: {err}");
+                }
+            }
+        }
+        let Some(src_rate) = src_rate else {
+            anyhow::bail!("MP3 contained no audio frames");
+        };
+        Ok((stereo, src_rate))
+    }
+}
+
+impl Default for Mp3Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameDecoder for Mp3Decoder {
+    fn name(&self) -> &str {
+        "minimp3"
+    }
+
+    fn decode(&self, mp3: &[u8]) -> Result<PcmBuffer> {
+        let (stereo_i16, src_rate) = Self::decode_frames(mp3)?;
+        let at_bus_rate = resample_linear_stereo(&stereo_i16, src_rate, BUS_RATE);
+        Ok(PcmBuffer::from_interleaved(i16_to_f32_stereo(&at_bus_rate)))
+    }
+}
+
+/// Duplicate every mono sample to L+R.
+fn upmix_mono_to_stereo(mono: &[i16], out: &mut Vec<i16>) {
+    out.reserve(mono.len() * 2);
+    for &s in mono {
+        out.push(s);
+        out.push(s);
+    }
+}
+
+/// Linear-interpolating resampler for interleaved stereo `i16`.
+/// Returns the input unchanged when `src_rate == dst_rate`.
+fn resample_linear_stereo(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
+    if src_rate == dst_rate || input.is_empty() {
+        return input.to_vec();
+    }
+    let in_frames = input.len() / 2;
+    let out_frames = (in_frames as u64 * dst_rate as u64 / src_rate as u64) as usize;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    for i in 0..out_frames {
+        let pos = i as f64 * src_rate as f64 / dst_rate as f64;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = idx.min(in_frames - 1) * 2;
+        let b = (idx + 1).min(in_frames - 1) * 2;
+        for ch in 0..2 {
+            let s = input[a + ch] as f32 * (1.0 - frac) + input[b + ch] as f32 * frac;
+            out.push(s.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        }
+    }
+    out
+}
+
+/// Convert interleaved stereo `i16` to `f32` in `[-1.0, 1.0]`.
+fn i16_to_f32_stereo(input: &[i16]) -> Vec<f32> {
+    input.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
 /// Phase 2 tap: [`PcmBuffer`] -> CBR MP3 bytes at one fixed bitrate for the
@@ -295,5 +409,127 @@ mod tests {
         assert!((buf.duration_secs() - 1.0).abs() < 1e-6);
         assert!(!buf.is_empty());
         assert!(PcmBuffer::new().is_empty());
+    }
+
+    #[test]
+    fn upmix_duplicates_mono_to_both_channels() {
+        let mut out = Vec::new();
+        upmix_mono_to_stereo(&[1000, -1000, 0], &mut out);
+        assert_eq!(out, vec![1000, 1000, -1000, -1000, 0, 0]);
+    }
+
+    #[test]
+    fn resample_same_rate_is_identity() {
+        let input = vec![1, 2, 3, 4, 5, 6];
+        assert_eq!(resample_linear_stereo(&input, 44100, 44100), input);
+        assert!(resample_linear_stereo(&[], 22050, 44100).is_empty());
+    }
+
+    #[test]
+    fn resample_upsample_doubles_frame_count() {
+        // 4 frames at 22050 Hz -> 8 frames at 44100 Hz; endpoints preserved.
+        let input = vec![0, 0, 1000, 1000, 2000, 2000, 3000, 3000];
+        let out = resample_linear_stereo(&input, 22050, 44100);
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[..2], &[0, 0]);
+        assert_eq!(&out[14..], &[3000, 3000]);
+        // Midpoint between frame 0 and 1 lands exactly between samples.
+        assert_eq!(&out[2..4], &[500, 500]);
+    }
+
+    #[test]
+    fn resample_downsample_halves_frame_count() {
+        let input = vec![0, 0, 1000, 1000, 2000, 2000, 3000, 3000];
+        let out = resample_linear_stereo(&input, 44100, 22050);
+        assert_eq!(out.len(), 4);
+        assert_eq!(&out[..2], &[0, 0]);
+    }
+
+    #[test]
+    fn i16_to_f32_scales_to_unit_range() {
+        let out = i16_to_f32_stereo(&[32767, -32768, 0]);
+        assert!((out[0] - 32767.0 / 32768.0).abs() < 1e-6);
+        assert_eq!(out[1], -1.0);
+        assert_eq!(out[2], 0.0);
+    }
+
+    #[test]
+    fn decoder_reports_its_backend_name() {
+        assert_eq!(Mp3Decoder::new().name(), "minimp3");
+    }
+
+    #[test]
+    fn decoder_rejects_empty_input() {
+        assert!(Mp3Decoder::new().decode(&[]).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_garbage_without_audio_frames() {
+        // Plausible non-audio payload: must error, never panic or return
+        // silence disguised as a track.
+        let garbage = vec![0xAA; 4096];
+        assert!(Mp3Decoder::new().decode(&garbage).is_err());
+    }
+
+    /// 1 second of stereo 16-bit 44.1 kHz 440 Hz sine, the raw PCM that the
+    /// roundtrip test below feeds to LAME.
+    fn sine_pcm_i16() -> Vec<i16> {
+        let mut pcm = Vec::with_capacity(44100 * 2);
+        for i in 0..44100 {
+            let t = i as f32 / 44100.0;
+            let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0;
+            pcm.push(s as i16);
+            pcm.push(s as i16);
+        }
+        pcm
+    }
+
+    /// End-to-end decode of a real MP3: needs LAME on PATH. Run with
+    /// `cargo test -- --ignored decode_real_mp3`.
+    #[test]
+    #[ignore = "requires lame on PATH"]
+    fn decode_real_mp3_produces_bus_pcm() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let raw: Vec<u8> = sine_pcm_i16()
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut child = Command::new("lame")
+            .args(["-r", "-s", "44.1", "-m", "s", "-b", "128", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("lame must be on PATH for this test");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&raw)
+            .expect("write PCM to lame");
+        let output = child.wait_with_output().expect("read lame output");
+        assert!(output.status.success(), "lame failed to encode");
+        assert!(!output.stdout.is_empty(), "lame produced no MP3");
+
+        let decoded = Mp3Decoder::new()
+            .decode(&output.stdout)
+            .expect("decode MP3");
+        // 1s at 44100 Hz, plus the MP3 encoder delay/padding tail (~2112
+        // samples) that survives decoding.
+        assert!(
+            (44100..=(44100 + 5000)).contains(&decoded.frames()),
+            "unexpected frame count: {}",
+            decoded.frames()
+        );
+        let samples = PcmBuffer::from_interleaved(decoded.samples().to_vec());
+        let energy: f32 = samples.samples().iter().map(|s| s * s).sum();
+        let rms = (energy / samples.samples().len() as f32).sqrt();
+        assert!(rms > 0.05, "decoded sine must not be silent (rms={rms})");
+        assert!(
+            samples.samples().iter().all(|s| *s >= -1.0 && *s <= 1.0),
+            "samples must stay in unit range"
+        );
     }
 }

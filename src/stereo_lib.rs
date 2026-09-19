@@ -69,8 +69,7 @@ impl StderrGuard {
         // value is checked and the original fd is restored in `Drop`.
         let saved = unsafe { libc::dup(2) };
         if saved >= 0 {
-            let null =
-                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+            let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
             if null >= 0 {
                 unsafe {
                     libc::dup2(null, 2);
@@ -97,15 +96,23 @@ impl Drop for StderrGuard {
 
 type Create2Fn = unsafe extern "C" fn(has_gui: bool, key: *const c_char) -> *mut Opaque;
 type DeleteFn = unsafe extern "C" fn(st: *mut Opaque);
-type ProcessFn =
-    unsafe extern "C" fn(st: *mut Opaque, samples: *mut f32, numsamples: i32, channels: i32, samplerate: i32);
-type LoadPresetFn = unsafe extern "C" fn(st: *mut Opaque, filename: *const c_char, loadsave_type: c_int) -> bool;
+type ProcessFn = unsafe extern "C" fn(
+    st: *mut Opaque,
+    samples: *mut f32,
+    numsamples: i32,
+    channels: i32,
+    samplerate: i32,
+);
+type LoadPresetFn =
+    unsafe extern "C" fn(st: *mut Opaque, filename: *const c_char, loadsave_type: c_int) -> bool;
 type ResetFn = unsafe extern "C" fn(st: *mut Opaque, loadsave_type: c_int);
-type GetLatency2Fn = unsafe extern "C" fn(st: *mut Opaque, samplerate: i32, feed_silence: bool) -> c_int;
+type GetLatency2Fn =
+    unsafe extern "C" fn(st: *mut Opaque, samplerate: i32, feed_silence: bool) -> c_int;
 type CheckLicenseFn = unsafe extern "C" fn(st: *mut Opaque) -> bool;
 type EnableSoundCardFn = unsafe extern "C" fn(enabled: bool);
 type GetVersionFn = unsafe extern "C" fn() -> c_int;
-type UnlicensedFeaturesFn = unsafe extern "C" fn(st: *mut Opaque, text: *mut c_char, text_maxlen: c_int) -> bool;
+type UnlicensedFeaturesFn =
+    unsafe extern "C" fn(st: *mut Opaque, text: *mut c_char, text_maxlen: c_int) -> bool;
 
 /// Connection settings for the shared-library path. The `.sts` settings file
 /// and license key are shared with the CLI flags; only the backend differs.
@@ -218,7 +225,8 @@ impl StereoLibHandle {
         let key_cstr;
         let key_ptr = match &config.key {
             Some(key) => {
-                key_cstr = CString::new(key.as_str()).context("stereo-tool key is not valid UTF-8")?;
+                key_cstr =
+                    CString::new(key.as_str()).context("stereo-tool key is not valid UTF-8")?;
                 key_cstr.as_ptr()
             }
             None => std::ptr::null(),
@@ -258,8 +266,8 @@ impl StereoLibHandle {
         }
         // SAFETY: instance is valid and the preset (if any) is loaded.
         handle.latency_frames =
-            unsafe { (handle.get_latency2)(instance, crate::audio::BUS_RATE as i32, true) }
-                .max(0) as usize;
+            unsafe { (handle.get_latency2)(instance, crate::audio::BUS_RATE as i32, true) }.max(0)
+                as usize;
         // Noisy C init is over: restore stderr before our own log lines.
         #[cfg(unix)]
         drop(_quiet);

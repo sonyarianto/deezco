@@ -12,8 +12,8 @@ use tokio::time::sleep;
 
 use crate::api::DeezerApi;
 use crate::audio::{
-    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, PcmBuffer, SymphoniaDecoder,
-    render_track_overlap,
+    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, PcmBuffer,
+    SymphoniaDecoder, render_track_overlap,
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};

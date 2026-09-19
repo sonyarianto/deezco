@@ -1,6 +1,6 @@
-# Deezco
-
 [![CI](https://github.com/sonyarianto/deezco/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/deezco/actions/workflows/ci.yml)
+
+# Deezco
 
 A fast, lightweight Deezer music downloader written in Rust. Zero runtime dependencies.
 
@@ -256,7 +256,8 @@ deezco serve --refresh-secs 60
 ### Live streaming to Icecast
 
 `stream` pushes a playlist to an Icecast server as a live radio source (MP3
-128 or 320 — FLAC is rejected). It sends track titles to listeners via
+128 or 320 — FLAC needs an active pipeline flag, otherwise it is rejected).
+It sends track titles to listeners via
 ICY metadata, paces playback in real time, prefetches the next track so
 changes are seamless, and reconnects automatically if the connection
 drops.
@@ -292,11 +293,18 @@ deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
 
 # PCM pipeline options (equal-power crossfade + static DSP gain).
-# The values are plumbed into the audio bus; audible fades activate once
-# the bus decoder/encoder lands (until then the stream stays native MP3
-# passthrough):
+# Every track is rendered decode → crossfade → DSP → session-CBR encode in
+# background prefetch tasks, so track changes stay instant and listeners
+# hear one constant format. Requires the `lame` binary (native MP3
+# passthrough without these flags needs nothing):
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --gain-db 3
+
+# Force the session bitrate (8..=320 kbps); also activates the pipeline
+# alone as a transcode. Without it, the fetched format's native rate wins
+# (320, or 128 on quality fallback):
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --crossfade 6 --bitrate 128
 ```
 
 ### Output layout
@@ -374,7 +382,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade and a post-crossfade processor chain
+- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain, and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, or `--bitrate` is set)
 
 ## Support
 

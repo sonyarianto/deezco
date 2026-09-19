@@ -568,6 +568,10 @@ async fn main() -> Result<()> {
             crossfade,
             gain_db,
             bitrate,
+            stereo_tool,
+            stereo_tool_sts,
+            stereo_tool_key,
+            stereo_rate,
             refresh_secs,
         } => {
             let password = password.or_else(|| {
@@ -597,6 +601,12 @@ async fn main() -> Result<()> {
             {
                 anyhow::bail!("--bitrate must be between 8 and 320 kbps");
             }
+            let stereo_tool = stereo_tool.map(|binary| crate::dsp::StereoToolConfig {
+                binary,
+                settings: stereo_tool_sts,
+                key: stereo_tool_key,
+                rate: stereo_rate,
+            });
             let config = icecast::IcecastConfig {
                 server,
                 mount,
@@ -616,7 +626,10 @@ async fn main() -> Result<()> {
                 ),
                 gain_db,
                 bitrate,
+                stereo_tool,
             };
+            // Fail fast on missing pipeline binaries before login/network.
+            icecast::check_prerequisites(&pipeline)?;
             icecast::stream(api, format, config, refresh_secs, pipeline).await?;
         }
     }

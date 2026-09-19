@@ -12,11 +12,11 @@ use tokio::time::sleep;
 
 use crate::api::DeezerApi;
 use crate::audio::{
-    CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, Mp3Decoder, PcmBuffer,
+    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, Mp3Decoder, PcmBuffer,
     render_track_overlap,
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
-use crate::dsp::{GainProcessor, ProcessorChain};
+use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
 use crate::track::{available_format, debug_enabled};
@@ -67,7 +67,7 @@ pub struct IcecastConfig {
 /// zero extra dependencies. When active — crossfade, DSP gain, or an
 /// explicit `--bitrate` — every track runs decode → (crossfade) → DSP →
 /// CBR encode, so listeners hear one constant format for the whole session.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PipelineConfig {
     /// Overlap between consecutive tracks (0 = hard cut).
     pub crossfade: CrossfadeConfig,
@@ -77,6 +77,9 @@ pub struct PipelineConfig {
     /// native rate (320, or 128 on fallback); `Some` forces a transcode and
     /// activates the pipeline on its own.
     pub bitrate: Option<u32>,
+    /// Thimeo Stereo Tool processing. Activates the pipeline on its own;
+    /// runs after the gain stage, before the encoder.
+    pub stereo_tool: Option<crate::dsp::StereoToolConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -85,20 +88,24 @@ impl Default for PipelineConfig {
             crossfade: CrossfadeConfig::disabled(),
             gain_db: None,
             bitrate: None,
+            stereo_tool: None,
         }
     }
 }
 
 impl PipelineConfig {
     /// Build the post-crossfade processor chain for this config.
-    /// Order is broadcast order: trim gain first, then processors like
-    /// Stereo Tool (docked after the gain stage on integration).
+    /// Order is broadcast order: trim gain first, then Stereo Tool,
+    /// then the encoder.
     pub fn build_chain(&self) -> ProcessorChain {
         let mut chain = ProcessorChain::new();
         if let Some(db) = self.gain_db
             && db != 0.0
         {
             chain.push(GainProcessor::new(db));
+        }
+        if let Some(config) = &self.stereo_tool {
+            chain.push(StereoToolProcessor::new(config.clone()));
         }
         chain
     }
@@ -108,6 +115,7 @@ impl PipelineConfig {
         self.crossfade.is_enabled()
             || self.gain_db.is_some_and(|db| db != 0.0)
             || self.bitrate.is_some()
+            || self.stereo_tool.is_some()
     }
 
     /// The one CBR bitrate the whole session encodes at when the pipeline
@@ -775,6 +783,36 @@ async fn run_connection(
     Ok(())
 }
 
+/// Fail fast when the pipeline's external binaries are unusable: the
+/// `lame` binary for any active pipeline, plus the Stereo Tool binary and
+/// bus-rate match when processing is requested. Called before login/network
+/// (good UX) and again at the top of `stream()` (backstop).
+pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
+    // Stereo Tool misconfiguration is reported first: it is the more
+    // specific user error, and these checks need no external binary.
+    if let Some(stereo) = &pipeline.stereo_tool {
+        if !stereo.binary_exists() {
+            bail!(
+                "stereo-tool binary not found ({}); check --stereo-tool",
+                stereo.binary.display()
+            );
+        }
+        if stereo.rate != BUS_RATE {
+            bail!(
+                "stereo-tool rate must be {} Hz (the bus rate); got {} Hz",
+                BUS_RATE,
+                stereo.rate
+            );
+        }
+    }
+    if pipeline.is_active() && !LameEncoder::is_available() {
+        bail!(
+            "the stream pipeline (--crossfade, --gain-db, --bitrate, or --stereo-tool) needs the lame binary; install it (e.g. `apt-get install lame`)"
+        );
+    }
+    Ok(())
+}
+
 /// Stream a playlist to an Icecast mount forever, reconnecting whenever the
 /// source connection drops. With an active pipeline every track is rendered
 /// through decode → crossfade → DSP → session-CBR encode in background
@@ -797,11 +835,7 @@ pub async fn stream(
         bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
     }
     let encode_bps = pipeline.encode_bitrate(fetch_format);
-    if pipeline.is_active() && !LameEncoder::is_available() {
-        bail!(
-            "the stream pipeline (--crossfade, --gain-db, or --bitrate) needs the lame binary; install it (e.g. `apt-get install lame`)"
-        );
-    }
+    check_prerequisites(&pipeline)?;
     let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
     let playlist_name = match api.get_playlist_info(&config.playlist).await {
         Ok(info) => info["DATA"]["TITLE"]
@@ -832,6 +866,12 @@ pub async fn stream(
         let chain = pipeline.build_chain();
         if !chain.names().is_empty() {
             println!("deezco: DSP chain: {}", chain.names().join(" -> "));
+        }
+        if let Some(stereo) = &pipeline.stereo_tool {
+            println!(
+                "deezco: stereo-tool via {} (per-track spawn; processor state resets each track)",
+                stereo.binary.display()
+            );
         }
     }
 
@@ -947,6 +987,7 @@ mod tests {
             crossfade: CrossfadeConfig::disabled(),
             gain_db: Some(6.0),
             bitrate: None,
+            stereo_tool: None,
         };
         assert!(pipeline.is_active());
         let chain = pipeline.build_chain();
@@ -961,6 +1002,7 @@ mod tests {
             crossfade: CrossfadeConfig::new(6.0, crate::audio::CrossfadeCurve::EqualPower),
             gain_db: None,
             bitrate: None,
+            stereo_tool: None,
         };
         assert!(pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
@@ -972,6 +1014,7 @@ mod tests {
             crossfade: CrossfadeConfig::disabled(),
             gain_db: Some(0.0),
             bitrate: None,
+            stereo_tool: None,
         };
         assert!(!pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
@@ -983,9 +1026,66 @@ mod tests {
             crossfade: CrossfadeConfig::disabled(),
             gain_db: None,
             bitrate: Some(96),
+            stereo_tool: None,
         };
         assert!(pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
+    }
+
+    #[test]
+    fn pipeline_stereo_tool_docks_after_gain() {
+        let pipeline = PipelineConfig {
+            crossfade: CrossfadeConfig::disabled(),
+            gain_db: Some(3.0),
+            bitrate: None,
+            stereo_tool: Some(crate::dsp::StereoToolConfig {
+                binary: std::path::PathBuf::from("/opt/stereo_tool_cmd_64"),
+                settings: None,
+                key: None,
+                rate: crate::audio::BUS_RATE,
+            }),
+        };
+        assert!(pipeline.is_active());
+        // Broadcast order: trim gain first, then the broadcast processor.
+        assert_eq!(pipeline.build_chain().names(), vec!["gain", "stereo-tool"]);
+    }
+
+    #[test]
+    fn prerequisites_pass_for_inactive_pipeline() {
+        // No external binaries involved on the passthrough path.
+        check_prerequisites(&PipelineConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn prerequisites_reject_missing_stereo_binary() {
+        let pipeline = PipelineConfig {
+            stereo_tool: Some(crate::dsp::StereoToolConfig {
+                binary: std::path::PathBuf::from("/nonexistent/stereo_tool_cmd_64"),
+                settings: None,
+                key: None,
+                rate: crate::audio::BUS_RATE,
+            }),
+            ..PipelineConfig::default()
+        };
+        let err = check_prerequisites(&pipeline).unwrap_err();
+        assert!(err.to_string().contains("--stereo-tool"), "{err}");
+    }
+
+    #[test]
+    fn prerequisites_reject_wrong_stereo_rate() {
+        // The test binary itself stands in as an existing executable, so
+        // this exercises the rate gate with no external dependency.
+        let pipeline = PipelineConfig {
+            stereo_tool: Some(crate::dsp::StereoToolConfig {
+                binary: std::env::current_exe().expect("test binary path"),
+                settings: None,
+                key: None,
+                rate: 48000,
+            }),
+            ..PipelineConfig::default()
+        };
+        let err = check_prerequisites(&pipeline).unwrap_err();
+        assert!(err.to_string().contains("44100"), "{err}");
     }
 
     #[test]

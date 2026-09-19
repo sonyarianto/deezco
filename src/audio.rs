@@ -317,7 +317,7 @@ fn resample_linear_stereo(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i1
 }
 
 /// Convert interleaved stereo `i16` to `f32` in `[-1.0, 1.0]`.
-fn i16_to_f32_stereo(input: &[i16]) -> Vec<f32> {
+pub(crate) fn i16_to_f32_stereo(input: &[i16]) -> Vec<f32> {
     input.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
@@ -467,7 +467,7 @@ impl FrameEncoder for LameEncoder {
 }
 
 /// Convert interleaved stereo `f32` in `[-1.0, 1.0]` to `i16` (clamped).
-fn f32_to_s16_stereo(input: &[f32]) -> Vec<i16> {
+pub(crate) fn f32_to_s16_stereo(input: &[f32]) -> Vec<i16> {
     input
         .iter()
         .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16)

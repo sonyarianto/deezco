@@ -214,6 +214,23 @@ pub enum Commands {
         /// flags, 128/320 keep streaming natively.
         #[arg(long)]
         bitrate: Option<u32>,
+        /// Path to the Thimeo Stereo Tool CLI binary (stereo_tool_cmd_64).
+        /// Runs every track through it (decode -> process -> encode) and
+        /// activates the pipeline; needs `lame` too. State resets per track.
+        #[arg(long)]
+        stereo_tool: Option<PathBuf>,
+        /// Stereo Tool processor settings file (.sts); the tool's own
+        /// defaults apply when unset.
+        #[arg(long)]
+        stereo_tool_sts: Option<PathBuf>,
+        /// Stereo Tool license key (visible in `ps aux` while running, like
+        /// the official CLI expects).
+        #[arg(long)]
+        stereo_tool_key: Option<String>,
+        /// Sample rate (Hz) of the Stereo Tool bus; must be 44100 to match
+        /// the PCM bus.
+        #[arg(long, default_value_t = 44100)]
+        stereo_rate: u32,
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,

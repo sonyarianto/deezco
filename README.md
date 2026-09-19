@@ -2,7 +2,7 @@
 
 # Deezco
 
-A fast, lightweight Deezer music downloader. Zero runtime dependencies for downloads and native streaming.
+A fast, lightweight Deezer music downloader. Zero runtime dependencies.
 
 ## Features
 
@@ -293,10 +293,10 @@ deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
 
 # PCM pipeline options (equal-power crossfade + static DSP gain).
-# Every track is rendered decode → crossfade → DSP → session-CBR encode in
-# background prefetch tasks, so track changes stay instant and listeners
-# hear one constant format. Requires the `lame` binary (native MP3
-# passthrough without these flags needs nothing):
+# Every track is rendered decode → DSP in background prefetch tasks while
+# one session encoder turns the endless PCM stream into continuous CBR —
+# track boundaries never exist at the MP3 level, so splices cannot click
+# (native MP3 passthrough without these flags needs nothing extra):
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --gain-db 3
 
@@ -313,10 +313,10 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --target-lufs -14
 
 # Broadcast processing via the licensed Thimeo Stereo Tool CLI. Every track
-# runs decode -> Stereo Tool -> encode (needs `lame` too); processor state
-# resets at each track boundary, and a tool failure bypasses the track
-# instead of killing the stream. The key is visible in `ps aux` while
-# running, like the official CLI:
+# runs decode -> Stereo Tool -> session encode; processor state resets at
+# each track boundary, and a tool failure bypasses the track instead of
+# killing the stream. The key is visible in `ps aux` while running,
+# like the official CLI:
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 \
   --stereo-tool /opt/stereo_tool_cmd_64 \
@@ -413,7 +413,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with R128 loudness normalization, equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--target-lufs`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
+- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in); PCM bus is f32 stereo @ 44100 Hz with R128 loudness normalization, equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and continuous session-CBR MP3 encode via statically linked LAME. Zero runtime dependencies — only the optional Stereo Tool binaries (`--stereo-tool*`) are external.
 
 ## Support
 

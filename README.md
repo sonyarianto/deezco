@@ -29,7 +29,7 @@ cd deezco
 cargo build --release
 ```
 
-The binary will be at `target/release/deezco` (approx. 3.2 MB).
+The binary will be at `target/release/deezco` (approx. 3.4 MB).
 
 ### Requirements
 
@@ -290,6 +290,13 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 # listeners keep seeing "now playing":
 deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
+
+# PCM pipeline options (equal-power crossfade + static DSP gain).
+# The values are plumbed into the audio bus; audible fades activate once
+# the bus decoder/encoder lands (until then the stream stays native MP3
+# passthrough):
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --crossfade 6 --gain-db 3
 ```
 
 ### Output layout
@@ -340,13 +347,24 @@ deezco logout                     # remove stored ARL
 src/
   main.rs      CLI entry point, argument parsing
   api.rs       Deezer GW (internal) API + public API + media URL client
+  audio.rs     PCM bus types, crossfade math, MP3 decoder (minimp3)
   auth.rs      ARL-based login, persistent credential storage
+  batch.rs     Concurrent download orchestration and dry-run/summary helpers
+  cli.rs       Clap CLI definitions (commands and flags)
   crypto.rs    Blowfish CBC decryption, AES-128-ECB stream path, key generation
+  dedupe.rs    Audio hash index and duplicate linking/cleanup
   download.rs  Track/playlist/favorites/artist download orchestration
-  models.rs    Data structures (tracks, playlists, albums, formats)
-  queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
-  serve.rs     HTTP playlist server for media players
+  dsp.rs       Post-crossfade processor chain (gain, Stereo Tool tap)
+  files.rs     Filename sanitizing and audio-file helpers
   icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
+  models.rs    Data structures (tracks, playlists, albums, formats)
+  output.rs    Human/JSON output formatting (listings, defaults, headers)
+  queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
+  resolve.rs   Output-dir and quality-bounds resolution
+  serve.rs     HTTP playlist server for media players
+  sort.rs      Quality/duration/relevance sorting helpers
+  track.rs     Single-track fetch, decrypt, and format negotiation
+  web_assets.rs Embedded single-file web player served by `serve`
 ```
 
 ### Technical Details
@@ -356,6 +374,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
+- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade and a post-crossfade processor chain
 
 ## Support
 

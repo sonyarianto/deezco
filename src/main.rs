@@ -9,6 +9,7 @@ mod download;
 mod dsp;
 mod files;
 mod icecast;
+mod log;
 mod models;
 mod output;
 mod queue;

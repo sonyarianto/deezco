@@ -245,7 +245,7 @@ async fn prepare_track_audio(
     fetch_format: TrackFormat,
 ) -> Result<FetchedTrack> {
     if debug_enabled() {
-        eprintln!(
+        crate::warn!(
             "[deezco-debug] preparing track {} for stream",
             track.display_name()
         );
@@ -505,13 +505,13 @@ impl Producer {
     /// (mixed in the background task), so activation stays instant here.
     fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
         if self.runtime.pipeline.crossfade.is_enabled() {
-            println!(
+            crate::info!(
                 "deezco: now playing: {} (crossfade {:.1}s)",
                 track.display_name(),
                 self.runtime.pipeline.crossfade.duration_secs
             );
         } else {
-            println!("deezco: now playing: {}", track.display_name());
+            crate::info!("deezco: now playing: {}", track.display_name());
         }
         if let Some(updater) = &self.updater {
             let updater = updater.clone();
@@ -522,14 +522,14 @@ impl Producer {
                 if let Err(err) = updater.update(&title).await
                     && !err.to_string().contains("404")
                 {
-                    eprintln!("deezco: title update failed: {err}");
+                    crate::warn!("deezco: title update failed: {err}");
                 }
             });
         }
         // Top up the prefetch queue so there are always PREFETCH_AHEAD
         // tracks ready (or being fetched) ahead of the current one.
         while self.prefetch.len() < Self::PREFETCH_AHEAD {
-            eprintln!("deezco: prefetching next track in background");
+            crate::warn!("deezco: prefetching next track in background");
             self.spawn_prefetch();
         }
         // Resolve the real output bitrate so the advertised rate matches what
@@ -580,7 +580,7 @@ impl Producer {
                     return Ok(());
                 }
                 Ok(Err(err)) => {
-                    eprintln!("deezco: track fetch failed: {err}; skipping");
+                    crate::warn!("deezco: track fetch failed: {err}; skipping");
                     continue;
                 }
                 Err(err) => {
@@ -617,7 +617,7 @@ impl Producer {
             if self.current.is_none() {
                 let started = std::time::Instant::now();
                 if let Err(err) = self.load_next_track().await {
-                    eprintln!(
+                    crate::warn!(
                         "deezco: track fetch failed: {err}; retrying in {:?}",
                         RETRY_DELAY
                     );
@@ -627,7 +627,7 @@ impl Producer {
                 // A slow prep makes the stream go silent: silent-source hosts
                 // drop the connection, so surface the stall.
                 if started.elapsed() > Duration::from_secs(2) {
-                    eprintln!(
+                    crate::warn!(
                         "deezco: next track took {:?} to prepare (stream was silent)",
                         started.elapsed()
                     );
@@ -693,20 +693,20 @@ async fn run_connection(
     loop {
         let mut p = producer.lock().await;
         if p.current.is_none() && !prepared {
-            println!("deezco: preparing the first track before connecting");
+            crate::info!("deezco: preparing the first track before connecting");
             prepared = true;
         }
         match p.warm_up().await {
             Ok(()) => {
                 advertised_kbps = p.advertised_kbps();
-                println!(
+                crate::info!(
                     "deezco: streaming at {advertised_kbps} kbps (actual, after quality fallback)"
                 );
                 client = p.api.client().clone();
                 break;
             }
             Err(err) => {
-                eprintln!("deezco: first track not ready: {err}; retrying");
+                crate::warn!("deezco: first track not ready: {err}; retrying");
                 drop(p);
                 sleep(RETRY_DELAY).await;
             }
@@ -755,7 +755,7 @@ async fn run_connection(
             response.status()
         )));
     }
-    println!("deezco: connected to {url} (listeners can tune in at {url})");
+    crate::info!("deezco: connected to {url} (listeners can tune in at {url})");
     if let Some(updater) = updater {
         let title = producer.lock().await.current_title();
         if let Some(title) = title {
@@ -764,7 +764,7 @@ async fn run_connection(
                 if let Err(err) = updater.update(&title).await
                     && !err.to_string().contains("404")
                 {
-                    eprintln!("deezco: title update failed: {err}");
+                    crate::warn!("deezco: title update failed: {err}");
                 }
             });
         }
@@ -845,7 +845,7 @@ pub async fn stream(
         Err(_) => config.playlist.clone(),
     };
     queue.set_name(&config.playlist, &playlist_name).await;
-    println!(
+    crate::info!(
         "deezco: streaming \"{}\" ({}) to {}{} (refresh every {}s)",
         playlist_name,
         config.playlist,
@@ -854,21 +854,22 @@ pub async fn stream(
         refresh_secs
     );
     if pipeline.is_active() {
-        println!(
+        crate::info!(
             "deezco: pipeline active: session CBR {encode_bps} kbps (decode → crossfade → DSP → encode per track)"
         );
         if pipeline.crossfade.is_enabled() {
-            println!(
+            crate::info!(
                 "deezco: crossfade {:.1}s ({:?}); first-track encode can take ~20s before connect",
-                pipeline.crossfade.duration_secs, pipeline.crossfade.curve
+                pipeline.crossfade.duration_secs,
+                pipeline.crossfade.curve
             );
         }
         let chain = pipeline.build_chain();
         if !chain.names().is_empty() {
-            println!("deezco: DSP chain: {}", chain.names().join(" -> "));
+            crate::info!("deezco: DSP chain: {}", chain.names().join(" -> "));
         }
         if let Some(stereo) = &pipeline.stereo_tool {
-            println!(
+            crate::info!(
                 "deezco: stereo-tool via {} (per-track spawn; processor state resets each track)",
                 stereo.binary.display()
             );
@@ -898,11 +899,11 @@ pub async fn stream(
     loop {
         let connected = match run_connection(&producer, &config, Some(&updater)).await {
             Ok(()) => {
-                eprintln!("deezco: source connection closed by Icecast; reconnecting");
+                crate::warn!("deezco: source connection closed by Icecast; reconnecting");
                 true
             }
             Err(StreamError::Transient(err)) => {
-                eprintln!("deezco: stream error: {err}; reconnecting");
+                crate::warn!("deezco: stream error: {err}; reconnecting");
                 false
             }
             Err(StreamError::Fatal(err)) => bail!("{err}"),
@@ -913,7 +914,7 @@ pub async fn stream(
         if connected {
             reconnect_delay = RECONNECT_DELAY;
         }
-        eprintln!("deezco: next connection attempt in {:?}", reconnect_delay);
+        crate::warn!("deezco: next connection attempt in {:?}", reconnect_delay);
         sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
     }

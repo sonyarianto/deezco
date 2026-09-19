@@ -469,21 +469,43 @@ mod tests {
             .find(|p| p.is_file())
             .unwrap_or_else(|| panic!("{name} must exist for this test"))
     }
-
     /// A fake "processor" binary: ignores argv (so the real Stereo Tool
     /// flags pass through harmlessly) and echoes stdin to stdout like the
     /// tool's raw-PCM mode. Hermetic: only needs `/bin/sh` + `cat`.
+    ///
+    /// Written next to the test binary — not `temp_dir()`: CI runners have
+    /// been observed refusing to exec files under `/tmp`, which turned this
+    /// test red there while green locally. `target/debug/deps` is proven
+    /// executable because the test itself runs from it.
     #[cfg(unix)]
     fn fake_processor() -> PathBuf {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("deezco-fake-stereo-{}", std::process::id()));
+        let dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("test binary dir")
+            .to_path_buf();
+        let path = dir.join(format!("deezco-fake-stereo-{}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("create fake processor");
         file.write_all(b"#!/bin/sh\nexec cat\n")
             .expect("write fake processor");
         drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake processor");
+        // Pre-flight: prove the script actually executes here. The script
+        // ignores argv, so this runs `cat --version` → exit 0. A failure
+        // panics with the OS error instead of a mysterious bypass later.
+        let status = std::process::Command::new(&path)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("fake processor must execute");
+        assert!(
+            status.success(),
+            "fake processor pre-flight failed: {status}"
+        );
         path
     }
 

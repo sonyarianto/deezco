@@ -376,45 +376,7 @@ deezco --show-arl                 # masked: 1234****cdef (safe for screenshots)
 deezco --show-arl --reveal        # full ARL — careful, it's a password (also: cat ~/.config/deezco/.arl)
 deezco logout                     # remove stored ARL
 ```
-
-## Architecture
-
-```
-src/
-  main.rs      CLI entry point, argument parsing
-  api.rs       Deezer GW (internal) API + public API + media URL client
-  audio.rs     PCM bus types, crossfade math, MP3 decoder (Symphonia)
-  auth.rs      ARL-based login, persistent credential storage
-  batch.rs     Concurrent download orchestration and dry-run/summary helpers
-  cli.rs       Clap CLI definitions (commands and flags)
-  crypto.rs    Blowfish CBC decryption, AES-128-ECB stream path, key generation
-  dedupe.rs    Audio hash index and duplicate linking/cleanup
-  download.rs  Track/playlist/favorites/artist download orchestration
-  dsp.rs       Post-crossfade processor chain (gain, Stereo Tool tap)
-  stereo_lib.rs Persistent in-process libStereoTool backend (dlopen FFI)
-  files.rs     Filename sanitizing and audio-file helpers
-  icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
-  loudness.rs  R128 loudness normalization (BS.1770 K-weighting + gating)
-  log.rs       Timestamped logging macros for long-lived processes
-  models.rs    Data structures (tracks, playlists, albums, formats)
-  output.rs    Human/JSON output formatting (listings, defaults, headers)
-  queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
-  resolve.rs   Output-dir and quality-bounds resolution
-  serve.rs     HTTP playlist server for media players
-  sort.rs      Quality/duration/relevance sorting helpers
-  track.rs     Single-track fetch, decrypt, and format negotiation
-  web_assets.rs Embedded single-file web player served by `serve`
-```
-
-### Technical Details
-
-- **GW API**: `http://www.deezer.com/ajax/gw-light.php` — internal API for track metadata, playlists, user data
-- **Public API**: `https://api.deezer.com` — artist search, track info
-- **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
-- **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
-- **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in); PCM bus is f32 stereo @ 44100 Hz with R128 loudness normalization, equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and continuous session-CBR MP3 encode via statically linked LAME. Zero runtime dependencies — only the optional Stereo Tool binaries (`--stereo-tool*`) are external.
-
+ 
 ## Support
 
 If deezco is useful to you, consider supporting its development:

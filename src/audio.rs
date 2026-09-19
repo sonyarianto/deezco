@@ -1,4 +1,4 @@
-//! PCM bus types for the Icecast source pipeline (Phase 1: design).
+//! PCM bus types for the Icecast source pipeline.
 //!
 //! The bus is the shared language every stage speaks:
 //!
@@ -7,22 +7,24 @@
 //!   -> dsp::ProcessorChain -> Encoder -> Icecast
 //! ```
 //!
-//! Phase 1 ships the types plus the pure crossfade math (fully unit-tested,
-//! no audio dependencies). Phase 2 plugs in the real `FrameDecoder` (MP3 ->
-//! PCM, e.g. `minimp3`/`symphonia`) and `FrameEncoder` (PCM -> CBR MP3) behind
-//! the traits below — the `Producer` wiring does not change again.
+//! Ships the bus types, the pure crossfade math, and both converters:
+//! `Mp3Decoder` (bundled `minimp3`, no runtime deps) and `LameEncoder`
+//! (external `lame` binary, opt-in — only spawned when the pipeline is
+//! active). What remains is driving them from `Producer` (decode->
+//! crossfade->process->encode per track) instead of native passthrough.
 
-// Phase 1 scaffolding: this module is public bus API for Phase 2. Items not
-// yet read by production code are covered here instead of per-item
-// attributes; remove this allow as each stage gets wired (the compiler will
-// point at what's left via the unit tests).
+// Scaffolding allow: covers bus API surface that unit tests exercise but
+// production constructs only on some paths (e.g. alternate curve variants,
+// future taps); remove it as coverage converges.
 #![allow(dead_code)]
+
+use std::io::Write;
 
 use anyhow::Result;
 
 /// Sample rate (Hz) every stage resamples to before mixing. 44100 matches
-/// Deezer's MP3 sources, so Phase 2 starts without a resampler; Stereo Tool
-/// also accepts it natively.
+/// Deezer's MP3 sources, so the linear resampler below is a rarely-hit
+/// fallback; Stereo Tool also accepts this rate natively.
 pub const BUS_RATE: u32 = 44100;
 /// Channel count on the bus. Stereo Tool is a stereo processor, so mono
 /// sources are upmixed on decode and the encoder always emits stereo.
@@ -70,6 +72,11 @@ impl PcmBuffer {
     /// Mutable access for DSP stages.
     pub fn samples_mut(&mut self) -> &mut [f32] {
         &mut self.samples
+    }
+
+    /// Consume the buffer into its raw interleaved samples.
+    pub fn into_samples(self) -> Vec<f32> {
+        self.samples
     }
 
     /// Number of stereo frames.
@@ -190,9 +197,9 @@ pub fn apply_crossfade(tail: &[f32], head: &[f32], curve: CrossfadeCurve) -> Vec
     out
 }
 
-/// Phase 2 tap: MP3 bytes -> [`PcmBuffer`]. Implementations decode, upmix to
-/// stereo, and resample to [`BUS_RATE`]. Kept as a trait so the bus design
-/// does not dictate the backend.
+/// MP3 bytes -> [`PcmBuffer`]: decode, upmix to stereo, resample to
+/// [`BUS_RATE`]. Implemented by [`Mp3Decoder`]; kept as a trait so the bus
+/// design does not dictate the backend.
 pub trait FrameDecoder: Send + Sync {
     /// Decoder name for logs (e.g. `"minimp3"`).
     fn name(&self) -> &str;
@@ -314,16 +321,176 @@ fn i16_to_f32_stereo(input: &[i16]) -> Vec<f32> {
     input.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
-/// Phase 2 tap: [`PcmBuffer`] -> CBR MP3 bytes at one fixed bitrate for the
-/// whole Icecast session (constant encoder settings — required so listeners
+/// Render one track's share of the crossfade: mix the previous track's
+/// held tail with the head of `pcm`, and hold this track's own tail for
+/// the next one.
+///
+/// Returns `(output_pcm, new_tail)` — both interleaved stereo. `output_pcm`
+/// is what gets DSP-processed and encoded now; `new_tail` is published to
+/// the shared handoff for the following track. Degenerate inputs (empty
+/// previous tail on the first track, tracks shorter than the overlap) fall
+/// back gracefully instead of panicking.
+pub fn render_track_overlap(
+    prev_tail: &[f32],
+    pcm: Vec<f32>,
+    overlap_frames: usize,
+    curve: CrossfadeCurve,
+) -> (Vec<f32>, Vec<f32>) {
+    let own_frames = pcm.len() / 2;
+    if own_frames == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let prev_frames = prev_tail.len() / 2;
+    // Never consume the whole track into the overlap: keep at least one
+    // frame of body so the handoff tail always moves forward, and cap the
+    // held tail so overlap + hold never exceed the track (short tracks
+    // shrink both gracefully instead of panicking on slice bounds).
+    let overlap = overlap_frames
+        .min(prev_frames)
+        .min(own_frames.saturating_sub(1));
+    let hold = overlap_frames.min(own_frames.saturating_sub(overlap));
+    let new_tail = pcm[pcm.len() - hold * 2..].to_vec();
+    if overlap == 0 {
+        let body = pcm[..pcm.len() - hold * 2].to_vec();
+        return (body, new_tail);
+    }
+    let tail_part = &prev_tail[prev_tail.len() - overlap * 2..];
+    let head_part = &pcm[..overlap * 2];
+    let mut out = apply_crossfade(tail_part, head_part, curve);
+    out.extend_from_slice(&pcm[overlap * 2..pcm.len() - hold * 2]);
+    (out, new_tail)
+}
+
+/// [`PcmBuffer`] -> CBR MP3 bytes at one fixed bitrate for the whole
+/// Icecast session (constant encoder settings — required so listeners
 /// never hear a format switch mid-stream).
 pub trait FrameEncoder: Send + Sync {
-    /// Encoder name for logs (e.g. `"lame-128"`).
+    /// Encoder name for logs (e.g. `"lame"`).
     fn name(&self) -> &str;
     /// Output bitrate in kbps.
     fn bitrate_kbps(&self) -> u32;
     /// Encode bus PCM to MP3.
     fn encode(&self, pcm: &PcmBuffer) -> Result<Vec<u8>>;
+}
+
+/// [`FrameEncoder`] backed by the external `lame` binary (opt-in runtime
+/// dependency: required only when the PCM pipeline is active — native MP3
+/// passthrough never spawns it).
+///
+/// Bus PCM (`f32`) is converted to 16-bit stereo, wrapped in a minimal WAV
+/// container so LAME reads rate/channels from the header instead of flags,
+/// and piped through `lame --silent -b <bitrate> - -`.
+///
+/// Blocking by design (plain `std::process`): async callers must run it
+/// under `spawn_blocking` so the stream pacer never stalls.
+pub struct LameEncoder {
+    bitrate: u32,
+}
+
+impl LameEncoder {
+    /// Lowest / highest CBR bitrate LAME accepts for MP3.
+    pub const MIN_BITRATE: u32 = 8;
+    /// Lowest / highest CBR bitrate LAME accepts for MP3.
+    pub const MAX_BITRATE: u32 = 320;
+
+    /// Build an encoder for `bitrate` kbps; rejects anything outside
+    /// 8..=320 before LAME ever runs.
+    pub fn new(bitrate: u32) -> Result<Self> {
+        if !(Self::MIN_BITRATE..=Self::MAX_BITRATE).contains(&bitrate) {
+            anyhow::bail!(
+                "LAME bitrate must be between {} and {} kbps, got {bitrate}",
+                Self::MIN_BITRATE,
+                Self::MAX_BITRATE
+            );
+        }
+        Ok(Self { bitrate })
+    }
+
+    /// True when the `lame` binary runs on this machine. Check at startup
+    /// (before opening the Icecast connection) so a missing binary fails
+    /// fast instead of mid-stream.
+    pub fn is_available() -> bool {
+        std::process::Command::new("lame")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+impl FrameEncoder for LameEncoder {
+    fn name(&self) -> &str {
+        "lame"
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.bitrate
+    }
+
+    fn encode(&self, pcm: &PcmBuffer) -> Result<Vec<u8>> {
+        if pcm.is_empty() {
+            anyhow::bail!("cannot encode empty PCM buffer");
+        }
+        let s16 = f32_to_s16_stereo(pcm.samples());
+        let mut wav = wav_header(s16.len() * 2, BUS_RATE);
+        wav.extend(s16.iter().flat_map(|s| s.to_le_bytes()));
+
+        let mut child = std::process::Command::new("lame")
+            .args(["--silent", "-b", &self.bitrate.to_string(), "-", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| anyhow::anyhow!("failed to start lame: {err}"))?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&wav)
+            .map_err(|err| anyhow::anyhow!("failed to feed PCM to lame: {err}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|err| anyhow::anyhow!("failed to read lame output: {err}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "lame failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if output.stdout.is_empty() {
+            anyhow::bail!("lame produced no MP3 output");
+        }
+        Ok(output.stdout)
+    }
+}
+
+/// Convert interleaved stereo `f32` in `[-1.0, 1.0]` to `i16` (clamped).
+fn f32_to_s16_stereo(input: &[f32]) -> Vec<i16> {
+    input
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+        .collect()
+}
+
+/// Minimal 44-byte WAV header for 16-bit stereo PCM at `sample_rate`.
+/// `data_bytes` is the payload length that follows the header.
+fn wav_header(data_bytes: usize, sample_rate: u32) -> Vec<u8> {
+    let mut header = Vec::with_capacity(44);
+    header.extend_from_slice(b"RIFF");
+    header.extend_from_slice(&(36 + data_bytes as u32).to_le_bytes());
+    header.extend_from_slice(b"WAVEfmt ");
+    header.extend_from_slice(&16u32.to_le_bytes());
+    header.extend_from_slice(&1u16.to_le_bytes());
+    header.extend_from_slice(&2u16.to_le_bytes());
+    header.extend_from_slice(&sample_rate.to_le_bytes());
+    header.extend_from_slice(&(sample_rate * 2 * 2).to_le_bytes());
+    header.extend_from_slice(&4u16.to_le_bytes());
+    header.extend_from_slice(&16u16.to_le_bytes());
+    header.extend_from_slice(b"data");
+    header.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+    header
 }
 
 #[cfg(test)]
@@ -409,6 +576,49 @@ mod tests {
         assert!((buf.duration_secs() - 1.0).abs() < 1e-6);
         assert!(!buf.is_empty());
         assert!(PcmBuffer::new().is_empty());
+    }
+
+    /// 10 stereo frames of silence-valued `v` (distinct per test).
+    fn ten_frames(v: f32) -> Vec<f32> {
+        vec![v; 20]
+    }
+
+    #[test]
+    fn render_overlap_mixes_head_and_holds_tail() {
+        // 10-frame track, 4-frame overlap: out = 4 mixed + 2 body, new tail 4.
+        let (out, tail) =
+            render_track_overlap(&ten_frames(1.0), ten_frames(0.0), 4, CrossfadeCurve::Linear);
+        assert_eq!(out.len(), 12, "4 mixed + 2 body frames");
+        assert_eq!(tail.len(), 8, "held tail");
+        assert!((out[0] - 1.0).abs() < 1e-6, "overlap starts at outgoing");
+        assert!(out[10].abs() < 1e-6, "body is the incoming track");
+    }
+
+    #[test]
+    fn render_overlap_first_track_holds_tail_without_prefix() {
+        // No previous tail: straight body, still holds its own tail.
+        let (out, tail) = render_track_overlap(&[], ten_frames(0.5), 4, CrossfadeCurve::EqualPower);
+        assert_eq!(out.len(), 12, "10 - 4 held frames");
+        assert_eq!(tail.len(), 8);
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn render_overlap_short_track_shrinks_gracefully() {
+        // 3-frame track against a 4-frame request: overlap clamps to 2,
+        // output is just the mixed region plus an empty body — no panic.
+        let (out, tail) =
+            render_track_overlap(&ten_frames(1.0), vec![0.0; 6], 4, CrossfadeCurve::Linear);
+        assert_eq!(out.len(), 4);
+        assert_eq!(tail.len(), 2, "hold capped so overlap + hold fit");
+    }
+
+    #[test]
+    fn render_overlap_empty_track_is_empty() {
+        let (out, tail) =
+            render_track_overlap(&ten_frames(1.0), Vec::new(), 4, CrossfadeCurve::Linear);
+        assert!(out.is_empty());
+        assert!(tail.is_empty());
     }
 
     #[test]
@@ -530,6 +740,95 @@ mod tests {
         assert!(
             samples.samples().iter().all(|s| *s >= -1.0 && *s <= 1.0),
             "samples must stay in unit range"
+        );
+    }
+
+    #[test]
+    fn f32_to_s16_scales_and_clamps() {
+        assert_eq!(f32_to_s16_stereo(&[1.0, -1.0, 0.0]), vec![32767, -32767, 0]);
+        // Out-of-range input hard-clips instead of wrapping.
+        assert_eq!(f32_to_s16_stereo(&[2.0, -2.0]), vec![32767, -32767]);
+    }
+
+    #[test]
+    fn wav_header_describes_stereo_16bit_pcm() {
+        let header = wav_header(176400, 44100);
+        assert_eq!(header.len(), 44);
+        assert_eq!(&header[0..4], b"RIFF");
+        assert_eq!(&header[8..12], b"WAVE");
+        assert_eq!(&header[12..16], b"fmt ");
+        assert_eq!(
+            u16::from_le_bytes([header[20], header[21]]),
+            1,
+            "PCM format"
+        );
+        assert_eq!(u16::from_le_bytes([header[22], header[23]]), 2, "channels");
+        assert_eq!(
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]),
+            44100,
+            "sample rate"
+        );
+        assert_eq!(&header[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes([header[40], header[41], header[42], header[43]]),
+            176400,
+            "data length"
+        );
+    }
+
+    #[test]
+    fn lame_encoder_validates_bitrate_before_spawning() {
+        assert!(LameEncoder::new(128).is_ok());
+        assert!(LameEncoder::new(8).is_ok());
+        assert!(LameEncoder::new(320).is_ok());
+        assert!(LameEncoder::new(0).is_err());
+        assert!(LameEncoder::new(7).is_err());
+        assert!(LameEncoder::new(321).is_err());
+        assert_eq!(LameEncoder::new(96).unwrap().bitrate_kbps(), 96);
+        assert_eq!(LameEncoder::new(96).unwrap().name(), "lame");
+    }
+
+    #[test]
+    fn lame_encoder_rejects_empty_pcm_without_spawning() {
+        let pcm = PcmBuffer::new();
+        assert!(LameEncoder::new(128).unwrap().encode(&pcm).is_err());
+    }
+
+    /// PCM -> MP3 smoke test: needs LAME on PATH. Run with
+    /// `cargo test -- --ignored encode_pcm_to_mp3`.
+    #[test]
+    #[ignore = "requires lame on PATH"]
+    fn encode_pcm_to_mp3_produces_mp3_frames() {
+        assert!(LameEncoder::is_available(), "lame must be on PATH");
+        let pcm = PcmBuffer::from_interleaved(i16_to_f32_stereo(&sine_pcm_i16()));
+        let mp3 = LameEncoder::new(128).unwrap().encode(&pcm).unwrap();
+        assert!(!mp3.is_empty(), "lame produced no output");
+        // MP3 frame sync (11 set bits), no ID3 tag requested.
+        assert_eq!(mp3[0], 0xFF);
+        assert_eq!(mp3[1] & 0xE0, 0xE0, "second byte must carry frame sync");
+    }
+
+    /// Full bus loop PCM -> MP3 -> PCM: needs LAME on PATH. Run with
+    /// `cargo test -- --ignored bus_roundtrip`.
+    #[test]
+    #[ignore = "requires lame on PATH"]
+    fn bus_roundtrip_preserves_audible_sine() {
+        assert!(LameEncoder::is_available(), "lame must be on PATH");
+        let pcm = PcmBuffer::from_interleaved(i16_to_f32_stereo(&sine_pcm_i16()));
+        let mp3 = LameEncoder::new(128).unwrap().encode(&pcm).unwrap();
+        let back = Mp3Decoder::new()
+            .decode(&mp3)
+            .expect("decode the encoded MP3");
+        assert!(
+            (44100..=(44100 + 5000)).contains(&back.frames()),
+            "unexpected frame count: {}",
+            back.frames()
+        );
+        let energy: f32 = back.samples().iter().map(|s| s * s).sum();
+        let rms = (energy / back.samples().len() as f32).sqrt();
+        assert!(
+            rms > 0.05,
+            "roundtripped sine must stay audible (rms={rms})"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! DSP chain for the Icecast source pipeline (Phase 1: bus design).
+//! DSP chain for the Icecast source pipeline.
 //!
 //! Pipeline order (industry standard):
 //!
@@ -7,15 +7,14 @@
 //!   -> ProcessorChain (Gain -> StereoTool -> ...) -> Encoder -> Icecast
 //! ```
 //!
-//! This module only owns the `ProcessorChain` tap — the slot where Stereo
-//! Tool will live in Phase 2. Decoding/encoding stay behind the
-//! `FrameDecoder`/`FrameEncoder` traits in [`crate::audio`] so the default
-//! build keeps zero runtime dependencies and the native MP3 passthrough
-//! behaviour is unchanged until the PCM pipeline is activated.
+//! This module owns the `ProcessorChain` tap: gain is live, and Stereo Tool
+//! docks here in the follow-up (its config and bypass stub already define
+//! the slot). The default path stays native MP3 passthrough with zero extra
+//! dependencies; the chain only runs when the pipeline is active.
 
-// Phase 1 scaffolding: the chain API is fully unit-tested but production
-// only builds (not yet drives) it until the Phase 2 decoder lands. Remove
-// this allow as stages get wired.
+// Scaffolding allow: covers chain API surface that unit tests exercise
+// but production constructs only on the pipeline path (e.g. the Stereo
+// Tool stub); remove it as coverage converges.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -126,8 +125,8 @@ impl AudioProcessor for GainProcessor {
 }
 
 /// Connection settings for the Thimeo Stereo Tool CLI (`stereo_tool_cmd_64`).
-/// Phase 1 only carries the config + a bypass stub so the CLI shape and the
-/// chain slot are stable; Phase 2 replaces `process` with the real streaming
+/// Carries the config + a bypass stub so the CLI shape and the chain slot
+/// are stable; the follow-up replaces `process` with the real streaming
 /// subprocess (raw PCM over stdin/stdout, kept open across tracks so the
 /// processor state — AGC, loudness history — survives track boundaries).
 #[derive(Clone, Debug)]
@@ -143,16 +142,16 @@ pub struct StereoToolConfig {
 }
 
 impl StereoToolConfig {
-    /// The binary must exist to be usable; checked at startup (Phase 2).
+    /// The binary must exist to be usable; checked at startup on integration.
     pub fn binary_exists(&self) -> bool {
         self.binary.is_file()
     }
 }
 
-/// Phase 1 stub: advertises the chain slot, passes audio through untouched,
+/// Bypass stub: advertises the chain slot, passes audio through untouched,
 /// and warns once so a misconfigured `--stereo-tool` can never silently
-/// degrade the stream. Phase 2 fills in the subprocess here — callers
-/// (`Producer`) do not change.
+/// degrade the stream. The follow-up fills in the subprocess here —
+/// callers (`Producer`) do not change.
 pub struct StereoToolProcessor {
     config: StereoToolConfig,
     warned: bool,

@@ -567,6 +567,7 @@ async fn main() -> Result<()> {
             no_metadata,
             crossfade,
             gain_db,
+            bitrate,
             refresh_secs,
         } => {
             let password = password.or_else(|| {
@@ -591,6 +592,11 @@ async fn main() -> Result<()> {
             {
                 anyhow::bail!("--gain-db must be between -24 and +24 dB");
             }
+            if let Some(br) = bitrate
+                && !(8..=320).contains(&br)
+            {
+                anyhow::bail!("--bitrate must be between 8 and 320 kbps");
+            }
             let config = icecast::IcecastConfig {
                 server,
                 mount,
@@ -609,6 +615,7 @@ async fn main() -> Result<()> {
                     crate::audio::CrossfadeCurve::EqualPower,
                 ),
                 gain_db,
+                bitrate,
             };
             icecast::stream(api, format, config, refresh_secs, pipeline).await?;
         }

@@ -201,15 +201,19 @@ pub enum Commands {
         /// connections on metadata updates (e.g. caster.fm)
         #[arg(long)]
         no_metadata: bool,
-        /// Crossfade duration in seconds (0 = hard cut). Phase 1 plumbs the
-        /// value into the PCM bus; audible fades activate with the Phase 2
-        /// decoder/encoder.
+        /// Crossfade duration in seconds (0 = hard cut). Rendered as an
+        /// equal-power overlap in the PCM bus; needs the `lame` binary.
         #[arg(long, default_value_t = 0.0)]
         crossfade: f32,
         /// Static DSP gain in dB (-24..+24), applied post-crossfade
         /// pre-encode through the processor chain.
         #[arg(long)]
         gain_db: Option<f32>,
+        /// Session MP3 bitrate in kbps (8..=320) when the pipeline is active;
+        /// also activates the pipeline alone as a transcode. Without pipeline
+        /// flags, 128/320 keep streaming natively.
+        #[arg(long)]
+        bitrate: Option<u32>,
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,

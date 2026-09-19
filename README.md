@@ -2,7 +2,7 @@
 
 # Deezco
 
-A fast, lightweight Deezer music downloader written in Rust. Zero runtime dependencies.
+A fast, lightweight Deezer music downloader. Zero runtime dependencies.
 
 ## Features
 

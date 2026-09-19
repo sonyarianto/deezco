@@ -29,7 +29,7 @@ cd deezco
 cargo build --release
 ```
 
-The binary will be at `target/release/deezco` (approx. 3.6 MB).
+The binary will be at `target/release/deezco`.
 
 ### Requirements
 

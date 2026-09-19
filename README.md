@@ -316,6 +316,17 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --stereo-tool /opt/stereo_tool_cmd_64 \
   --stereo-tool-sts /etc/stereo/audio.sts \
   --stereo-tool-key "$STEREO_KEY"
+
+# Same processing via the in-process libStereoTool shared library
+# (from Stereo_Tool_Generic_plugin.zip): no per-track spawn, no pipe
+# roundtrip, key stays out of `ps aux`, and processor state persists across
+# tracks by default (--stereo-tool-reset-track restores CLI-like resets).
+# Conflicts with --stereo-tool (pick one backend):
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --crossfade 6 \
+  --stereo-tool-lib /opt/libStereoTool_intel64.so \
+  --stereo-tool-sts /etc/stereo/audio.sts \
+  --stereo-tool-key "$STEREO_KEY"
 ```
 
 ### Output layout
@@ -374,6 +385,7 @@ src/
   dedupe.rs    Audio hash index and duplicate linking/cleanup
   download.rs  Track/playlist/favorites/artist download orchestration
   dsp.rs       Post-crossfade processor chain (gain, Stereo Tool tap)
+  stereo_lib.rs Persistent in-process libStereoTool backend (dlopen FFI)
   files.rs     Filename sanitizing and audio-file helpers
   icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
   models.rs    Data structures (tracks, playlists, albums, formats)
@@ -393,7 +405,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, or `--stereo-tool` is set)
+- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
 
 ## Support
 

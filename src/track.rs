@@ -134,7 +134,7 @@ pub async fn fetch_track_audio_from_url(
 ) -> Result<FetchedTrack> {
     // Download using the shared API client
     if debug_enabled() {
-        eprintln!("[deezco-debug] downloading track {sng_id} from {url}");
+        crate::warn!("[deezco-debug] downloading track {sng_id} from {url}");
     }
     let response = api
         .client()
@@ -201,7 +201,7 @@ pub async fn fetch_track_audio_from_url(
     };
 
     if debug_enabled() {
-        eprintln!(
+        crate::warn!(
             "[deezco-debug] downloaded track {sng_id}: {} bytes",
             output_data.len()
         );

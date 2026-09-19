@@ -80,7 +80,7 @@ impl TrackQueue {
                 .get(playlist_id)
                 .cloned()
                 .unwrap_or_else(|| playlist_id.to_string());
-            eprintln!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
+            crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
             match api.get_playlist_tracks(playlist_id).await {
                 Ok(tracks) if !tracks.is_empty() => {
                     let mut tracks = tracks;
@@ -91,7 +91,7 @@ impl TrackQueue {
                 }
                 Ok(_) => {} // Deezer returned no tracks: keep the cached queue.
                 Err(err) if !queue.tracks.is_empty() => {
-                    eprintln!("deezco: playlist fetch failed, keeping cache: {err}");
+                    crate::warn!("deezco: playlist fetch failed, keeping cache: {err}");
                 }
                 Err(err) => {
                     return Err(NextTrackError::Fetch(err.to_string()));

@@ -443,15 +443,19 @@ impl FrameEncoder for LameEncoder {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|err| anyhow::anyhow!("failed to start lame: {err}"))?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(&wav)
-            .map_err(|err| anyhow::anyhow!("failed to feed PCM to lame: {err}"))?;
+        // Writer thread + wait_with_output drain concurrently: a full track
+        // (~35 MB WAV) never fits in a 64 KB pipe, so sequential
+        // write-then-wait deadlocks (parent blocks on stdin while lame
+        // blocks on stdout).
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let writer = std::thread::spawn(move || stdin.write_all(&wav));
         let output = child
             .wait_with_output()
             .map_err(|err| anyhow::anyhow!("failed to read lame output: {err}"))?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("lame stdin writer panicked"))?
+            .map_err(|err| anyhow::anyhow!("failed to feed PCM to lame: {err}"))?;
         if !output.status.success() {
             anyhow::bail!(
                 "lame failed ({}): {}",
@@ -476,7 +480,7 @@ pub(crate) fn f32_to_s16_stereo(input: &[f32]) -> Vec<i16> {
 
 /// Minimal 44-byte WAV header for 16-bit stereo PCM at `sample_rate`.
 /// `data_bytes` is the payload length that follows the header.
-fn wav_header(data_bytes: usize, sample_rate: u32) -> Vec<u8> {
+pub(crate) fn wav_header(data_bytes: usize, sample_rate: u32) -> Vec<u8> {
     let mut header = Vec::with_capacity(44);
     header.extend_from_slice(b"RIFF");
     header.extend_from_slice(&(36 + data_bytes as u32).to_le_bytes());

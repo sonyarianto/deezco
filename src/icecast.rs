@@ -80,6 +80,9 @@ pub struct PipelineConfig {
     /// Thimeo Stereo Tool processing. Activates the pipeline on its own;
     /// runs after the gain stage, before the encoder.
     pub stereo_tool: Option<crate::dsp::StereoToolConfig>,
+    /// In-process `libStereoTool` backend. Mutually exclusive with
+    /// `stereo_tool` (enforced by the CLI); same chain slot.
+    pub stereo_lib: Option<crate::stereo_lib::StereoLibConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -89,6 +92,7 @@ impl Default for PipelineConfig {
             gain_db: None,
             bitrate: None,
             stereo_tool: None,
+            stereo_lib: None,
         }
     }
 }
@@ -116,6 +120,7 @@ impl PipelineConfig {
             || self.gain_db.is_some_and(|db| db != 0.0)
             || self.bitrate.is_some()
             || self.stereo_tool.is_some()
+            || self.stereo_lib.is_some()
     }
 
     /// The one CBR bitrate the whole session encodes at when the pipeline
@@ -246,7 +251,7 @@ async fn prepare_track_audio(
 ) -> Result<FetchedTrack> {
     if debug_enabled() {
         crate::warn!(
-            "[deezco-debug] preparing track {} for stream",
+            "[deezco-debug] preparing track \"{}\" for stream",
             track.display_name()
         );
     }
@@ -308,6 +313,9 @@ struct PipelineRuntime {
     /// Session CBR resolved in `stream()` (override or native rate).
     encode_bps: u32,
     xfade: Arc<Mutex<XfadeShared>>,
+    /// Persistent `libStereoTool` instance, opened once in `stream()`.
+    /// `None` unless `--stereo-tool-lib` was given.
+    stereo_lib: Option<Arc<std::sync::Mutex<crate::stereo_lib::StereoLibHandle>>>,
 }
 
 /// Fetch the next track from the queue and prepare its audio: native MP3
@@ -315,6 +323,10 @@ struct PipelineRuntime {
 /// encode path when the pipeline is active. Slow CPU work (decode, LAME)
 /// runs on blocking threads inside the background task, so track changes
 /// stay instant on the streaming path.
+///
+/// Every slow stage logs start/finish with timings: without them a
+/// multi-minute Stereo Tool encode looks like a hang (the exact symptom
+/// this fixes — previously only the download had a debug line).
 async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     let track = ctx
         .queue
@@ -334,14 +346,48 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     if !ctx.runtime.pipeline.is_active() {
         return Ok((track, fetched));
     }
-    let pcm = match tokio::task::spawn_blocking(move || Mp3Decoder::new().decode(&fetched.data))
-        .await
-        .context("decoder task panicked")?
+    let title = track.display_name();
+    let mp3_len = fetched.data.len();
+    // Source vs session: on a free account the fetch falls back (e.g. 320
+    // -> 128) while the session CBR stays fixed, so an upscale (128 -> 320)
+    // would waste bandwidth without adding quality. Surface it per track.
+    let actual = available_format(&track, ctx.fetch_format);
+    if actual != ctx.fetch_format {
+        crate::info!(
+            "deezco: source \"{title}\" is {actual} (fallback from {}) → session {} kbps CBR",
+            ctx.fetch_format,
+            ctx.runtime.encode_bps,
+        );
+    }
+    if let Some(native) = native_bitrate(actual)
+        && ctx.runtime.encode_bps > native
     {
-        Ok(pcm) => pcm,
-        Err(err) => {
+        crate::warn!(
+            "deezco: upscaling \"{title}\" ({actual} → {} kbps); consider --bitrate {native}",
+            ctx.runtime.encode_bps,
+        );
+    }
+    crate::info!("deezco: decoding \"{title}\" ({} bytes MP3)...", mp3_len);
+    let decode_started = std::time::Instant::now();
+    // A panicked/cancelled decode must still advance the crossfade sequence,
+    // or every later task would wait forever on `claim_turn`.
+    let decode_join = tokio::task::spawn_blocking(move || Mp3Decoder::new().decode(&fetched.data)).await;
+    let pcm = match decode_join {
+        Ok(Ok(pcm)) => {
+            crate::info!(
+                "deezco: decoded \"{title}\" in {:.1}s ({} frames)",
+                decode_started.elapsed().as_secs_f32(),
+                pcm.frames(),
+            );
+            pcm
+        }
+        Ok(Err(err)) => {
             advance_past(&ctx.runtime.xfade, ctx.seq).await;
             return Err(err);
+        }
+        Err(join_err) => {
+            advance_past(&ctx.runtime.xfade, ctx.seq).await;
+            return Err(anyhow::anyhow!("decoder task panicked: {join_err}"));
         }
     };
     // Ordered micro-step: mix the held tail, publish this track's own tail.
@@ -363,14 +409,65 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     };
     let pipeline = ctx.runtime.pipeline;
     let encode_bps = ctx.runtime.encode_bps;
-    let data = tokio::task::spawn_blocking(move || {
+    let stereo_lib = ctx.runtime.stereo_lib;
+    let mut label_chain = pipeline.build_chain();
+    if let Some(shared) = &stereo_lib {
+        label_chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+            shared.clone(),
+            pipeline
+                .stereo_lib
+                .as_ref()
+                .is_some_and(|config| config.reset_per_track),
+        ));
+    }
+    let chain_names = label_chain.names().join(" -> ");
+    let dsp_label = if chain_names.is_empty() {
+        "encode".to_string()
+    } else {
+        format!("DSP ({chain_names}) + encode")
+    };
+    let frames = out_pcm.len() / 2;
+    crate::info!(
+        "deezco: {dsp_label} \"{title}\" ({} frames -> {encode_bps} kbps CBR)...",
+        frames,
+    );
+    let process_started = std::time::Instant::now();
+    // The version was already published above, so `advance_past` here is a
+    // harmless no-op that only guards the non-crossfade path ordering.
+    let encode_join = tokio::task::spawn_blocking(move || {
         let mut chain = pipeline.build_chain();
+        if let Some(shared) = &stereo_lib {
+            chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                shared.clone(),
+                pipeline
+                    .stereo_lib
+                    .as_ref()
+                    .is_some_and(|config| config.reset_per_track),
+            ));
+        }
         let mut out = out_pcm;
         chain.process(&mut out)?;
         LameEncoder::new(encode_bps)?.encode(&PcmBuffer::from_interleaved(out))
     })
-    .await
-    .context("encode task panicked")??;
+    .await;
+    let data = match encode_join {
+        Ok(Ok(data)) => {
+            crate::info!(
+                "deezco: ready \"{title}\" in {:.1}s ({} bytes MP3)",
+                process_started.elapsed().as_secs_f32(),
+                data.len(),
+            );
+            data
+        }
+        Ok(Err(err)) => {
+            advance_past(&ctx.runtime.xfade, ctx.seq).await;
+            return Err(err);
+        }
+        Err(join_err) => {
+            advance_past(&ctx.runtime.xfade, ctx.seq).await;
+            return Err(anyhow::anyhow!("encode task panicked: {join_err}"));
+        }
+    };
     Ok((track, FetchedTrack { data }))
 }
 
@@ -506,12 +603,12 @@ impl Producer {
     fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
         if self.runtime.pipeline.crossfade.is_enabled() {
             crate::info!(
-                "deezco: now playing: {} (crossfade {:.1}s)",
+                "deezco: now playing: \"{}\" (crossfade {:.1}s)",
                 track.display_name(),
                 self.runtime.pipeline.crossfade.duration_secs
             );
         } else {
-            crate::info!("deezco: now playing: {}", track.display_name());
+            crate::info!("deezco: now playing: \"{}\"", track.display_name());
         }
         if let Some(updater) = &self.updater {
             let updater = updater.clone();
@@ -746,6 +843,10 @@ async fn run_connection(
     }
     let request = request.body(reqwest::Body::wrap_stream(body));
 
+    // Visible while the PUT handshake is in flight: without this, a server
+    // that accepts TCP but never answers looks identical to a missing
+    // "connected" log with no error.
+    crate::info!("deezco: connecting to {url} as {} ...", config.username);
     let response = request.send().await.map_err(|err| {
         StreamError::Transient(anyhow::Error::new(err).context("Icecast connection failed"))
     })?;
@@ -805,9 +906,17 @@ pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
             );
         }
     }
+    if let Some(lib) = &pipeline.stereo_lib
+        && !lib.lib_exists()
+    {
+        bail!(
+            "stereo-tool lib not found ({}); check --stereo-tool-lib",
+            lib.lib.display()
+        );
+    }
     if pipeline.is_active() && !LameEncoder::is_available() {
         bail!(
-            "the stream pipeline (--crossfade, --gain-db, --bitrate, or --stereo-tool) needs the lame binary; install it (e.g. `apt-get install lame`)"
+            "the stream pipeline (--crossfade, --gain-db, --bitrate, --stereo-tool, or --stereo-tool-lib) needs the lame binary; install it (e.g. `apt-get install lame`)"
         );
     }
     Ok(())
@@ -859,9 +968,17 @@ pub async fn stream(
         );
         if pipeline.crossfade.is_enabled() {
             crate::info!(
-                "deezco: crossfade {:.1}s ({:?}); first-track encode can take ~20s before connect",
+                "deezco: crossfade {:.1}s ({:?}); first-track render can take a while before connect (watch for decoding/DSP/ready lines)",
                 pipeline.crossfade.duration_secs,
                 pipeline.crossfade.curve
+            );
+        } else if pipeline.stereo_tool.is_some() || pipeline.stereo_lib.is_some() {
+            crate::info!(
+                "deezco: first-track render can take minutes before connect (stereo-tool runs ~2x realtime; watch for decoding/DSP/ready lines)"
+            );
+        } else {
+            crate::info!(
+                "deezco: first-track encode can take ~20s before connect (watch for decoding/ready lines)"
             );
         }
         let chain = pipeline.build_chain();
@@ -874,16 +991,46 @@ pub async fn stream(
                 stereo.binary.display()
             );
         }
+        if let Some(lib) = &pipeline.stereo_lib {
+            crate::info!(
+                "deezco: stereo-tool-lib via {} (persistent instance; state {})",
+                lib.lib.display(),
+                if lib.reset_per_track {
+                    "resets each track"
+                } else {
+                    "continuous across tracks"
+                },
+            );
+        }
     }
 
     // The producer outlives individual connections: after a reconnect it
     // resumes the buffered track and its background prefetch, so dropped
     // connections cost a few seconds instead of a full track preparation.
+    //
+    // The libStereoTool instance is opened once here (fail fast with a clear
+    // error) and shared by every prefetch task; the CLI-subprocess backend
+    // needs no such handle.
+    let stereo_lib = match &pipeline.stereo_lib {
+        Some(config) => {
+            let handle = crate::stereo_lib::StereoLibHandle::open(config)?;
+            crate::info!(
+                "deezco: stereo-tool-lib v{} (api {}), latency {} frames (~{:.0} ms)",
+                handle.software_version,
+                handle.api_version,
+                handle.latency_frames(),
+                handle.latency_frames() as f32 / crate::audio::BUS_RATE as f32 * 1000.0,
+            );
+            Some(Arc::new(std::sync::Mutex::new(handle)))
+        }
+        None => None,
+    };
     let updater = TitleUpdater::new(&config);
     let runtime = PipelineRuntime {
         pipeline,
         encode_bps,
         xfade: Arc::new(Mutex::new(XfadeShared::default())),
+        stereo_lib,
     };
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
@@ -989,6 +1136,7 @@ mod tests {
             gain_db: Some(6.0),
             bitrate: None,
             stereo_tool: None,
+            stereo_lib: None,
         };
         assert!(pipeline.is_active());
         let chain = pipeline.build_chain();
@@ -1004,6 +1152,7 @@ mod tests {
             gain_db: None,
             bitrate: None,
             stereo_tool: None,
+            stereo_lib: None,
         };
         assert!(pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
@@ -1016,6 +1165,7 @@ mod tests {
             gain_db: Some(0.0),
             bitrate: None,
             stereo_tool: None,
+            stereo_lib: None,
         };
         assert!(!pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
@@ -1028,6 +1178,7 @@ mod tests {
             gain_db: None,
             bitrate: Some(96),
             stereo_tool: None,
+            stereo_lib: None,
         };
         assert!(pipeline.is_active());
         assert!(pipeline.build_chain().is_empty());
@@ -1045,6 +1196,7 @@ mod tests {
                 key: None,
                 rate: crate::audio::BUS_RATE,
             }),
+            stereo_lib: None,
         };
         assert!(pipeline.is_active());
         // Broadcast order: trim gain first, then the broadcast processor.
@@ -1087,6 +1239,38 @@ mod tests {
         };
         let err = check_prerequisites(&pipeline).unwrap_err();
         assert!(err.to_string().contains("44100"), "{err}");
+    }
+
+    #[test]
+    fn pipeline_stereo_lib_activates_alone() {
+        let pipeline = PipelineConfig {
+            stereo_lib: Some(crate::stereo_lib::StereoLibConfig {
+                lib: std::path::PathBuf::from("/opt/libStereoTool.so"),
+                settings: None,
+                key: None,
+                reset_per_track: false,
+            }),
+            ..PipelineConfig::default()
+        };
+        assert!(pipeline.is_active());
+        // The lib backend docks in the encode stage, not the CLI chain:
+        // `build_chain` stays empty until the runtime handle is attached.
+        assert!(pipeline.build_chain().is_empty());
+    }
+
+    #[test]
+    fn prerequisites_reject_missing_stereo_lib() {
+        let pipeline = PipelineConfig {
+            stereo_lib: Some(crate::stereo_lib::StereoLibConfig {
+                lib: std::path::PathBuf::from("/nonexistent/libStereoTool.so"),
+                settings: None,
+                key: None,
+                reset_per_track: false,
+            }),
+            ..PipelineConfig::default()
+        };
+        let err = check_prerequisites(&pipeline).unwrap_err();
+        assert!(err.to_string().contains("--stereo-tool-lib"), "{err}");
     }
 
     #[test]

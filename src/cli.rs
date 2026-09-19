@@ -217,8 +217,23 @@ pub enum Commands {
         /// Path to the Thimeo Stereo Tool CLI binary (stereo_tool_cmd_64).
         /// Runs every track through it (decode -> process -> encode) and
         /// activates the pipeline; needs `lame` too. State resets per track.
-        #[arg(long)]
+        /// Conflicts with `--stereo-tool-lib` (pick one backend).
+        #[arg(long, conflicts_with = "stereo_tool_lib")]
         stereo_tool: Option<PathBuf>,
+        /// Path to the Thimeo `libStereoTool` shared library
+        /// (e.g. `libStereoTool_intel64.so` from `Stereo_Tool_Generic_plugin.zip`).
+        /// In-process alternative to `--stereo-tool`: no per-track spawn, no
+        /// pipe roundtrip, key stays out of `ps aux`, and processor state can
+        /// persist across tracks (see `--stereo-tool-reset-track`). Shares
+        /// `--stereo-tool-sts` / `--stereo-tool-key`; needs `lame` too.
+        #[arg(long, conflicts_with = "stereo_tool")]
+        stereo_tool_lib: Option<PathBuf>,
+        /// Reset the `libStereoTool` processor state on each track boundary,
+        /// mimicking the CLI per-track spawn. Default (unset) keeps AGC and
+        /// loudness history continuous across tracks. Only meaningful with
+        /// `--stereo-tool-lib`.
+        #[arg(long)]
+        stereo_tool_reset_track: bool,
         /// Stereo Tool processor settings file (.sts); the tool's own
         /// defaults apply when unset.
         #[arg(long)]

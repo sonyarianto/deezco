@@ -16,6 +16,7 @@ mod queue;
 mod resolve;
 mod serve;
 mod sort;
+mod stereo_lib;
 mod track;
 mod web_assets;
 
@@ -570,6 +571,8 @@ async fn main() -> Result<()> {
             gain_db,
             bitrate,
             stereo_tool,
+            stereo_tool_lib,
+            stereo_tool_reset_track,
             stereo_tool_sts,
             stereo_tool_key,
             stereo_rate,
@@ -602,11 +605,20 @@ async fn main() -> Result<()> {
             {
                 anyhow::bail!("--bitrate must be between 8 and 320 kbps");
             }
+            if stereo_tool_reset_track && stereo_tool_lib.is_none() {
+                anyhow::bail!("--stereo-tool-reset-track requires --stereo-tool-lib");
+            }
             let stereo_tool = stereo_tool.map(|binary| crate::dsp::StereoToolConfig {
                 binary,
+                settings: stereo_tool_sts.clone(),
+                key: stereo_tool_key.clone(),
+                rate: stereo_rate,
+            });
+            let stereo_lib = stereo_tool_lib.map(|lib| crate::stereo_lib::StereoLibConfig {
+                lib,
                 settings: stereo_tool_sts,
                 key: stereo_tool_key,
-                rate: stereo_rate,
+                reset_per_track: stereo_tool_reset_track,
             });
             let config = icecast::IcecastConfig {
                 server,
@@ -628,6 +640,7 @@ async fn main() -> Result<()> {
                 gain_db,
                 bitrate,
                 stereo_tool,
+                stereo_lib,
             };
             // Fail fast on missing pipeline binaries before login/network.
             icecast::check_prerequisites(&pipeline)?;

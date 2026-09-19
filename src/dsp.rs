@@ -144,8 +144,12 @@ impl StereoToolConfig {
         self.binary.is_file()
     }
 
-    /// CLI arguments for `stereo_tool_cmd_64`: quiet 16-bit raw PCM at the
-    /// bus rate, optional settings/license, raw PCM on stdin and stdout.
+    /// CLI arguments for `stereo_tool_cmd_64`: quiet 16-bit stereo WAV at
+    /// the bus rate, optional settings/license, WAV on stdin and stdout.
+    /// A WAV container (not raw PCM) is required: with raw input the tool
+    /// silently drops its internal latency buffer on flush (~8192 samples
+    /// short, every track), which then trips the length check and bypasses.
+    /// With WAV in -> WAV out the length matches exactly.
     /// Extracted so the exact invocation is unit-tested without the
     /// licensed binary.
     fn args(&self) -> Vec<String> {
@@ -170,8 +174,36 @@ impl StereoToolConfig {
     }
 }
 
+/// Wrap interleaved stereo `i16` in a 44-byte WAV container for the Stereo
+/// Tool CLI. The tool documents `<infile>` as "WAV or PCM"; in practice raw
+/// PCM output comes back ~8192 samples short (unflushed latency buffer),
+/// while WAV in -> WAV out preserves the exact length.
+fn encode_wav(samples: &[i16]) -> Vec<u8> {
+    let mut wav = crate::audio::wav_header(samples.len() * 2, crate::audio::BUS_RATE);
+    wav.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+    wav
+}
+
+/// Parse the Stereo Tool's WAV output back to interleaved stereo `i16`.
+/// Returns `None` when the output is not a 44-byte-header stereo 16-bit WAV
+/// or the payload has an odd byte count.
+fn decode_wav(data: &[u8]) -> Option<Vec<i16>> {
+    if data.len() < 44 {
+        return None;
+    }
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" || &data[36..40] != b"data" {
+        return None;
+    }
+    let payload = &data[44..];
+    let (chunks, remainder) = payload.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    Some(chunks.iter().map(|c| i16::from_le_bytes(*c)).collect())
+}
+
 /// Thimeo Stereo Tool processor: runs bus PCM through the licensed
-/// `stereo_tool_cmd_64` CLI (16-bit raw stereo in and out) once per track.
+/// `stereo_tool_cmd_64` CLI (16-bit stereo WAV in and out) once per track.
 ///
 /// Two deliberate trade-offs, both logged:
 /// - Per-track spawn (not one persistent process): fits the parallel
@@ -197,7 +229,7 @@ impl StereoToolProcessor {
     fn warn_once(&mut self, message: String) {
         if !self.warned {
             self.warned = true;
-            eprintln!("deezco: stereo-tool: {message}");
+            crate::warn!("deezco: stereo-tool: {message}");
         }
     }
 
@@ -205,12 +237,14 @@ impl StereoToolProcessor {
     /// samples, or `None` when the tool failed (caller bypasses).
     /// Stdin writes run on a writer thread while stdout drains: a full
     /// track never fits in a pipe buffer, so sequential write-then-read
-    /// would deadlock.
+    /// would deadlock. Input is wrapped in a 44-byte WAV container and the
+    /// output is parsed back as WAV, so the tool flushes its latency buffer
+    /// and the sample count matches exactly (raw PCM loses ~8192 samples).
     fn run_tool(&self, input: &[i16]) -> Option<Vec<i16>> {
         use std::io::Write;
         use std::process::Stdio;
 
-        let raw: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let wav = encode_wav(input);
         let mut child = std::process::Command::new(&self.config.binary)
             .args(self.config.args())
             .stdin(Stdio::piped())
@@ -219,7 +253,7 @@ impl StereoToolProcessor {
             .spawn()
             .ok()?;
         let mut stdin = child.stdin.take()?;
-        let writer = std::thread::spawn(move || stdin.write_all(&raw));
+        let writer = std::thread::spawn(move || stdin.write_all(&wav));
         let output = child.wait_with_output().ok()?;
         // A dead writer (panic or broken pipe) means the tool is gone;
         // the status check below is the backstop for the rest.
@@ -227,21 +261,19 @@ impl StereoToolProcessor {
             return None;
         }
         if !output.status.success() {
-            eprintln!(
+            crate::warn!(
                 "deezco: stereo-tool failed ({}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
             return None;
         }
-        let (chunks, remainder) = output.stdout.as_chunks::<2>();
-        if !remainder.is_empty() {
-            eprintln!("deezco: stereo-tool returned an odd byte count, bypassing");
+        let Some(processed) = decode_wav(&output.stdout) else {
+            crate::warn!("deezco: stereo-tool returned non-WAV output, bypassing");
             return None;
-        }
-        let processed: Vec<i16> = chunks.iter().map(|c| i16::from_le_bytes(*c)).collect();
+        };
         if processed.len() != input.len() {
-            eprintln!(
+            crate::warn!(
                 "deezco: stereo-tool returned {} samples for {} in, bypassing",
                 processed.len(),
                 input.len()
@@ -497,5 +529,30 @@ mod tests {
         let mut buf = [0.3, -0.3];
         tool.process(&mut buf).unwrap();
         assert_eq!(buf, [0.3, -0.3]);
+    }
+
+    #[test]
+    fn wav_wrapper_roundtrips_exact_sample_count() {
+        // Regression test: raw PCM through the tool came back ~8192 samples
+        // short (unflushed latency), tripping the length check into bypass.
+        // WAV in -> WAV out must preserve the exact count.
+        let samples: Vec<i16> = (0..4410).map(|i| (i % 32767) as i16).collect();
+        let wav = encode_wav(&samples);
+        assert_eq!(wav.len(), 44 + samples.len() * 2);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let back = decode_wav(&wav).expect("valid WAV must decode");
+        assert_eq!(back, samples);
+    }
+
+    #[test]
+    fn wav_decoder_rejects_non_wav_and_short_input() {
+        assert!(decode_wav(&[]).is_none());
+        assert!(decode_wav(&[0u8; 43]).is_none());
+        assert!(decode_wav(&[0xAAu8; 100]).is_none());
+        // Odd payload after a valid header is rejected.
+        let mut wav = encode_wav(&[1, 2, 3, 4]);
+        wav.push(0xFF);
+        assert!(decode_wav(&wav).is_none());
     }
 }

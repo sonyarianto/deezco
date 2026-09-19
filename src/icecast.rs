@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use reqwest::header;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::api::DeezerApi;
 use crate::audio::{
@@ -27,6 +27,13 @@ use crate::track::{available_format, debug_enabled};
 const META_INTERVAL: usize = 16000;
 /// Size of the audio chunks pushed to Icecast between pacing sleeps.
 const CHUNK_SIZE: usize = 32768;
+/// Pipeline path batches several encoder feeds into one TCP write (~0.5s at
+/// 128 kbps). One feed is ~93ms / ~1.5KB — one packet per feed hits
+/// Nagle/delayed-ACK worst case (up to ~40ms extra per chunk) and drifts the
+/// stream slow until Icecast's queue drains (~1 min symptom). Batching 5-6x
+/// restores large-write behaviour like native passthrough while keeping
+/// latency under a second.
+const PIPELINE_TARGET_BYTES: usize = 8192;
 /// How long to wait before retrying after a transient failure.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// How long to wait before reconnecting after Icecast drops the source.
@@ -663,7 +670,12 @@ struct Producer {
     /// `on_connected`, because a reconnect restarts Icecast's counter at 0.
     meta_remaining: usize,
     prefetch: VecDeque<PrefetchHandle>,
-    sleep_for: Option<Duration>,
+    /// Next wake time for paced audio. Deadline-based (not `sleep(duration)`
+    /// per chunk): the deadline advances by exactly `take/rate` per chunk, so
+    /// encode + TCP time is subtracted from the next sleep instead of
+    /// accumulating as drift. `sleep_until` with a past deadline returns
+    /// immediately (catch-up); a debt over 5s (stall/reconnect) resets.
+    deadline: Option<Instant>,
 }
 
 impl Producer {
@@ -717,8 +729,27 @@ impl Producer {
             current: None,
             meta_remaining: META_INTERVAL,
             prefetch,
-            sleep_for: None,
+            deadline: None,
         })
+    }
+
+    /// Advance the pacing deadline by `take` bytes at `bytes_per_sec`.
+    /// Returns the new deadline; the next `next_chunk` sleeps until it.
+    fn push_deadline(&mut self, prev: Option<Instant>, take: usize, bytes_per_sec: u64) {
+        if take == 0 || bytes_per_sec == 0 {
+            self.deadline = prev;
+            return;
+        }
+        let duration = Duration::from_secs_f64(take as f64 / bytes_per_sec as f64);
+        let now = Instant::now();
+        let base = match prev {
+            // Stall/reconnect debt over 5s: drop it and resume paced from now
+            // instead of spinning without sleep trying to catch up forever.
+            Some(t) if t + Duration::from_secs(5) < now => now,
+            Some(t) => t,
+            None => now,
+        };
+        self.deadline = Some(base + duration);
     }
 
     /// Ensure the first track is loaded and ready. Used before opening the
@@ -861,6 +892,10 @@ impl Producer {
     /// within about a second of connecting.
     fn on_connected(&mut self) {
         self.meta_remaining = META_INTERVAL;
+        // Fresh connection restarts Icecast's byte counter (see above) and
+        // its playout buffer: drop any pacing debt from the reconnect sleep
+        // so the first chunk sends immediately.
+        self.deadline = None;
     }
 
     /// Next body chunk: audio (paced) or a metadata block. `None` never
@@ -869,8 +904,9 @@ impl Producer {
     /// `self.current` (activate/skip), the encoder, and the output buffer
     /// in turns, never overlapping.
     async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, std::io::Error>> {
-        if let Some(dur) = self.sleep_for.take() {
-            sleep(dur).await;
+        let prev_deadline = self.deadline.take();
+        if let Some(deadline) = prev_deadline {
+            sleep_until(deadline).await;
         }
         loop {
             if self.current.is_none() {
@@ -899,6 +935,10 @@ impl Producer {
                     .as_ref()
                     .map(|current| current.title.clone())
                     .unwrap_or_default();
+                // Metadata is overhead, not audio: keep the audio deadline for
+                // the next chunk instead of consuming it (it was already
+                // waited above).
+                self.deadline = prev_deadline;
                 return Some(Ok(icy_metadata_block(&title)));
             }
             let bytes_per_sec = self
@@ -917,12 +957,19 @@ impl Producer {
                     self.current = None;
                     continue;
                 };
-                while self.out_pos >= self.out.len() {
+                // Batch several ~93ms feeds into one ~0.5s TCP write (see
+                // PIPELINE_TARGET_BYTES): one packet per feed hits
+                // Nagle/delayed-ACK and drifts slow. Bounded (8 feeds max) so
+                // a degenerate encoder can't stall the stream filling it.
+                let mut feeds = 0;
+                while self.out.len() - self.out_pos < PIPELINE_TARGET_BYTES && feeds < 8 {
                     let Some(current) = self.current.as_mut() else {
                         break;
                     };
                     match feed_encoder(encoder, &mut self.out, &mut current.audio) {
-                        FeedOutcome::Fed => {}
+                        FeedOutcome::Fed => {
+                            feeds += 1;
+                        }
                         FeedOutcome::TrackDone => {
                             self.current = None;
                             break;
@@ -964,7 +1011,7 @@ impl Producer {
                     self.out.drain(..self.out_pos);
                     self.out_pos = 0;
                 }
-                self.sleep_for = Some(Duration::from_secs_f64(take as f64 / bytes_per_sec as f64));
+                self.push_deadline(prev_deadline, take, bytes_per_sec);
                 return Some(Ok(chunk));
             }
             let Some(current) = self.current.as_mut() else {
@@ -990,7 +1037,7 @@ impl Producer {
             if finished {
                 self.current = None;
             }
-            self.sleep_for = Some(Duration::from_secs_f64(take as f64 / bytes_per_sec as f64));
+            self.push_deadline(prev_deadline, take, bytes_per_sec);
             return Some(Ok(chunk));
         }
     }

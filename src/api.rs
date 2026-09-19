@@ -41,11 +41,13 @@ impl DeezerApi {
             .danger_accept_invalid_certs(true)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .tcp_nodelay(true)
             .build()?;
         let source_client = Client::builder()
             .user_agent(USER_AGENT)
             .danger_accept_invalid_certs(true)
             .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_nodelay(true)
             .build()?;
 
         Ok(Self {

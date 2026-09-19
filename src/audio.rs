@@ -533,7 +533,7 @@ impl SessionEncoder {
             .set_brate(bitrate)
             .map_err(|err| anyhow::anyhow!("LAME bitrate: {err}"))?;
         builder
-            .set_quality(mp3lame_encoder::Quality::Best)
+            .set_quality(mp3lame_encoder::Quality::Good)
             .map_err(|err| anyhow::anyhow!("LAME quality: {err}"))?;
         let inner = builder
             .build()

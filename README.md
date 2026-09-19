@@ -1,5 +1,7 @@
 # Deezco
 
+[![CI](https://github.com/sonyarianto/deezco/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/deezco/actions/workflows/ci.yml)
+
 A fast, lightweight Deezer music downloader written in Rust. Zero runtime dependencies.
 
 ## Features
@@ -354,6 +356,14 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
+
+## Support
+
+If deezco is useful to you, consider supporting its development:
+
+- [GitHub Sponsors](https://github.com/sponsors/sonyarianto)
+- [Buy Me a Coffee](https://buymeacoffee.com/sonyarianto)
+- [Ko-fi](https://ko-fi.com/sonyarianto)
 
 ## License
 

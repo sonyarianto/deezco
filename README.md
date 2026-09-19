@@ -306,6 +306,12 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --bitrate 128
 
+# R128 loudness normalization: every track is measured (ITU-R BS.1770
+# gating) and corrected toward the target before the mix, so consecutive
+# tracks play at one consistent level. -9 hot, -14 streaming, -23 broadcast:
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --crossfade 6 --target-lufs -14
+
 # Broadcast processing via the licensed Thimeo Stereo Tool CLI. Every track
 # runs decode -> Stereo Tool -> encode (needs `lame` too); processor state
 # resets at each track boundary, and a tool failure bypasses the track
@@ -388,6 +394,8 @@ src/
   stereo_lib.rs Persistent in-process libStereoTool backend (dlopen FFI)
   files.rs     Filename sanitizing and audio-file helpers
   icecast.rs   Icecast source client (live streaming, ICY metadata, pacing)
+  loudness.rs  R128 loudness normalization (BS.1770 K-weighting + gating)
+  log.rs       Timestamped logging macros for long-lived processes
   models.rs    Data structures (tracks, playlists, albums, formats)
   output.rs    Human/JSON output formatting (listings, defaults, headers)
   queue.rs     Shuffled per-playlist track queues (shared by serve and stream)
@@ -405,7 +413,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
+- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with R128 loudness normalization, equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--target-lufs`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
 
 ## Support
 

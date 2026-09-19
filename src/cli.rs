@@ -201,6 +201,15 @@ pub enum Commands {
         /// connections on metadata updates (e.g. caster.fm)
         #[arg(long)]
         no_metadata: bool,
+        /// Crossfade duration in seconds (0 = hard cut). Phase 1 plumbs the
+        /// value into the PCM bus; audible fades activate with the Phase 2
+        /// decoder/encoder.
+        #[arg(long, default_value_t = 0.0)]
+        crossfade: f32,
+        /// Static DSP gain in dB (-24..+24), applied post-crossfade
+        /// pre-encode through the processor chain.
+        #[arg(long)]
+        gain_db: Option<f32>,
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,

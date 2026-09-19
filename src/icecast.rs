@@ -11,7 +11,9 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::api::DeezerApi;
+use crate::audio::CrossfadeConfig;
 use crate::download::{FetchedTrack, fetch_track_audio};
+use crate::dsp::{GainProcessor, ProcessorChain};
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
 use crate::track::{available_format, debug_enabled};
@@ -54,6 +56,48 @@ pub struct IcecastConfig {
     pub url: Option<String>,
     pub public: bool,
     pub playlist: String,
+}
+
+/// PCM-bus pipeline configuration (Phase 1: design + tap wiring).
+///
+/// The audio path stays native MP3 passthrough until the Phase 2 decoder /
+/// encoder land; carrying the config through `Producer` now proves the tap
+/// is plumbed and keeps the Phase 2 diff to the decode/mix/encode stages.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineConfig {
+    /// Overlap between consecutive tracks (0 = hard cut, current behaviour).
+    pub crossfade: CrossfadeConfig,
+    /// Static DSP gain in dB, applied post-crossfade pre-encode.
+    pub gain_db: Option<f32>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            crossfade: CrossfadeConfig::disabled(),
+            gain_db: None,
+        }
+    }
+}
+
+impl PipelineConfig {
+    /// Build the post-crossfade processor chain for this config.
+    /// Order is broadcast order: trim gain first, then processors like
+    /// Stereo Tool (Phase 2 appends after the gain stage).
+    pub fn build_chain(&self) -> ProcessorChain {
+        let mut chain = ProcessorChain::new();
+        if let Some(db) = self.gain_db
+            && db != 0.0
+        {
+            chain.push(GainProcessor::new(db));
+        }
+        chain
+    }
+
+    /// True when any stage beyond native passthrough was requested.
+    pub fn is_active(&self) -> bool {
+        self.crossfade.is_enabled() || self.gain_db.is_some_and(|db| db != 0.0)
+    }
 }
 
 /// Out-of-band "now playing" title updates via Icecast's admin metadata
@@ -216,6 +260,16 @@ type PrefetchHandle = JoinHandle<Result<(GwTrack, FetchedTrack)>>;
 /// metadata blocks interleaved every `META_INTERVAL` bytes. The next track is
 /// prefetched on a background task while the current one streams, so track
 /// changes are seamless.
+///
+/// Phase 2 audio path (PCM bus):
+///
+/// ```text
+/// FetchedTrack (MP3) -> FrameDecoder -> PcmBuffer -> Crossfader(crossfade)
+///   -> dsp.process() -> FrameEncoder -> paced MP3 bytes -> Icecast
+/// ```
+///
+/// Until the decoder/encoder land, `crossfade`/`dsp` are carried but the
+/// native passthrough path below is used unchanged.
 struct Producer {
     api: DeezerApi,
     queue: TrackQueue,
@@ -224,6 +278,10 @@ struct Producer {
     updater: Option<TitleUpdater>,
     nominal_bps: u64,
     playlist: String,
+    /// Overlap between consecutive tracks (Phase 2 renders it in PCM).
+    crossfade: CrossfadeConfig,
+    /// Post-crossfade DSP chain (gain now, Stereo Tool in Phase 2).
+    dsp: ProcessorChain,
     /// Actual output bitrate in kbps, resolved per track after Deezer's
     /// quality fallback. Advertised to Icecast so the server's reported
     /// bitrate matches what listeners actually receive (e.g. 128 on a free
@@ -248,6 +306,7 @@ impl Producer {
         metadata: bool,
         updater: Option<TitleUpdater>,
         playlist: String,
+        pipeline: PipelineConfig,
     ) -> Self {
         let nominal_bps = nominal_bytes_per_sec(fetch_format);
         let mut prefetch = VecDeque::new();
@@ -265,6 +324,8 @@ impl Producer {
             updater,
             nominal_bps,
             playlist,
+            crossfade: pipeline.crossfade,
+            dsp: pipeline.build_chain(),
             actual_kbps: None,
             current: None,
             meta_remaining: META_INTERVAL,
@@ -299,8 +360,19 @@ impl Producer {
 
     /// Activate a successfully fetched track: print "now playing", update
     /// the Icecast title, top up the prefetch queue, and set `self.current`.
+    /// Phase 2 renders `self.crossfade` here (overlap the decoded head of
+    /// this track with the PCM tail of the previous one); until the decoder
+    /// lands the flag is only observed for the log line below.
     fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
-        println!("deezco: now playing: {}", track.display_name());
+        if self.crossfade.is_enabled() {
+            println!(
+                "deezco: now playing: {} (crossfade {:.1}s armed, PCM decoder pending)",
+                track.display_name(),
+                self.crossfade.duration_secs
+            );
+        } else {
+            println!("deezco: now playing: {}", track.display_name());
+        }
         if let Some(updater) = &self.updater {
             let updater = updater.clone();
             let title = track.display_name();
@@ -386,6 +458,10 @@ impl Producer {
     /// within about a second of connecting.
     fn on_connected(&mut self) {
         self.meta_remaining = META_INTERVAL;
+        // Stateful DSP (Stereo Tool AGC/loudness in Phase 2) restarts clean
+        // on a new source connection so a reconnect never resumes with
+        // stale processor history.
+        self.dsp.reset();
     }
 
     /// Next body chunk: audio (paced) or a metadata block. `None` never
@@ -421,6 +497,12 @@ impl Producer {
                 self.meta_remaining = META_INTERVAL;
                 return Some(Ok(icy_metadata_block(&current.title)));
             }
+            // PCM BUS TAP (Phase 2): `current.data` is still native MP3.
+            // Once FrameDecoder lands, this region becomes:
+            //   decoded = decoder.decode(current) -> resample to BUS_RATE
+            //   overlapped = Crossfader::blend(prev_tail, decoded.head, crossfade)
+            //   dsp.process(overlapped) -> encoder.encode() -> paced bytes.
+            // Pacing also moves from byte-rate to sample-clock at that point.
             let take = if self.metadata {
                 self.meta_remaining
                     .min(CHUNK_SIZE)
@@ -568,6 +650,7 @@ pub async fn stream(
     format: TrackFormat,
     config: IcecastConfig,
     refresh_secs: u64,
+    pipeline: PipelineConfig,
 ) -> Result<()> {
     if format == TrackFormat::Flac {
         bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
@@ -589,6 +672,18 @@ pub async fn stream(
         config.mount,
         refresh_secs
     );
+    if pipeline.is_active() {
+        if pipeline.crossfade.is_enabled() {
+            println!(
+                "deezco: crossfade requested: {:.1}s ({:?}) — PCM decoder lands in Phase 2; playing passthrough until then",
+                pipeline.crossfade.duration_secs, pipeline.crossfade.curve
+            );
+        }
+        let chain = pipeline.build_chain();
+        if !chain.names().is_empty() {
+            println!("deezco: DSP chain: {}", chain.names().join(" -> "));
+        }
+    }
 
     // The producer outlives individual connections: after a reconnect it
     // resumes the buffered track and its background prefetch, so dropped
@@ -601,6 +696,7 @@ pub async fn stream(
         config.metadata,
         Some(updater.clone()),
         config.playlist.clone(),
+        pipeline,
     )));
 
     let mut reconnect_delay = RECONNECT_DELAY;
@@ -681,5 +777,45 @@ mod tests {
         assert_eq!(native_bitrate(TrackFormat::Mp3_320), Some(320));
         assert_eq!(native_bitrate(TrackFormat::Mp3_128), Some(128));
         assert_eq!(native_bitrate(TrackFormat::Flac), None);
+    }
+
+    #[test]
+    fn pipeline_default_is_native_passthrough() {
+        let pipeline = PipelineConfig::default();
+        assert!(!pipeline.is_active());
+        assert!(pipeline.build_chain().is_empty());
+    }
+
+    #[test]
+    fn pipeline_gain_builds_a_named_chain() {
+        let pipeline = PipelineConfig {
+            crossfade: CrossfadeConfig::disabled(),
+            gain_db: Some(6.0),
+        };
+        assert!(pipeline.is_active());
+        let chain = pipeline.build_chain();
+        assert_eq!(chain.names(), vec!["gain"]);
+    }
+
+    #[test]
+    fn pipeline_crossfade_marks_active_without_chain() {
+        // Crossfade renders in the mixer stage, not the DSP chain: active
+        // pipeline, empty chain.
+        let pipeline = PipelineConfig {
+            crossfade: CrossfadeConfig::new(6.0, crate::audio::CrossfadeCurve::EqualPower),
+            gain_db: None,
+        };
+        assert!(pipeline.is_active());
+        assert!(pipeline.build_chain().is_empty());
+    }
+
+    #[test]
+    fn pipeline_zero_gain_stays_passthrough() {
+        let pipeline = PipelineConfig {
+            crossfade: CrossfadeConfig::disabled(),
+            gain_db: Some(0.0),
+        };
+        assert!(!pipeline.is_active());
+        assert!(pipeline.build_chain().is_empty());
     }
 }

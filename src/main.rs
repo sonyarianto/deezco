@@ -1,10 +1,12 @@
 mod api;
+mod audio;
 mod auth;
 mod batch;
 mod cli;
 mod crypto;
 mod dedupe;
 mod download;
+mod dsp;
 mod files;
 mod icecast;
 mod models;
@@ -563,6 +565,8 @@ async fn main() -> Result<()> {
             url,
             public,
             no_metadata,
+            crossfade,
+            gain_db,
             refresh_secs,
         } => {
             let password = password.or_else(|| {
@@ -575,6 +579,18 @@ async fn main() -> Result<()> {
                     "an Icecast source password is required (--password or DEEZCO_ICECAST_PASSWORD)"
                 );
             };
+            if !(0.0..=crate::audio::MAX_CROSSFADE_SECS).contains(&crossfade) || crossfade.is_nan()
+            {
+                anyhow::bail!(
+                    "--crossfade must be between 0 and {} seconds",
+                    crate::audio::MAX_CROSSFADE_SECS
+                );
+            }
+            if let Some(db) = gain_db
+                && !(-24.0..=24.0).contains(&db)
+            {
+                anyhow::bail!("--gain-db must be between -24 and +24 dB");
+            }
             let config = icecast::IcecastConfig {
                 server,
                 mount,
@@ -587,7 +603,14 @@ async fn main() -> Result<()> {
                 public,
                 playlist: extract_id(&playlist, "playlist"),
             };
-            icecast::stream(api, format, config, refresh_secs).await?;
+            let pipeline = icecast::PipelineConfig {
+                crossfade: crate::audio::CrossfadeConfig::new(
+                    crossfade,
+                    crate::audio::CrossfadeCurve::EqualPower,
+                ),
+                gain_db,
+            };
+            icecast::stream(api, format, config, refresh_secs, pipeline).await?;
         }
     }
 

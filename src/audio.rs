@@ -8,17 +8,13 @@
 //! ```
 //!
 //! Ships the bus types, the pure crossfade math, and both converters:
-//! `SymphoniaDecoder` (pure Rust, no runtime deps) and `LameEncoder`
-//! (external `lame` binary, opt-in — only spawned when the pipeline is
-//! active). What remains is driving them from `Producer` (decode->
-//! crossfade->process->encode per track) instead of native passthrough.
+//! `SymphoniaDecoder` (pure Rust) and `SessionEncoder` (statically linked
+//! LAME) — the whole loop stays in-process with zero runtime dependencies.
 
 // Scaffolding allow: covers bus API surface that unit tests exercise but
 // production constructs only on some paths (e.g. alternate curve variants,
 // future taps); remove it as coverage converges.
 #![allow(dead_code)]
-
-use std::io::Write;
 
 use anyhow::{Context, Result};
 
@@ -433,112 +429,111 @@ pub fn render_track_overlap(
     (out, new_tail)
 }
 
-/// [`PcmBuffer`] -> CBR MP3 bytes at one fixed bitrate for the whole
-/// Icecast session (constant encoder settings — required so listeners
-/// never hear a format switch mid-stream).
-pub trait FrameEncoder: Send + Sync {
-    /// Encoder name for logs (e.g. `"lame"`).
-    fn name(&self) -> &str;
-    /// Output bitrate in kbps.
-    fn bitrate_kbps(&self) -> u32;
-    /// Encode bus PCM to MP3.
-    fn encode(&self, pcm: &PcmBuffer) -> Result<Vec<u8>>;
+/// Nearest LAME CBR bitrate around `kbps` (the encoder only offers the 16
+/// discrete MPEG rates; ties resolve downward). Mirrors the mapping in
+/// CrabBoss (`crabboss/crates/core/src/stream/encoder_mp3.rs`).
+pub fn nearest_bitrate(kbps: u32) -> mp3lame_encoder::Bitrate {
+    use mp3lame_encoder::Bitrate::*;
+    const ALL: [(u32, mp3lame_encoder::Bitrate); 16] = [
+        (8, Kbps8),
+        (16, Kbps16),
+        (24, Kbps24),
+        (32, Kbps32),
+        (40, Kbps40),
+        (48, Kbps48),
+        (64, Kbps64),
+        (80, Kbps80),
+        (96, Kbps96),
+        (112, Kbps112),
+        (128, Kbps128),
+        (160, Kbps160),
+        (192, Kbps192),
+        (224, Kbps224),
+        (256, Kbps256),
+        (320, Kbps320),
+    ];
+    ALL.iter()
+        .min_by_key(|(v, _)| v.abs_diff(kbps))
+        .map(|(_, b)| *b)
+        .unwrap_or(Kbps128)
 }
 
-/// [`FrameEncoder`] backed by the external `lame` binary (opt-in runtime
-/// dependency: required only when the PCM pipeline is active — native MP3
-/// passthrough never spawns it).
+/// Session-persistent MP3 encoder: arbitrary interleaved stereo `f32`
+/// chunks in, complete CBR MP3 bytes out. One instance lives for the whole
+/// Icecast session, so the encoder delay is paid once at startup and the
+/// bit reservoir stays continuous — track boundaries never exist at the
+/// MP3 level, which is what finally kills the splice click that per-track
+/// encodes (fresh delay + padding + reservoir every track) produce.
 ///
-/// Bus PCM (`f32`) is converted to 16-bit stereo, wrapped in a minimal WAV
-/// container so LAME reads rate/channels from the header instead of flags,
-/// and piped through `lame --silent -b <bitrate> - -`.
-///
-/// Blocking by design (plain `std::process`): async callers must run it
-/// under `spawn_blocking` so the stream pacer never stalls.
-pub struct LameEncoder {
-    bitrate: u32,
+/// Same backend family as CrabBoss (`mp3lame-encoder`, statically linked
+/// LAME — no runtime binary). Feed progressively from the streaming path;
+/// never flush between tracks (flush writes padding and breaks continuity).
+pub struct SessionEncoder {
+    inner: mp3lame_encoder::Encoder,
+    out: Vec<u8>,
+    bitrate_kbps: u32,
 }
 
-impl LameEncoder {
-    /// Lowest / highest CBR bitrate LAME accepts for MP3.
-    pub const MIN_BITRATE: u32 = 8;
-    /// Lowest / highest CBR bitrate LAME accepts for MP3.
-    pub const MAX_BITRATE: u32 = 320;
-
-    /// Build an encoder for `bitrate` kbps; rejects anything outside
-    /// 8..=320 before LAME ever runs.
-    pub fn new(bitrate: u32) -> Result<Self> {
-        if !(Self::MIN_BITRATE..=Self::MAX_BITRATE).contains(&bitrate) {
-            anyhow::bail!(
-                "LAME bitrate must be between {} and {} kbps, got {bitrate}",
-                Self::MIN_BITRATE,
-                Self::MAX_BITRATE
-            );
-        }
-        Ok(Self { bitrate })
+impl SessionEncoder {
+    /// Build a session CBR encoder for `kbps` (snapped to the nearest
+    /// discrete MPEG rate) at the bus rate, best quality, no ID3/tag.
+    pub fn new(kbps: u32) -> Result<Self> {
+        let bitrate = nearest_bitrate(kbps);
+        let mut builder =
+            mp3lame_encoder::Builder::new().context("LAME: failed to allocate encoder")?;
+        builder
+            .set_num_channels(2)
+            .map_err(|err| anyhow::anyhow!("LAME channels: {err}"))?;
+        builder
+            .set_sample_rate(BUS_RATE)
+            .map_err(|err| anyhow::anyhow!("LAME rate {BUS_RATE}: {err}"))?;
+        builder
+            .set_brate(bitrate)
+            .map_err(|err| anyhow::anyhow!("LAME bitrate: {err}"))?;
+        builder
+            .set_quality(mp3lame_encoder::Quality::Best)
+            .map_err(|err| anyhow::anyhow!("LAME quality: {err}"))?;
+        let inner = builder
+            .build()
+            .map_err(|err| anyhow::anyhow!("LAME init: {err}"))?;
+        Ok(Self {
+            inner,
+            out: Vec::with_capacity(16_384),
+            bitrate_kbps: bitrate as u32,
+        })
     }
 
-    /// True when the `lame` binary runs on this machine. Check at startup
-    /// (before opening the Icecast connection) so a missing binary fails
-    /// fast instead of mid-stream.
-    pub fn is_available() -> bool {
-        std::process::Command::new("lame")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-}
-
-impl FrameEncoder for LameEncoder {
-    fn name(&self) -> &str {
-        "lame"
+    /// Actual session bitrate (the snapped rate, for Icecast advertising).
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
     }
 
-    fn bitrate_kbps(&self) -> u32 {
-        self.bitrate
-    }
-
-    fn encode(&self, pcm: &PcmBuffer) -> Result<Vec<u8>> {
+    /// Feed interleaved stereo `f32` (even length); returns the MP3 bytes
+    /// completed by this feed — possibly empty while an MP3 frame is still
+    /// filling. Output framing depends only on stream position, never on
+    /// feed boundaries, so chunking is click-free by construction.
+    pub fn encode_chunk(&mut self, pcm: &[f32]) -> Result<&[u8]> {
+        self.out.clear();
         if pcm.is_empty() {
-            anyhow::bail!("cannot encode empty PCM buffer");
+            return Ok(&self.out);
         }
-        let s16 = f32_to_s16_stereo(pcm.samples());
-        let mut wav = wav_header(s16.len() * 2, BUS_RATE);
-        wav.extend(s16.iter().flat_map(|s| s.to_le_bytes()));
+        debug_assert_eq!(pcm.len() % 2, 0, "stereo frames are always even");
+        self.out
+            .reserve(mp3lame_encoder::max_required_buffer_size(pcm.len() / 2));
+        self.inner
+            .encode_to_vec(mp3lame_encoder::InterleavedPcm(pcm), &mut self.out)
+            .map_err(|err| anyhow::anyhow!("LAME encode failed: {err}"))?;
+        Ok(&self.out)
+    }
 
-        let mut child = std::process::Command::new("lame")
-            .args(["--silent", "-b", &self.bitrate.to_string(), "-", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| anyhow::anyhow!("failed to start lame: {err}"))?;
-        // Writer thread + wait_with_output drain concurrently: a full track
-        // (~35 MB WAV) never fits in a 64 KB pipe, so sequential
-        // write-then-wait deadlocks (parent blocks on stdin while lame
-        // blocks on stdout).
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let writer = std::thread::spawn(move || stdin.write_all(&wav));
-        let output = child
-            .wait_with_output()
-            .map_err(|err| anyhow::anyhow!("failed to read lame output: {err}"))?;
-        writer
-            .join()
-            .map_err(|_| anyhow::anyhow!("lame stdin writer panicked"))?
-            .map_err(|err| anyhow::anyhow!("failed to feed PCM to lame: {err}"))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "lame failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        if output.stdout.is_empty() {
-            anyhow::bail!("lame produced no MP3 output");
-        }
-        Ok(output.stdout)
+    /// Flush the tail (padding frames). Only for a clean shutdown — never
+    /// between tracks.
+    pub fn flush(&mut self) -> &[u8] {
+        self.out.clear();
+        let _ = self
+            .inner
+            .flush_to_vec::<mp3lame_encoder::FlushNoGap>(&mut self.out);
+        &self.out
     }
 }
 
@@ -885,45 +880,79 @@ mod tests {
     }
 
     #[test]
-    fn lame_encoder_validates_bitrate_before_spawning() {
-        assert!(LameEncoder::new(128).is_ok());
-        assert!(LameEncoder::new(8).is_ok());
-        assert!(LameEncoder::new(320).is_ok());
-        assert!(LameEncoder::new(0).is_err());
-        assert!(LameEncoder::new(7).is_err());
-        assert!(LameEncoder::new(321).is_err());
-        assert_eq!(LameEncoder::new(96).unwrap().bitrate_kbps(), 96);
-        assert_eq!(LameEncoder::new(96).unwrap().name(), "lame");
+    fn nearest_bitrate_snaps_to_mpeg_rates() {
+        // `Bitrate` carries no PartialEq/Debug, so compare discriminants
+        // (which are the kbps values by construction).
+        assert_eq!(nearest_bitrate(128) as u32, 128);
+        assert_eq!(nearest_bitrate(320) as u32, 320);
+        assert_eq!(nearest_bitrate(8) as u32, 8);
+        assert_eq!(nearest_bitrate(96) as u32, 96);
+        assert_eq!(nearest_bitrate(100) as u32, 96);
+        // Exact tie resolves downward (first minimum wins).
+        assert_eq!(nearest_bitrate(104) as u32, 96);
+        // Out-of-range clamps to the ends, never panics.
+        assert_eq!(nearest_bitrate(0) as u32, 8);
+        assert_eq!(nearest_bitrate(9999) as u32, 320);
     }
 
     #[test]
-    fn lame_encoder_rejects_empty_pcm_without_spawning() {
+    fn session_encoder_reports_snapped_rate() {
+        assert_eq!(SessionEncoder::new(128).unwrap().bitrate_kbps(), 128);
+        assert_eq!(SessionEncoder::new(100).unwrap().bitrate_kbps(), 96);
+    }
+
+    #[test]
+    fn session_encoder_empty_feed_yields_nothing() {
+        let mut enc = SessionEncoder::new(128).unwrap();
+        assert!(enc.encode_chunk(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_encoder_empty_pcm_buffer_yields_nothing() {
         let pcm = PcmBuffer::new();
-        assert!(LameEncoder::new(128).unwrap().encode(&pcm).is_err());
+        let mut enc = SessionEncoder::new(128).unwrap();
+        assert!(enc.encode_chunk(pcm.samples()).unwrap().is_empty());
     }
 
-    /// PCM -> MP3 smoke test: needs LAME on PATH. Run with
-    /// `cargo test -- --ignored encode_pcm_to_mp3`.
+    /// THE gapless proof: one 2 s sine fed whole vs fed in two halves must
+    /// produce byte-identical MP3 — chunk boundaries never exist at the
+    /// MP3 level, so track boundaries encoded progressively cannot click.
     #[test]
-    #[ignore = "requires lame on PATH"]
-    fn encode_pcm_to_mp3_produces_mp3_frames() {
-        assert!(LameEncoder::is_available(), "lame must be on PATH");
+    fn session_encoder_split_feeds_match_whole_feed() {
+        let sine: Vec<f32> = (0..44100 * 2)
+            .flat_map(|i| {
+                let t = i as f32 / 44100.0;
+                let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        let mut whole = SessionEncoder::new(128).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(whole.encode_chunk(&sine).unwrap());
+
+        let mut split = SessionEncoder::new(128).unwrap();
+        let mut actual = Vec::new();
+        let mid = sine.len() / 2;
+        actual.extend_from_slice(split.encode_chunk(&sine[..mid]).unwrap());
+        actual.extend_from_slice(split.encode_chunk(&sine[mid..]).unwrap());
+
+        assert!(!expected.is_empty(), "encoder produced no output");
+        assert_eq!(actual, expected, "split feeds must match the whole feed");
+    }
+
+    /// Full bus loop PCM -> MP3 -> PCM, all in-process (no binaries).
+    /// Runs unignored: the whole loop is now linked code.
+    #[test]
+    fn bus_roundtrip_preserves_audible_sine() {
         let pcm = PcmBuffer::from_interleaved(i16_to_f32_stereo(&sine_pcm_i16()));
-        let mp3 = LameEncoder::new(128).unwrap().encode(&pcm).unwrap();
-        assert!(!mp3.is_empty(), "lame produced no output");
+        let mut enc = SessionEncoder::new(128).unwrap();
+        let mut mp3 = Vec::new();
+        mp3.extend_from_slice(enc.encode_chunk(pcm.samples()).unwrap());
+        mp3.extend_from_slice(enc.flush());
+        assert!(!mp3.is_empty(), "encoder produced no output");
         // MP3 frame sync (11 set bits), no ID3 tag requested.
         assert_eq!(mp3[0], 0xFF);
         assert_eq!(mp3[1] & 0xE0, 0xE0, "second byte must carry frame sync");
-    }
-
-    /// Full bus loop PCM -> MP3 -> PCM: needs LAME on PATH. Run with
-    /// `cargo test -- --ignored bus_roundtrip`.
-    #[test]
-    #[ignore = "requires lame on PATH"]
-    fn bus_roundtrip_preserves_audible_sine() {
-        assert!(LameEncoder::is_available(), "lame must be on PATH");
-        let pcm = PcmBuffer::from_interleaved(i16_to_f32_stereo(&sine_pcm_i16()));
-        let mp3 = LameEncoder::new(128).unwrap().encode(&pcm).unwrap();
         let back = SymphoniaDecoder::new()
             .decode(&mp3)
             .expect("decode the encoded MP3");

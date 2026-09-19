@@ -202,7 +202,7 @@ pub enum Commands {
         #[arg(long)]
         no_metadata: bool,
         /// Crossfade duration in seconds (0 = hard cut). Rendered as an
-        /// equal-power overlap in the PCM bus; needs the `lame` binary.
+        /// equal-power overlap in the PCM bus feeding the session encoder.
         #[arg(long, default_value_t = 0.0)]
         crossfade: f32,
         /// Static DSP gain in dB (-24..+24), applied post-crossfade
@@ -211,17 +211,18 @@ pub enum Commands {
         gain_db: Option<f32>,
         /// R128 loudness target in LUFS (-23..-6). Each track is measured
         /// and corrected toward the target before the mix; unmeasurable
-        /// tracks pass through. Needs `lame` too. Example: `--target-lufs -14`.
+        /// tracks pass through. Example: `--target-lufs -14`.
         #[arg(long)]
         target_lufs: Option<f32>,
-        /// Session MP3 bitrate in kbps (8..=320) when the pipeline is active;
+        /// Session MP3 bitrate in kbps (8..=320) when the pipeline is active,
+        /// snapped to the nearest discrete MPEG rate (e.g. 100 -> 96);
         /// also activates the pipeline alone as a transcode. Without pipeline
         /// flags, 128/320 keep streaming natively.
         #[arg(long)]
         bitrate: Option<u32>,
         /// Path to the Thimeo Stereo Tool CLI binary (stereo_tool_cmd_64).
-        /// Runs every track through it (decode -> process -> encode) and
-        /// activates the pipeline; needs `lame` too. State resets per track.
+        /// Runs every track through it (decode -> process -> session encode)
+        /// and activates the pipeline. State resets per track.
         /// Conflicts with `--stereo-tool-lib` (pick one backend).
         #[arg(long, conflicts_with = "stereo_tool_lib")]
         stereo_tool: Option<PathBuf>,
@@ -230,7 +231,7 @@ pub enum Commands {
         /// In-process alternative to `--stereo-tool`: no per-track spawn, no
         /// pipe roundtrip, key stays out of `ps aux`, and processor state can
         /// persist across tracks (see `--stereo-tool-reset-track`). Shares
-        /// `--stereo-tool-sts` / `--stereo-tool-key`; needs `lame` too.
+        /// `--stereo-tool-sts` / `--stereo-tool-key`.
         #[arg(long, conflicts_with = "stereo_tool")]
         stereo_tool_lib: Option<PathBuf>,
         /// Reset the `libStereoTool` processor state on each track boundary,

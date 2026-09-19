@@ -12,8 +12,8 @@ use tokio::time::sleep;
 
 use crate::api::DeezerApi;
 use crate::audio::{
-    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, PcmBuffer,
-    SymphoniaDecoder, render_track_overlap,
+    BUS_RATE, CrossfadeConfig, FrameDecoder, SessionEncoder, SymphoniaDecoder, nearest_bitrate,
+    render_track_overlap,
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
@@ -130,11 +130,14 @@ impl PipelineConfig {
     }
 
     /// The one CBR bitrate the whole session encodes at when the pipeline
-    /// is active: the explicit override, else the fetched format's native
-    /// rate (320 for lossless sources fetched as MP3).
+    /// is active: the explicit override snapped to a discrete MPEG rate,
+    /// else the fetched format's native rate (320 for lossless sources
+    /// fetched as MP3). This is the exact advertised rate.
     pub fn encode_bitrate(&self, fetch_format: TrackFormat) -> u32 {
-        self.bitrate
-            .unwrap_or_else(|| native_bitrate(fetch_format).unwrap_or(320))
+        nearest_bitrate(
+            self.bitrate
+                .unwrap_or_else(|| native_bitrate(fetch_format).unwrap_or(320)),
+        ) as u32
     }
 }
 
@@ -272,14 +275,20 @@ async fn prepare_track_audio(
 }
 
 /// Ordered handoff between consecutive prefetch tasks: the held PCM tail of
-/// the previous track plus a sequence number. Tasks decode and encode fully
-/// in parallel; only the microsecond mix-and-publish step is ordered, so a
-/// slow LAME encode never serializes the pipeline.
+/// the previous track plus two sequence numbers. Tasks decode and DSP fully
+/// in parallel; only the microsecond mix-and-publish step and the shared
+/// libStereoTool invocations are ordered, so slow work never serializes
+/// more than correctness requires.
 #[derive(Default)]
 struct XfadeShared {
     /// How many tracks have published their tail. Task `seq` may render once
     /// `version == seq`; the first track (seq 0) proceeds immediately.
     version: u64,
+    /// How many tracks have finished the shared libStereoTool call. The lib
+    /// instance is persistent (broadcast-continuous state), so invocations
+    /// must follow stream order even though tasks run concurrently. Unused
+    /// (stays 0) unless ordered DSP is armed.
+    dsp_version: u64,
     /// Held tail of the last published track (interleaved stereo f32).
     tail: Vec<f32>,
 }
@@ -296,12 +305,25 @@ async fn claim_turn(shared: &Arc<Mutex<XfadeShared>>, seq: u64) {
     }
 }
 
-/// A failed task must still let the sequence move past it, or every later
+/// Wait until every earlier track has finished its shared libStereoTool
+/// call, keeping the persistent instance's state in stream order.
+/// Same polling rationale as `claim_turn`.
+async fn claim_dsp_turn(shared: &Arc<Mutex<XfadeShared>>, seq: u64) {
+    loop {
+        if shared.lock().await.dsp_version == seq {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A failed task must still let both sequences move past it, or every later
 /// task would wait forever. The held tail is left untouched: it still
 /// belongs to the last good track, which is exactly the streamed boundary.
 async fn advance_past(shared: &Arc<Mutex<XfadeShared>>, seq: u64) {
     let mut guard = shared.lock().await;
     guard.version = guard.version.max(seq + 1);
+    guard.dsp_version = guard.dsp_version.max(seq + 1);
 }
 
 /// Everything one prefetch task needs. Bundled so `fetch_next_track` stays
@@ -330,16 +352,26 @@ struct PipelineRuntime {
     stereo_lib: Option<Arc<std::sync::Mutex<crate::stereo_lib::StereoLibHandle>>>,
 }
 
+/// What one prefetch task delivers: native MP3 bytes straight through, or
+/// bus PCM (decoded, leveled, mixed, DSP-processed) waiting on the session
+/// encoder in the streaming path. Encoding itself is progressive and lives
+/// with the `Producer`, never in a task, so no track boundary ever exists
+/// at the MP3 level.
+enum PreparedAudio {
+    Native(Vec<u8>),
+    Pcm(Vec<f32>),
+}
+
 /// Fetch the next track from the queue and prepare its audio: native MP3
-/// passthrough by default, or the full decode → crossfade → DSP → CBR
-/// encode path when the pipeline is active. Slow CPU work (decode, LAME)
-/// runs on blocking threads inside the background task, so track changes
-/// stay instant on the streaming path.
+/// passthrough by default, or decode → loudnorm → crossfade → DSP when the
+/// pipeline is active (the session encoder downstream turns PCM into
+/// continuous CBR). Slow CPU work runs on blocking threads inside the
+/// background task, so track changes stay instant on the streaming path.
 ///
 /// Every slow stage logs start/finish with timings: without them a
-/// multi-minute Stereo Tool encode looks like a hang (the exact symptom
+/// multi-minute Stereo Tool process looks like a hang (the exact symptom
 /// this fixes — previously only the download had a debug line).
-async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
+async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
     let track = ctx
         .queue
         .next_track(&ctx.api, &ctx.playlist)
@@ -356,7 +388,7 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
         }
     };
     if !ctx.runtime.pipeline.is_active() {
-        return Ok((track, fetched));
+        return Ok((track, PreparedAudio::Native(fetched.data)));
     }
     let title = track.display_name();
     let mp3_len = fetched.data.len();
@@ -438,9 +470,8 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     } else {
         pcm.into_samples()
     };
-    let pipeline = ctx.runtime.pipeline;
-    let encode_bps = ctx.runtime.encode_bps;
-    let stereo_lib = ctx.runtime.stereo_lib;
+    let pipeline = ctx.runtime.pipeline.clone();
+    let stereo_lib = ctx.runtime.stereo_lib.clone();
     let mut label_chain = pipeline.build_chain();
     if let Some(shared) = &stereo_lib {
         label_chain.push(crate::stereo_lib::StereoLibProcessor::shared(
@@ -453,19 +484,29 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     }
     let chain_names = label_chain.names().join(" -> ");
     let dsp_label = if chain_names.is_empty() {
-        "encode".to_string()
+        "ready".to_string()
     } else {
-        format!("DSP ({chain_names}) + encode")
+        format!("DSP ({chain_names})")
     };
     let frames = out_pcm.len() / 2;
-    crate::info!(
-        "deezco: {dsp_label} \"{title}\" ({} frames -> {encode_bps} kbps CBR)...",
-        frames,
-    );
+    crate::info!("deezco: {dsp_label} \"{title}\" ({frames} frames)...",);
     let process_started = std::time::Instant::now();
+    // Ordered DSP for the shared libStereoTool instance: continuity
+    // requires stream order even though prefetch tasks run concurrently.
+    // The tail version above already moved, so only the DSP turn waits.
+    let ordered_dsp = ctx.runtime.stereo_lib.is_some()
+        && !ctx
+            .runtime
+            .pipeline
+            .stereo_lib
+            .as_ref()
+            .is_some_and(|config| config.reset_per_track);
+    if ordered_dsp {
+        claim_dsp_turn(&ctx.runtime.xfade, ctx.seq).await;
+    }
     // The version was already published above, so `advance_past` here is a
     // harmless no-op that only guards the non-crossfade path ordering.
-    let encode_join = tokio::task::spawn_blocking(move || {
+    let dsp_join = tokio::task::spawn_blocking(move || {
         let mut chain = pipeline.build_chain();
         if let Some(shared) = &stereo_lib {
             chain.push(crate::stereo_lib::StereoLibProcessor::shared(
@@ -478,15 +519,23 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
         }
         let mut out = out_pcm;
         chain.process(&mut out)?;
-        LameEncoder::new(encode_bps)?.encode(&PcmBuffer::from_interleaved(out))
+        Ok(out)
     })
     .await;
-    let data = match encode_join {
+    // Advance the DSP turn on every path past the wait — success, DSP
+    // failure, or a panicked worker — or the next task waits forever.
+    // Encoding itself moved to the streaming path (session encoder), so
+    // this task's slow work ends here and activation stays instant.
+    if ordered_dsp {
+        let mut shared = ctx.runtime.xfade.lock().await;
+        shared.dsp_version = shared.dsp_version.max(ctx.seq + 1);
+    }
+    let data = match dsp_join {
         Ok(Ok(data)) => {
             crate::info!(
-                "deezco: ready \"{title}\" in {:.1}s ({} bytes MP3)",
+                "deezco: ready \"{title}\" in {:.1}s ({} frames PCM)",
                 process_started.elapsed().as_secs_f32(),
-                data.len(),
+                data.len() / 2,
             );
             data
         }
@@ -496,22 +545,70 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
         }
         Err(join_err) => {
             advance_past(&ctx.runtime.xfade, ctx.seq).await;
-            return Err(anyhow::anyhow!("encode task panicked: {join_err}"));
+            return Err(anyhow::anyhow!("DSP task panicked: {join_err}"));
         }
     };
-    Ok((track, FetchedTrack { data }))
+    Ok((track, PreparedAudio::Pcm(data)))
 }
 
-/// The audio track currently being pushed, with pacing state.
+/// The audio track currently being pushed: native MP3 bytes straight
+/// through, or bus PCM waiting on the session encoder.
+enum CurrentAudio {
+    Native { data: Vec<u8>, pos: usize },
+    Pcm { samples: Vec<f32>, pos: usize },
+}
+
+/// A track on the wire, with pacing state. On the pipeline path the PCM
+/// here is already mixed and DSP-processed; the session encoder below turns
+/// it into continuous CBR progressively.
 struct CurrentTrack {
     title: String,
-    data: Vec<u8>,
-    pos: usize,
+    audio: CurrentAudio,
     bytes_per_sec: u64,
 }
 
 /// Background task that fetches and prepares the next track.
-type PrefetchHandle = JoinHandle<Result<(GwTrack, FetchedTrack)>>;
+type PrefetchHandle = JoinHandle<Result<(GwTrack, PreparedAudio)>>;
+
+/// How many stereo frames each progressive encode feed covers (~93 ms —
+/// several MP3 frames per call, small enough to stay responsive).
+const FEED_FRAMES: usize = 4096;
+
+/// Outcome of one progressive encode feed. A free function (not a method)
+/// so the encoder, the output buffer, and the track audio borrow as three
+/// disjoint `&mut`s — a method on `Producer` could not split them.
+enum FeedOutcome {
+    /// Feed encoded; output appended (possibly empty on partial frames).
+    Fed,
+    /// Track PCM exhausted; the caller drops the track.
+    TrackDone,
+    /// Non-PCM audio reached the encoder; the caller drops the track loudly.
+    Mismatch,
+    /// Encoder failure; the caller drops the track loudly.
+    EncodeFailed(String),
+}
+
+/// Encode one feed of the current track into the shared output buffer.
+fn feed_encoder(
+    encoder: &mut SessionEncoder,
+    out: &mut Vec<u8>,
+    audio: &mut CurrentAudio,
+) -> FeedOutcome {
+    let CurrentAudio::Pcm { samples, pos } = audio else {
+        return FeedOutcome::Mismatch;
+    };
+    if *pos >= samples.len() {
+        return FeedOutcome::TrackDone;
+    }
+    let end = (*pos + FEED_FRAMES * 2).min(samples.len());
+    let bytes = match encoder.encode_chunk(&samples[*pos..end]) {
+        Ok(bytes) => bytes.to_vec(),
+        Err(err) => return FeedOutcome::EncodeFailed(err.to_string()),
+    };
+    *pos = end;
+    out.extend_from_slice(&bytes);
+    FeedOutcome::Fed
+}
 
 /// Produces the endless source body for Icecast: paced audio chunks with ICY
 /// metadata blocks interleaved every `META_INTERVAL` bytes. The next track is
@@ -519,11 +616,12 @@ type PrefetchHandle = JoinHandle<Result<(GwTrack, FetchedTrack)>>;
 /// changes are seamless.
 ///
 /// Two audio paths: native MP3 passthrough (default), or — when the pipeline
-/// is active — prefetch tasks deliver CBR MP3 rendered as decode →
-/// crossfade → DSP → encode, with the crossfade tails handed from one task
-/// to the next in activation order (`XfadeShared`). Either way `next_chunk`
-/// below only ever sees final MP3 bytes, so pacing and ICY framing are
-/// identical on both paths (and exact on CBR output).
+/// is active — prefetch tasks deliver processed PCM (decode → loudnorm →
+/// crossfade → DSP) and the session encoder below turns the endless PCM
+/// stream into continuous CBR. The encoder never resets between tracks, so
+/// no boundary exists at the MP3 level: no fresh delay, no padding, no
+/// reservoir restart — the splice click is gone by construction. ICY
+/// framing counts output bytes on both paths, so metadata stays aligned.
 struct Producer {
     api: DeezerApi,
     queue: TrackQueue,
@@ -534,6 +632,13 @@ struct Producer {
     playlist: String,
     /// Session pipeline config plus the shared crossfade handoff.
     runtime: PipelineRuntime,
+    /// Session CBR encoder (`None` on native passthrough). Lives for the
+    /// whole `Producer`: reconnects resume it, tracks never reset it.
+    encoder: Option<SessionEncoder>,
+    /// Encoder output bytes not yet pushed. Partial MP3 frames carry across
+    /// track boundaries here — that carry-over IS the seamless splice.
+    out: Vec<u8>,
+    out_pos: usize,
     /// Sequence number for the next spawned prefetch task.
     next_seq: u64,
     /// Actual output bitrate in kbps. Native path: resolved per track after
@@ -561,7 +666,7 @@ impl Producer {
         updater: Option<TitleUpdater>,
         playlist: String,
         runtime: PipelineRuntime,
-    ) -> Self {
+    ) -> Result<Self> {
         // CBR pipeline output paces exactly at the encode rate; native
         // passthrough falls back to the fetched format's nominal rate when
         // a track reports no duration.
@@ -570,6 +675,13 @@ impl Producer {
         } else {
             nominal_bytes_per_sec(fetch_format)
         };
+        // One encoder for the session, built before the first prefetch so a
+        // bad bitrate fails here instead of mid-stream.
+        let encoder = runtime
+            .pipeline
+            .is_active()
+            .then(|| SessionEncoder::new(runtime.encode_bps))
+            .transpose()?;
         let mut prefetch = VecDeque::new();
         prefetch.push_back(tokio::spawn(fetch_next_track(TaskCtx {
             api: api.clone(),
@@ -579,7 +691,7 @@ impl Producer {
             seq: 0,
             runtime: runtime.clone(),
         })));
-        Self {
+        Ok(Self {
             api,
             queue,
             fetch_format,
@@ -588,13 +700,16 @@ impl Producer {
             nominal_bps,
             playlist,
             runtime,
+            encoder,
+            out: Vec::new(),
+            out_pos: 0,
             next_seq: 1,
             actual_kbps: None,
             current: None,
             meta_remaining: META_INTERVAL,
             prefetch,
             sleep_for: None,
-        }
+        })
     }
 
     /// Ensure the first track is loaded and ready. Used before opening the
@@ -627,11 +742,11 @@ impl Producer {
     /// Number of tracks prefetched ahead of the current one.
     const PREFETCH_AHEAD: usize = 2;
 
-    /// Activate a successfully fetched track: print "now playing", update
-    /// the Icecast title, top up the prefetch queue, and set `self.current`.
-    /// On the pipeline path the audio already carries its rendered overlap
-    /// (mixed in the background task), so activation stays instant here.
-    fn activate_track(&mut self, track: GwTrack, fetched: FetchedTrack) {
+    /// Activate prepared audio: print "now playing", update the Icecast
+    /// title, top up the prefetch queue, and set `self.current`. Stays
+    /// instant: heavy work (decode/DSP) already happened in the task, and
+    /// encoding is progressive downstream.
+    fn activate_track(&mut self, track: GwTrack, audio: PreparedAudio) {
         if self.runtime.pipeline.crossfade.is_enabled() {
             crate::info!(
                 "deezco: now playing: \"{}\" (crossfade {:.1}s)",
@@ -668,15 +783,22 @@ impl Producer {
         } else {
             native_bitrate(available_format(&track, self.fetch_format)).unwrap_or(128)
         });
+        let (audio, bytes_per_sec) = match audio {
+            PreparedAudio::Native(data) => {
+                let rate = bytes_per_sec(data.len(), track.duration_secs(), self.nominal_bps);
+                (CurrentAudio::Native { data, pos: 0 }, rate)
+            }
+            // CBR output paces exactly at the session rate; duration math
+            // would only re-derive the same number through rounding.
+            PreparedAudio::Pcm(samples) => (
+                CurrentAudio::Pcm { samples, pos: 0 },
+                u64::from(self.runtime.encode_bps) * 1000 / 8,
+            ),
+        };
         self.current = Some(CurrentTrack {
             title: track.display_name(),
-            bytes_per_sec: bytes_per_sec(
-                fetched.data.len(),
-                track.duration_secs(),
-                self.nominal_bps,
-            ),
-            data: fetched.data,
-            pos: 0,
+            audio,
+            bytes_per_sec,
         });
         // Note: `meta_remaining` intentionally lives on the Producer and is
         // carried across track changes — the ICY interval must stay
@@ -737,6 +859,9 @@ impl Producer {
 
     /// Next body chunk: audio (paced) or a metadata block. `None` never
     /// happens — errors are logged and retried so the stream never ends.
+    /// Borrows are kept to single statements throughout: the loop mutates
+    /// `self.current` (activate/skip), the encoder, and the output buffer
+    /// in turns, never overlapping.
     async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, std::io::Error>> {
         if let Some(dur) = self.sleep_for.take() {
             sleep(dur).await;
@@ -761,26 +886,99 @@ impl Producer {
                     );
                 }
             }
+            if self.metadata && self.meta_remaining == 0 {
+                self.meta_remaining = META_INTERVAL;
+                let title = self
+                    .current
+                    .as_ref()
+                    .map(|current| current.title.clone())
+                    .unwrap_or_default();
+                return Some(Ok(icy_metadata_block(&title)));
+            }
+            let bytes_per_sec = self
+                .current
+                .as_ref()
+                .map(|current| current.bytes_per_sec)
+                .unwrap_or(self.nominal_bps);
+            // Pipeline path: keep the encoder output buffer filled from the
+            // track's PCM. A partially-filled MP3 frame carries across track
+            // boundaries in `self.out` — that carry-over is exactly what
+            // makes the splice seamless. Native path serves bytes directly.
+            if self.encoder.is_some() {
+                let Some(encoder) = self.encoder.as_mut() else {
+                    // Unreachable: checked above. Break loudly, never spin.
+                    crate::warn!("deezco: pipeline encoder missing; skipping track");
+                    self.current = None;
+                    continue;
+                };
+                while self.out_pos >= self.out.len() {
+                    let Some(current) = self.current.as_mut() else {
+                        break;
+                    };
+                    match feed_encoder(encoder, &mut self.out, &mut current.audio) {
+                        FeedOutcome::Fed => {}
+                        FeedOutcome::TrackDone => {
+                            self.current = None;
+                            break;
+                        }
+                        FeedOutcome::Mismatch => {
+                            crate::warn!("deezco: pipeline state mismatch; skipping track");
+                            self.current = None;
+                            break;
+                        }
+                        FeedOutcome::EncodeFailed(err) => {
+                            crate::warn!("deezco: encode failed: {err}; skipping track");
+                            self.current = None;
+                            break;
+                        }
+                    }
+                }
+                if self.out_pos >= self.out.len() {
+                    // Track(s) exhausted with the encoder still buffering a
+                    // partial frame: pull the next track, its samples will
+                    // complete the frame with zero gap.
+                    continue;
+                }
+                let take = if self.metadata {
+                    self.meta_remaining
+                        .min(CHUNK_SIZE)
+                        .min(self.out.len() - self.out_pos)
+                } else {
+                    CHUNK_SIZE.min(self.out.len() - self.out_pos)
+                };
+                let chunk = self.out[self.out_pos..self.out_pos + take].to_vec();
+                self.out_pos += take;
+                self.meta_remaining -= take;
+                // Compact the consumed prefix so the buffer stays bounded
+                // across a whole session (carry-over is at most one feed).
+                if self.out_pos >= self.out.len() {
+                    self.out.clear();
+                    self.out_pos = 0;
+                } else if self.out_pos > 65_536 {
+                    self.out.drain(..self.out_pos);
+                    self.out_pos = 0;
+                }
+                self.sleep_for = Some(Duration::from_secs_f64(take as f64 / bytes_per_sec as f64));
+                return Some(Ok(chunk));
+            }
             let Some(current) = self.current.as_mut() else {
                 continue;
             };
-            if self.metadata && self.meta_remaining == 0 {
-                self.meta_remaining = META_INTERVAL;
-                return Some(Ok(icy_metadata_block(&current.title)));
-            }
-            // `current.data` is final MP3 on both paths — native bytes, or
-            // session CBR rendered upstream by the prefetch task — so pacing
-            // and ICY framing stay identical. CBR output paces exactly.
-            let take = if self.metadata {
-                self.meta_remaining
-                    .min(CHUNK_SIZE)
-                    .min(current.data.len() - current.pos)
-            } else {
-                CHUNK_SIZE.min(current.data.len() - current.pos)
+            let CurrentAudio::Native { data, pos } = &mut current.audio else {
+                // Unreachable: the encoder exists exactly when prefetch
+                // tasks produce PCM. Drop loudly rather than spin.
+                crate::warn!("deezco: pipeline state mismatch; skipping track");
+                self.current = None;
+                continue;
             };
-            let chunk = current.data[current.pos..current.pos + take].to_vec();
-            let finished = current.pos + take >= current.data.len();
-            current.pos += take;
+            let take = if self.metadata {
+                self.meta_remaining.min(CHUNK_SIZE).min(data.len() - *pos)
+            } else {
+                CHUNK_SIZE.min(data.len() - *pos)
+            };
+            let chunk = data[*pos..*pos + take].to_vec();
+            let finished = *pos + take >= data.len();
+            *pos += take;
             self.meta_remaining -= take;
             let bytes_per_sec = current.bytes_per_sec;
             if finished {
@@ -917,13 +1115,13 @@ async fn run_connection(
     Ok(())
 }
 
-/// Fail fast when the pipeline's external binaries are unusable: the
-/// `lame` binary for any active pipeline, plus the Stereo Tool binary and
-/// bus-rate match when processing is requested. Called before login/network
-/// (good UX) and again at the top of `stream()` (backstop).
+/// Fail fast on unusable Stereo Tool backends: missing CLI binary, rate
+/// mismatch, or missing `.so`. Called before login/network (good UX) and
+/// again at the top of `stream()` (backstop). Encoding itself is statically
+/// linked and needs no external binary.
 pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
     // Stereo Tool misconfiguration is reported first: it is the more
-    // specific user error, and these checks need no external binary.
+    // specific user error.
     if let Some(stereo) = &pipeline.stereo_tool {
         if !stereo.binary_exists() {
             bail!(
@@ -947,18 +1145,15 @@ pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
             lib.lib.display()
         );
     }
-    if pipeline.is_active() && !LameEncoder::is_available() {
-        bail!(
-            "the stream pipeline (--crossfade, --target-lufs, --gain-db, --bitrate, --stereo-tool, or --stereo-tool-lib) needs the lame binary; install it (e.g. `apt-get install lame`)"
-        );
-    }
     Ok(())
 }
 
 /// Stream a playlist to an Icecast mount forever, reconnecting whenever the
-/// source connection drops. With an active pipeline every track is rendered
-/// through decode → crossfade → DSP → session-CBR encode in background
-/// prefetch tasks; otherwise Deezer's native MP3 streams untouched.
+/// source connection drops. With an active pipeline, prefetch tasks deliver
+/// processed PCM (decode → loudnorm → crossfade → DSP) and the session
+/// encoder below turns the endless PCM stream into continuous CBR — no
+/// boundary exists at the MP3 level, so splices cannot click. Otherwise
+/// Deezer's native MP3 streams untouched.
 pub async fn stream(
     api: DeezerApi,
     format: TrackFormat,
@@ -997,21 +1192,17 @@ pub async fn stream(
     );
     if pipeline.is_active() {
         crate::info!(
-            "deezco: pipeline active: session CBR {encode_bps} kbps (decode → crossfade → DSP → encode per track)"
+            "deezco: pipeline active: session CBR {encode_bps} kbps (decode → DSP per track in prefetch, continuous encode downstream)"
         );
         if pipeline.crossfade.is_enabled() {
             crate::info!(
-                "deezco: crossfade {:.1}s ({:?}); first-track render can take a while before connect (watch for decoding/DSP/ready lines)",
+                "deezco: crossfade {:.1}s ({:?})",
                 pipeline.crossfade.duration_secs,
                 pipeline.crossfade.curve
             );
         } else if pipeline.stereo_tool.is_some() || pipeline.stereo_lib.is_some() {
             crate::info!(
-                "deezco: first-track render can take minutes before connect (stereo-tool runs ~2x realtime; watch for decoding/DSP/ready lines)"
-            );
-        } else {
-            crate::info!(
-                "deezco: first-track encode can take ~20s before connect (watch for decoding/ready lines)"
+                "deezco: first-track render can take a while before connect (stereo-tool runs ~2x realtime; watch for decoding/DSP/ready lines)"
             );
         }
         let chain = pipeline.build_chain();
@@ -1073,7 +1264,7 @@ pub async fn stream(
         Some(updater.clone()),
         config.playlist.clone(),
         runtime,
-    )));
+    )?));
 
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
@@ -1334,6 +1525,13 @@ mod tests {
             ..PipelineConfig::default()
         };
         assert_eq!(forced.encode_bitrate(TrackFormat::Mp3_320), 96);
+        // Overrides snap to discrete MPEG rates: this is the exact
+        // advertised session rate.
+        let snapped = PipelineConfig {
+            bitrate: Some(100),
+            ..PipelineConfig::default()
+        };
+        assert_eq!(snapped.encode_bitrate(TrackFormat::Mp3_320), 96);
     }
 
     /// The handoff is the deadlock-critical piece: task 1 must wait for task

@@ -205,7 +205,7 @@ pub trait FrameDecoder: Send + Sync {
 
 /// Whole-track MP3 -> bus PCM decoder backed by Symphonia (pure Rust, no C
 /// sources, so untrusted network input never passes through a C parser).
-/// Output: stereo `i16` at the source rate, resampled to [`BUS_RATE`] only
+/// Output: stereo `f32` at the source rate, resampled to [`BUS_RATE`] only
 /// when it differs (Deezer MP3s are 44100 Hz, so the resampler is a
 /// rarely-hit fallback — linear interpolation, upgradeable to `rubato` if a
 /// non-44.1k source ever shows up in practice).
@@ -217,17 +217,18 @@ impl SymphoniaDecoder {
         Self
     }
 
-    /// Decode all packets of `mp3` into stereo `i16` at the source rate.
+    /// Decode all packets of `mp3` into stereo `f32` at the source rate.
     /// Returns `(samples, source_rate)`.
-    fn decode_frames(mp3: &[u8]) -> Result<(Vec<i16>, u32)> {
+    fn decode_frames(mp3: &[u8]) -> Result<(Vec<f32>, u32)> {
         use std::io::Cursor;
-        use symphonia::core::audio::SampleBuffer;
-        use symphonia::core::codecs::DecoderOptions;
+        use symphonia::core::audio::{Audio, GenericAudioBufferRef};
+        use symphonia::core::codecs::CodecParameters;
+        use symphonia::core::codecs::audio::AudioDecoderOptions;
         use symphonia::core::errors::Error;
-        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::formats::probe::Hint;
+        use symphonia::core::formats::{FormatOptions, TrackType};
         use symphonia::core::io::MediaSourceStream;
         use symphonia::core::meta::MetadataOptions;
-        use symphonia::core::probe::Hint;
 
         if mp3.is_empty() {
             anyhow::bail!("cannot decode empty MP3 input");
@@ -237,72 +238,86 @@ impl SymphoniaDecoder {
         let mss = MediaSourceStream::new(Box::new(Cursor::new(mp3.to_vec())), Default::default());
         let mut hint = Hint::new();
         hint.with_extension("mp3");
-        let probed = symphonia::default::get_probe()
-            .format(
+        let mut format = symphonia::default::get_probe()
+            .probe(
                 &hint,
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .map_err(|err| anyhow::anyhow!("MP3 probe failed: {err}"))?;
-        let mut reader = probed.format;
-        let track = reader
-            .default_track()
+        let track = format
+            .default_track(TrackType::Audio)
             .context("MP3 has no default audio track")?;
         let track_id = track.id;
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .context("unsupported MP3 codec parameters")?;
-        let mut stereo: Vec<i16> = Vec::new();
+        let codec_id = match &track.codec_params {
+            Some(CodecParameters::Audio(params)) => params.codec,
+            _ => anyhow::bail!("MP3 track has no audio codec parameters"),
+        };
+        let entry = symphonia::default::get_codecs()
+            .get_audio_decoder(codec_id)
+            .with_context(|| format!("unsupported MP3 codec: {codec_id:?}"))?;
+        let params = match &track.codec_params {
+            Some(CodecParameters::Audio(params)) => params.clone(),
+            _ => anyhow::bail!("MP3 track has no audio codec parameters"),
+        };
+        let mut decoder = (entry.factory)(&params, &AudioDecoderOptions::default())
+            .context("failed to instantiate MP3 decoder")?;
+        let mut stereo: Vec<f32> = Vec::new();
         let mut src_rate: Option<u32> = None;
-        // Reused across packets; recreated when the stream spec changes
-        // (mid-file rate/channel switches are pathological but handled).
-        let mut sample_buf = None;
         loop {
-            let packet = match reader.next_packet() {
-                Ok(packet) => packet,
-                // The packet reader reports any I/O exhaustion this way;
-                // mirrors the upstream decode example (end of input).
-                Err(Error::IoError(_)) => break,
-                Err(Error::ResetRequired) => {
-                    anyhow::bail!("MP3 track list changed mid-stream");
-                }
+            let packet = match format.next_packet() {
+                Ok(Some(packet)) => packet,
+                // Clean EOF: 0.6 reports it explicitly instead of the
+                // IoError the old loop treated as end-of-input.
+                Ok(None) => break,
                 Err(err) => {
                     anyhow::bail!("MP3 packet read failed: {err}");
                 }
             };
-            if packet.track_id() != track_id {
+            if packet.track_id != track_id {
                 continue;
             }
             let decoded = match decoder.decode(&packet) {
                 Ok(decoded) => decoded,
-                // Corrupt packet: skip it like the decode loop tolerates
-                // trailing garbage, rather than failing the whole track.
+                // Corrupt packet: skip it rather than failing the track.
                 Err(Error::DecodeError(_)) => continue,
+                Err(Error::ResetRequired) => {
+                    anyhow::bail!("MP3 track list changed mid-stream");
+                }
                 Err(err) => {
                     anyhow::bail!("MP3 decode failed: {err}");
                 }
             };
-            let spec = *decoded.spec();
-            let rate = spec.rate;
-            let channels = spec.channels.count();
-            src_rate.get_or_insert(rate);
-            let buf: &mut SampleBuffer<i16> = match &mut sample_buf {
-                Some((old_spec, buf)) if *old_spec == spec => buf,
+            // The 0.6 MP3 decoder yields F32 planes; S16 is accepted too
+            // (other containers/codecs may produce it) via the same shape.
+            let (spec, chunk) = match decoded {
+                GenericAudioBufferRef::F32(buf) => {
+                    let spec = buf.spec().clone();
+                    let slice = buf.slice(..);
+                    let planes: Vec<&[f32]> =
+                        (0..spec.channels().count()).map(|ch| &slice[ch]).collect();
+                    (spec, planar_to_stereo_f32(&planes))
+                }
+                GenericAudioBufferRef::S16(buf) => {
+                    let spec = buf.spec().clone();
+                    let slice = buf.slice(..);
+                    let planes: Vec<&[i16]> =
+                        (0..spec.channels().count()).map(|ch| &slice[ch]).collect();
+                    (spec, i16_to_f32_stereo(&planar_to_stereo(&planes)))
+                }
                 _ => {
-                    sample_buf = Some((spec, SampleBuffer::new(decoded.capacity() as u64, spec)));
-                    &mut sample_buf.as_mut().expect("just inserted").1
+                    anyhow::bail!("unexpected MP3 sample format (want F32/S16)");
                 }
             };
-            buf.copy_interleaved_ref(decoded);
+            let rate = spec.rate();
+            src_rate.get_or_insert(rate);
             if rate == src_rate.expect("just set") {
-                push_stereo_frame(buf.samples(), channels, &mut stereo);
+                stereo.extend(chunk);
             } else {
                 // Rate switched mid-file: resample this chunk back to the
                 // track rate so the single output stream stays coherent.
-                let mut chunk = Vec::new();
-                push_stereo_frame(buf.samples(), channels, &mut chunk);
-                stereo.extend(resample_linear_stereo(
+                stereo.extend(resample_linear_stereo_f32(
                     &chunk,
                     rate,
                     src_rate.expect("just set"),
@@ -328,37 +343,41 @@ impl FrameDecoder for SymphoniaDecoder {
     }
 
     fn decode(&self, mp3: &[u8]) -> Result<PcmBuffer> {
-        let (stereo_i16, src_rate) = Self::decode_frames(mp3)?;
-        let at_bus_rate = resample_linear_stereo(&stereo_i16, src_rate, BUS_RATE);
-        Ok(PcmBuffer::from_interleaved(i16_to_f32_stereo(&at_bus_rate)))
+        let (stereo_f32, src_rate) = Self::decode_frames(mp3)?;
+        let at_bus_rate = resample_linear_stereo_f32(&stereo_f32, src_rate, BUS_RATE);
+        Ok(PcmBuffer::from_interleaved(at_bus_rate))
     }
 }
 
-/// Append one interleaved multi-channel frame buffer as stereo `i16`:
-/// mono is duplicated, stereo passes through, surround keeps L/R.
-fn push_stereo_frame(interleaved: &[i16], channels: usize, out: &mut Vec<i16>) {
-    let channels = channels.max(1);
-    match channels {
-        1 => upmix_mono_to_stereo(interleaved, out),
-        2 => out.extend_from_slice(interleaved),
-        n => {
-            for chunk in interleaved.chunks(n) {
-                if chunk.len() >= 2 {
-                    out.push(chunk[0]);
-                    out.push(chunk[1]);
-                }
-            }
-        }
+/// Interleave planar channel slices as stereo `i16`: mono duplicated,
+/// stereo direct, surround keeps L/R. Empty input yields empty output.
+fn planar_to_stereo(channels: &[&[i16]]) -> Vec<i16> {
+    let Some((left, rest)) = channels.split_first() else {
+        return Vec::new();
+    };
+    let right = rest.first().unwrap_or(left);
+    let mut out = Vec::with_capacity(left.len().min(right.len()) * 2);
+    for (l, r) in left.iter().zip(right.iter()) {
+        out.push(*l);
+        out.push(*r);
     }
+    out
 }
 
-/// Duplicate every mono sample to L+R.
-fn upmix_mono_to_stereo(mono: &[i16], out: &mut Vec<i16>) {
-    out.reserve(mono.len() * 2);
-    for &s in mono {
-        out.push(s);
-        out.push(s);
+/// Interleave planar channel slices as stereo `f32`: same layout rules as
+/// [`planar_to_stereo`]. The native shape for decoders that yield floats
+/// (Symphonia 0.6 MP3), so no precision is lost to an `i16` roundtrip.
+fn planar_to_stereo_f32(channels: &[&[f32]]) -> Vec<f32> {
+    let Some((left, rest)) = channels.split_first() else {
+        return Vec::new();
+    };
+    let right = rest.first().unwrap_or(left);
+    let mut out = Vec::with_capacity(left.len().min(right.len()) * 2);
+    for (l, r) in left.iter().zip(right.iter()) {
+        out.push(*l);
+        out.push(*r);
     }
+    out
 }
 
 /// Linear-interpolating resampler for interleaved stereo `i16`.
@@ -379,6 +398,29 @@ fn resample_linear_stereo(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i1
         for ch in 0..2 {
             let s = input[a + ch] as f32 * (1.0 - frac) + input[b + ch] as f32 * frac;
             out.push(s.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        }
+    }
+    out
+}
+
+/// Linear-interpolating resampler for interleaved stereo `f32`: same math
+/// as [`resample_linear_stereo`] without the integer roundtrip, so decoded
+/// floats keep full precision through a rate switch.
+fn resample_linear_stereo_f32(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    if src_rate == dst_rate || input.is_empty() {
+        return input.to_vec();
+    }
+    let in_frames = input.len() / 2;
+    let out_frames = (in_frames as u64 * dst_rate as u64 / src_rate as u64) as usize;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    for i in 0..out_frames {
+        let pos = i as f64 * src_rate as f64 / dst_rate as f64;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = idx.min(in_frames - 1) * 2;
+        let b = (idx + 1).min(in_frames - 1) * 2;
+        for ch in 0..2 {
+            out.push(input[a + ch] * (1.0 - frac) + input[b + ch] * frac);
         }
     }
     out
@@ -693,10 +735,13 @@ mod tests {
     }
 
     #[test]
-    fn upmix_duplicates_mono_to_both_channels() {
-        let mut out = Vec::new();
-        upmix_mono_to_stereo(&[1000, -1000, 0], &mut out);
-        assert_eq!(out, vec![1000, 1000, -1000, -1000, 0, 0]);
+    fn planar_mono_duplicates_to_both_channels() {
+        // Covered by planar_to_stereo_maps_channel_layouts; this pins the
+        // single-plane call shape the decoder uses for mono MP3.
+        assert_eq!(
+            planar_to_stereo(&[&[1000, -1000, 0]]),
+            vec![1000, 1000, -1000, -1000, 0, 0]
+        );
     }
 
     #[test]
@@ -753,17 +798,29 @@ mod tests {
     }
 
     #[test]
-    fn push_stereo_frame_maps_channel_layouts() {
-        let mut out = Vec::new();
-        push_stereo_frame(&[7, 8, 9], 1, &mut out);
-        assert_eq!(out, vec![7, 7, 8, 8, 9, 9]);
-        let mut out = Vec::new();
-        push_stereo_frame(&[1, 2, 3, 4], 2, &mut out);
-        assert_eq!(out, vec![1, 2, 3, 4]);
+    fn planar_to_stereo_maps_channel_layouts() {
+        assert_eq!(planar_to_stereo(&[&[7, 8, 9]]), vec![7, 7, 8, 8, 9, 9]);
+        assert_eq!(planar_to_stereo(&[&[1, 2], &[3, 4]]), vec![1, 3, 2, 4]);
         // Surround keeps L/R of each frame, drops the rest.
-        let mut out = Vec::new();
-        push_stereo_frame(&[1, 2, 3, 4, 5, 6], 3, &mut out);
-        assert_eq!(out, vec![1, 2, 4, 5]);
+        assert_eq!(
+            planar_to_stereo(&[&[1, 2], &[3, 4], &[5, 6]]),
+            vec![1, 3, 2, 4]
+        );
+        assert!(planar_to_stereo(&[]).is_empty());
+    }
+
+    #[test]
+    fn planar_to_stereo_f32_matches_i16_layout() {
+        // Same cases in float: the decoder's live shape.
+        assert_eq!(
+            planar_to_stereo_f32(&[&[0.5, -0.5]]),
+            vec![0.5, 0.5, -0.5, -0.5]
+        );
+        assert_eq!(
+            planar_to_stereo_f32(&[&[1.0, 2.0], &[3.0, 4.0], &[9.0, 9.0]]),
+            vec![1.0, 3.0, 2.0, 4.0]
+        );
+        assert!(planar_to_stereo_f32(&[]).is_empty());
     }
 
     /// 1 second of stereo 16-bit 44.1 kHz 440 Hz sine, the raw PCM that the

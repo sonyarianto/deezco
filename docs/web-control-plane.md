@@ -20,7 +20,7 @@ Ide: tambah web interface sebagai **player** (preview playlist) dan **control pl
 ## 2. Keputusan Desain Utama
 
 1. **Additive, bukan breaking** — 3 endpoint crabsoup dibiarkan 100% sama (route registration di `serve()` dalam `src/serve.rs`). Web hanya nambah route di sebelahnya: `GET /`, `GET /api/health`, `POST /playlists/{id}/next`. Auth (jika ada nanti) hanya untuk `/api/*` & `/`, bukan untuk 3 endpoint legacy.
-2. **Single binary tetap** — Web player single-file HTML embed via `src/web_assets.rs` (`include_str!` style), tanpa Vite/React/build step. Binary tetap kecil (~3.2MB saat doc ini ditulis; ~3.4MB sejak decoder `minimp3` masuk 2026-09-19 — release profile `opt-level=z, lto, strip` di `Cargo.toml` tetap).
+2. **Single binary tetap** — Web player single-file HTML embed via `src/web_assets.rs` (`include_str!` style), tanpa Vite/React/build step. Binary tetap kecil (~3.2MB saat doc ini ditulis; ~3.8MB sejak decoder Symphonia masuk 2026-09-19 — release profile `opt-level=z, lto, strip` di `Cargo.toml` tetap).
 3. **Reuse 90% infra** — `DeezerApi::get_playlist_tracks` (`src/api.rs`), `TrackQueue::next_track` (`src/queue.rs`), `fetch_track_audio` (via `crate::download`) tinggal dipanggil. Web cuma wrapper `axum::Router` (sudah ada `axum 0.8` di `Cargo.toml`).
 
 ## 3. Phase 1 — Shipped (2026-08-22)

@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Ships the bus types, the pure crossfade math, and both converters:
-//! `Mp3Decoder` (bundled `minimp3`, no runtime deps) and `LameEncoder`
+//! `SymphoniaDecoder` (pure Rust, no runtime deps) and `LameEncoder`
 //! (external `lame` binary, opt-in — only spawned when the pipeline is
 //! active). What remains is driving them from `Producer` (decode->
 //! crossfade->process->encode per track) instead of native passthrough.
@@ -20,7 +20,7 @@
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Sample rate (Hz) every stage resamples to before mixing. 44100 matches
 /// Deezer's MP3 sources, so the linear resampler below is a rarely-hit
@@ -198,65 +198,119 @@ pub fn apply_crossfade(tail: &[f32], head: &[f32], curve: CrossfadeCurve) -> Vec
 }
 
 /// MP3 bytes -> [`PcmBuffer`]: decode, upmix to stereo, resample to
-/// [`BUS_RATE`]. Implemented by [`Mp3Decoder`]; kept as a trait so the bus
-/// design does not dictate the backend.
+/// [`BUS_RATE`]. Implemented by [`SymphoniaDecoder`]; kept as a trait so the
+/// bus design does not dictate the backend.
 pub trait FrameDecoder: Send + Sync {
-    /// Decoder name for logs (e.g. `"minimp3"`).
+    /// Decoder name for logs (e.g. `"symphonia"`).
     fn name(&self) -> &str;
     /// Decode one whole track into bus PCM.
     fn decode(&self, mp3: &[u8]) -> Result<PcmBuffer>;
 }
 
-/// Whole-track MP3 -> bus PCM decoder backed by `minimp3` (C sources are
-/// compiled in, so the binary keeps zero runtime dependencies).
-///
-/// Each frame is upmixed to stereo on the fly; the assembled track is
-/// resampled to [`BUS_RATE`] only when the source rate differs (Deezer MP3s
-/// are 44100 Hz, so the resampler is a rarely-hit fallback — linear
-/// interpolation, upgradeable to `rubato` if a non-44.1k source ever shows
-/// up in practice).
-pub struct Mp3Decoder;
+/// Whole-track MP3 -> bus PCM decoder backed by Symphonia (pure Rust, no C
+/// sources, so untrusted network input never passes through a C parser).
+/// Output: stereo `i16` at the source rate, resampled to [`BUS_RATE`] only
+/// when it differs (Deezer MP3s are 44100 Hz, so the resampler is a
+/// rarely-hit fallback — linear interpolation, upgradeable to `rubato` if a
+/// non-44.1k source ever shows up in practice).
+pub struct SymphoniaDecoder;
 
-impl Mp3Decoder {
+impl SymphoniaDecoder {
     /// Build a decoder (stateless; safe to share across prefetch tasks).
     pub fn new() -> Self {
         Self
     }
 
-    /// Decode all frames of `mp3` into stereo `i16` at the source rate.
+    /// Decode all packets of `mp3` into stereo `i16` at the source rate.
     /// Returns `(samples, source_rate)`.
     fn decode_frames(mp3: &[u8]) -> Result<(Vec<i16>, u32)> {
+        use std::io::Cursor;
+        use symphonia::core::audio::SampleBuffer;
+        use symphonia::core::codecs::DecoderOptions;
+        use symphonia::core::errors::Error;
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::core::probe::Hint;
+
         if mp3.is_empty() {
             anyhow::bail!("cannot decode empty MP3 input");
         }
-        let mut decoder = minimp3::Decoder::new(mp3);
+        // Symphonia owns its source (`'static`), so the track is copied
+        // once here; decoding itself stays streaming packet-by-packet.
+        let mss = MediaSourceStream::new(Box::new(Cursor::new(mp3.to_vec())), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("mp3");
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .map_err(|err| anyhow::anyhow!("MP3 probe failed: {err}"))?;
+        let mut reader = probed.format;
+        let track = reader
+            .default_track()
+            .context("MP3 has no default audio track")?;
+        let track_id = track.id;
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .context("unsupported MP3 codec parameters")?;
         let mut stereo: Vec<i16> = Vec::new();
         let mut src_rate: Option<u32> = None;
+        // Reused across packets; recreated when the stream spec changes
+        // (mid-file rate/channel switches are pathological but handled).
+        let mut sample_buf = None;
         loop {
-            match decoder.next_frame() {
-                Ok(frame) => {
-                    let rate = u32::try_from(frame.sample_rate).unwrap_or(BUS_RATE);
-                    src_rate.get_or_insert(rate);
-                    match frame.channels {
-                        1 => upmix_mono_to_stereo(&frame.data, &mut stereo),
-                        2 => stereo.extend_from_slice(&frame.data),
-                        // Surround MP3 is vanishingly rare: keep L/R, drop
-                        // the rest rather than breaking the stereo invariant.
-                        n => {
-                            let n = n.max(1);
-                            for chunk in frame.data.chunks(n) {
-                                if chunk.len() >= 2 {
-                                    stereo.push(chunk[0]);
-                                    stereo.push(chunk[1]);
-                                }
-                            }
-                        }
-                    }
+            let packet = match reader.next_packet() {
+                Ok(packet) => packet,
+                // The packet reader reports any I/O exhaustion this way;
+                // mirrors the upstream decode example (end of input).
+                Err(Error::IoError(_)) => break,
+                Err(Error::ResetRequired) => {
+                    anyhow::bail!("MP3 track list changed mid-stream");
                 }
-                Err(minimp3::Error::Eof) => break,
+                Err(err) => {
+                    anyhow::bail!("MP3 packet read failed: {err}");
+                }
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let decoded = match decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                // Corrupt packet: skip it like the decode loop tolerates
+                // trailing garbage, rather than failing the whole track.
+                Err(Error::DecodeError(_)) => continue,
                 Err(err) => {
                     anyhow::bail!("MP3 decode failed: {err}");
                 }
+            };
+            let spec = *decoded.spec();
+            let rate = spec.rate;
+            let channels = spec.channels.count();
+            src_rate.get_or_insert(rate);
+            let buf: &mut SampleBuffer<i16> = match &mut sample_buf {
+                Some((old_spec, buf)) if *old_spec == spec => buf,
+                _ => {
+                    sample_buf = Some((spec, SampleBuffer::new(decoded.capacity() as u64, spec)));
+                    &mut sample_buf.as_mut().expect("just inserted").1
+                }
+            };
+            buf.copy_interleaved_ref(decoded);
+            if rate == src_rate.expect("just set") {
+                push_stereo_frame(buf.samples(), channels, &mut stereo);
+            } else {
+                // Rate switched mid-file: resample this chunk back to the
+                // track rate so the single output stream stays coherent.
+                let mut chunk = Vec::new();
+                push_stereo_frame(buf.samples(), channels, &mut chunk);
+                stereo.extend(resample_linear_stereo(
+                    &chunk,
+                    rate,
+                    src_rate.expect("just set"),
+                ));
             }
         }
         let Some(src_rate) = src_rate else {
@@ -266,21 +320,39 @@ impl Mp3Decoder {
     }
 }
 
-impl Default for Mp3Decoder {
+impl Default for SymphoniaDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FrameDecoder for Mp3Decoder {
+impl FrameDecoder for SymphoniaDecoder {
     fn name(&self) -> &str {
-        "minimp3"
+        "symphonia"
     }
 
     fn decode(&self, mp3: &[u8]) -> Result<PcmBuffer> {
         let (stereo_i16, src_rate) = Self::decode_frames(mp3)?;
         let at_bus_rate = resample_linear_stereo(&stereo_i16, src_rate, BUS_RATE);
         Ok(PcmBuffer::from_interleaved(i16_to_f32_stereo(&at_bus_rate)))
+    }
+}
+
+/// Append one interleaved multi-channel frame buffer as stereo `i16`:
+/// mono is duplicated, stereo passes through, surround keeps L/R.
+fn push_stereo_frame(interleaved: &[i16], channels: usize, out: &mut Vec<i16>) {
+    let channels = channels.max(1);
+    match channels {
+        1 => upmix_mono_to_stereo(interleaved, out),
+        2 => out.extend_from_slice(interleaved),
+        n => {
+            for chunk in interleaved.chunks(n) {
+                if chunk.len() >= 2 {
+                    out.push(chunk[0]);
+                    out.push(chunk[1]);
+                }
+            }
+        }
     }
 }
 
@@ -669,12 +741,12 @@ mod tests {
 
     #[test]
     fn decoder_reports_its_backend_name() {
-        assert_eq!(Mp3Decoder::new().name(), "minimp3");
+        assert_eq!(SymphoniaDecoder::new().name(), "symphonia");
     }
 
     #[test]
     fn decoder_rejects_empty_input() {
-        assert!(Mp3Decoder::new().decode(&[]).is_err());
+        assert!(SymphoniaDecoder::new().decode(&[]).is_err());
     }
 
     #[test]
@@ -682,7 +754,21 @@ mod tests {
         // Plausible non-audio payload: must error, never panic or return
         // silence disguised as a track.
         let garbage = vec![0xAA; 4096];
-        assert!(Mp3Decoder::new().decode(&garbage).is_err());
+        assert!(SymphoniaDecoder::new().decode(&garbage).is_err());
+    }
+
+    #[test]
+    fn push_stereo_frame_maps_channel_layouts() {
+        let mut out = Vec::new();
+        push_stereo_frame(&[7, 8, 9], 1, &mut out);
+        assert_eq!(out, vec![7, 7, 8, 8, 9, 9]);
+        let mut out = Vec::new();
+        push_stereo_frame(&[1, 2, 3, 4], 2, &mut out);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+        // Surround keeps L/R of each frame, drops the rest.
+        let mut out = Vec::new();
+        push_stereo_frame(&[1, 2, 3, 4, 5, 6], 3, &mut out);
+        assert_eq!(out, vec![1, 2, 4, 5]);
     }
 
     /// 1 second of stereo 16-bit 44.1 kHz 440 Hz sine, the raw PCM that the
@@ -727,7 +813,7 @@ mod tests {
         assert!(output.status.success(), "lame failed to encode");
         assert!(!output.stdout.is_empty(), "lame produced no MP3");
 
-        let decoded = Mp3Decoder::new()
+        let decoded = SymphoniaDecoder::new()
             .decode(&output.stdout)
             .expect("decode MP3");
         // 1s at 44100 Hz, plus the MP3 encoder delay/padding tail (~2112
@@ -745,6 +831,24 @@ mod tests {
             samples.samples().iter().all(|s| *s >= -1.0 && *s <= 1.0),
             "samples must stay in unit range"
         );
+    }
+
+    /// Decode of a 10-second real MP3 from disk (`DEEZCO_BENCH_MP3`):
+    /// proves the backend handles full-size tracks, not just 1 s synthetic
+    /// fixtures. Run with e.g.
+    /// `DEEZCO_BENCH_MP3=/tmp/test10.mp3 cargo test -- --ignored decode_full_track_mp3`.
+    #[test]
+    #[ignore = "requires a real MP3 file on disk"]
+    fn decode_full_track_mp3_produces_audible_pcm() {
+        let path = std::env::var("DEEZCO_BENCH_MP3").expect("DEEZCO_BENCH_MP3");
+        let mp3 = std::fs::read(&path).expect("read bench MP3");
+        let decoded = SymphoniaDecoder::new()
+            .decode(&mp3)
+            .expect("decode full-track MP3");
+        assert!(decoded.frames() > 44100, "must decode minutes of audio");
+        let energy: f32 = decoded.samples().iter().map(|s| s * s).sum();
+        let rms = (energy / decoded.samples().len() as f32).sqrt();
+        assert!(rms > 0.01, "decoded track must not be silent (rms={rms})");
     }
 
     #[test]
@@ -820,7 +924,7 @@ mod tests {
         assert!(LameEncoder::is_available(), "lame must be on PATH");
         let pcm = PcmBuffer::from_interleaved(i16_to_f32_stereo(&sine_pcm_i16()));
         let mp3 = LameEncoder::new(128).unwrap().encode(&pcm).unwrap();
-        let back = Mp3Decoder::new()
+        let back = SymphoniaDecoder::new()
             .decode(&mp3)
             .expect("decode the encoded MP3");
         assert!(

@@ -20,10 +20,10 @@ futures-util = "0.3"
 dirs = "6"
 axum = "0.8"
 rand = "0.8"
-minimp3 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock", "std"] }
 libloading = "0.8"
 libc = "0.2"
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
 
 [lints.rust]
 warnings = "deny"

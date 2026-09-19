@@ -377,7 +377,7 @@ deezco logout                     # remove stored ARL
 src/
   main.rs      CLI entry point, argument parsing
   api.rs       Deezer GW (internal) API + public API + media URL client
-  audio.rs     PCM bus types, crossfade math, MP3 decoder (minimp3)
+  audio.rs     PCM bus types, crossfade math, MP3 decoder (Symphonia)
   auth.rs      ARL-based login, persistent credential storage
   batch.rs     Concurrent download orchestration and dry-run/summary helpers
   cli.rs       Clap CLI definitions (commands and flags)
@@ -405,7 +405,7 @@ src/
 - **Media API**: `https://media.deezer.com/v1/get_url` — authenticated track stream URLs
 - **Decryption**: Blowfish CBC with per-track key derived from `MD5(track_id) XOR secret`, IV `[0,1,2,3,4,5,6,7]`
 - **Stream format**: every 6144 bytes (2048 * 3), the first 2048 bytes are Blowfish-encrypted
-- **Stream DSP**: MP3 decode via bundled `minimp3` (compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
+- **Stream DSP**: MP3 decode via Symphonia (pure Rust, compiled in — no runtime binaries needed); PCM bus is f32 stereo @ 44100 Hz with equal-power crossfade, a post-crossfade processor chain (gain, Thimeo Stereo Tool), and session-CBR MP3 encode via the external `lame` binary (only spawned when `--crossfade`, `--gain-db`, `--bitrate`, `--stereo-tool`, or `--stereo-tool-lib` is set)
 
 ## Support
 

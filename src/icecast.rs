@@ -12,7 +12,7 @@ use tokio::time::sleep;
 
 use crate::api::DeezerApi;
 use crate::audio::{
-    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, Mp3Decoder, PcmBuffer,
+    BUS_RATE, CrossfadeConfig, FrameDecoder, FrameEncoder, LameEncoder, PcmBuffer, SymphoniaDecoder,
     render_track_overlap,
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
@@ -149,12 +149,18 @@ struct TitleUpdater {
 
 impl TitleUpdater {
     fn new(config: &IcecastConfig) -> Self {
+        // Short leash: these fire-and-forget updates run on detached tasks,
+        // so a hanging admin endpoint must fail instead of leaking tasks.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             url_base: format!("{}/admin/metadata", config.server.trim_end_matches('/')),
             mount: config.mount.clone(),
             username: config.username.clone(),
             password: config.password.clone(),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
@@ -371,7 +377,8 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, FetchedTrack)> {
     let decode_started = std::time::Instant::now();
     // A panicked/cancelled decode must still advance the crossfade sequence,
     // or every later task would wait forever on `claim_turn`.
-    let decode_join = tokio::task::spawn_blocking(move || Mp3Decoder::new().decode(&fetched.data)).await;
+    let decode_join =
+        tokio::task::spawn_blocking(move || SymphoniaDecoder::new().decode(&fetched.data)).await;
     let pcm = match decode_join {
         Ok(Ok(pcm)) => {
             crate::info!(
@@ -799,7 +806,9 @@ async fn run_connection(
                 crate::info!(
                     "deezco: streaming at {advertised_kbps} kbps (actual, after quality fallback)"
                 );
-                client = p.api.client().clone();
+                // The source body never ends: this client must not carry
+                // the Deezer total request timeout (see `source_client`).
+                client = p.api.source_client().clone();
                 break;
             }
             Err(err) => {

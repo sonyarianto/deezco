@@ -10,10 +10,25 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 const GW_API_URL: &str = "http://www.deezer.com/ajax/gw-light.php";
 const MEDIA_URL: &str = "https://media.deezer.com/v1/get_url";
 const PUBLIC_API_URL: &str = "https://api.deezer.com";
+/// How long a TCP connect to Deezer or Icecast may take before it fails.
+/// A hanging connect (dead host, blackholed route) previously stalled
+/// forever with no log line and no retry.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Total budget per Deezer request (API JSON or track download, headers +
+/// body). A CDN stall mid-body previously hung the stream forever at
+/// `downloading track ...`. Generous enough for FLAC on slow links; the
+/// stream path treats the expiry as a skippable track error with retry.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct DeezerApi {
     client: Client,
+    /// Client for the Icecast source PUT: connect timeout only, deliberately
+    /// *no* total timeout — the request body is endless by design and any
+    /// total timer would kill a healthy stream. Must stay separate from
+    /// `client`, whose total `REQUEST_TIMEOUT` would otherwise do exactly
+    /// that.
+    source_client: Client,
     api_token: Arc<Mutex<Option<String>>>,
     pub current_user: Arc<Mutex<Option<CurrentUser>>>,
 }
@@ -24,10 +39,18 @@ impl DeezerApi {
             .cookie_store(true)
             .user_agent(USER_AGENT)
             .danger_accept_invalid_certs(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?;
+        let source_client = Client::builder()
+            .user_agent(USER_AGENT)
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
 
         Ok(Self {
             client,
+            source_client,
             api_token: Arc::new(Mutex::new(None)),
             current_user: Arc::new(Mutex::new(None)),
         })
@@ -36,6 +59,11 @@ impl DeezerApi {
     /// HTTP client used for API calls and stream downloads
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// HTTP client used for the Icecast source PUT (no total timeout).
+    pub fn source_client(&self) -> &Client {
+        &self.source_client
     }
 
     /// Login using ARL cookie

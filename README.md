@@ -292,6 +292,13 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio \
 deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
 
+# Filler when no track is ready (failed download, empty playlist, or next
+# prefetch still pending). Instead of stalling the TCP stream and letting
+# Icecast drop the source, a random jingle from the directory is played;
+# without --jingle-dir a 2s silence filler keeps the connection alive:
+deezco stream 908622995 --server http://localhost:8000 --mount /radio \
+  --password hackme --jingle-dir ./jingles
+
 # PCM pipeline options (equal-power crossfade + static DSP gain).
 # Every track is rendered decode → DSP in background prefetch tasks while
 # one session encoder turns the endless PCM stream into continuous CBR —

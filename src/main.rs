@@ -579,6 +579,7 @@ async fn main() -> Result<()> {
             stereo_tool_key,
             stereo_rate,
             refresh_secs,
+            jingle_dir,
         } => {
             let password = password.or_else(|| {
                 std::env::var("DEEZCO_ICECAST_PASSWORD")
@@ -632,6 +633,14 @@ async fn main() -> Result<()> {
                 key: stereo_tool_key,
                 reset_per_track: stereo_tool_reset_track,
             });
+            if let Some(dir) = &jingle_dir
+                && !dir.is_dir()
+            {
+                anyhow::bail!(
+                    "--jingle-dir {} is not a directory",
+                    dir.display()
+                );
+            }
             let config = icecast::IcecastConfig {
                 server,
                 mount,
@@ -643,6 +652,7 @@ async fn main() -> Result<()> {
                 url,
                 public,
                 playlist: extract_id(&playlist, "playlist"),
+                jingle_dir,
             };
             let pipeline = icecast::PipelineConfig {
                 crossfade: crate::audio::CrossfadeConfig::new(

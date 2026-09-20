@@ -255,6 +255,13 @@ pub enum Commands {
         /// How often to refetch the playlist so web edits are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
+        /// Directory containing jingle/filler audio files (mp3/flac/ogg/wav).
+        /// When the Deezer playlist has no ready track (download failed, empty,
+        /// or next prefetch still pending) a random jingle is played instead of
+        /// silence, keeping the Icecast source alive without dead air.
+        /// Falls back to generated silence when unset or empty.
+        #[arg(long)]
+        jingle_dir: Option<PathBuf>,
     },
 }
 

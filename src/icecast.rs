@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -17,9 +18,11 @@ use crate::audio::{
 };
 use crate::download::{FetchedTrack, fetch_track_audio};
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
+use crate::files::is_audio_file;
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
 use crate::track::{available_format, debug_enabled};
+use rand::seq::IndexedRandom;
 
 /// How many bytes of audio between in-band ICY metadata blocks. The source
 /// picks the interval and tells Icecast about it via the `icy-metaint`
@@ -42,6 +45,26 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// that keeps resetting connections (edge proxies, rate limiters) gets time
 /// to clear instead of being hammered every few seconds.
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+/// How long silence filler lasts when used as a temporary track.
+const FILLER_SILENCE_SECS: f32 = 2.0;
+/// Avoid repeating the same jingle immediately.
+const JINGLE_RECENT_WINDOW: usize = 3;
+
+/// Scan a directory for audio files to use as filler jingles.
+fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && is_audio_file(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
 
 /// Errors from a single source connection. Transient errors (drops,
 /// unreachable server) are worth reconnecting; fatal ones (rejected by
@@ -66,6 +89,9 @@ pub struct IcecastConfig {
     pub url: Option<String>,
     pub public: bool,
     pub playlist: String,
+    /// Directory of filler jingles. When the playlist has no ready track
+    /// a random file from here is played to keep the source alive.
+    pub jingle_dir: Option<PathBuf>,
 }
 
 /// PCM-bus pipeline configuration.
@@ -379,14 +405,18 @@ enum PreparedAudio {
 /// multi-minute Stereo Tool process looks like a hang (the exact symptom
 /// this fixes — previously only the download had a debug line).
 async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
-    let track = ctx
-        .queue
-        .next_track(&ctx.api, &ctx.playlist)
-        .await
-        .map_err(|err| match err {
-            NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
-            NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
-        })?;
+    let track = match ctx.queue.next_track(&ctx.api, &ctx.playlist).await {
+        Ok(track) => track,
+        Err(err) => {
+            // Queue failures must also advance the crossfade/DSP handoff,
+            // otherwise every later task would wait forever on claim_turn.
+            advance_past(&ctx.runtime.xfade, ctx.seq).await;
+            return Err(match err {
+                NextTrackError::Empty => anyhow::anyhow!("playlist has no playable tracks"),
+                NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
+            });
+        }
+    };
     let fetched = match prepare_track_audio(&ctx.api, &track, ctx.fetch_format).await {
         Ok(fetched) => fetched,
         Err(err) => {
@@ -676,9 +706,15 @@ struct Producer {
     /// accumulating as drift. `sleep_until` with a past deadline returns
     /// immediately (catch-up); a debt over 5s (stall/reconnect) resets.
     deadline: Option<Instant>,
+    /// Jingle filler files from --jingle-dir, played when no real track is ready.
+    jingle_files: Vec<PathBuf>,
+    recent_jingles: VecDeque<PathBuf>,
+    /// Encoder for native filler (silence/jingles) when pipeline is inactive.
+    filler_encoder: Option<SessionEncoder>,
 }
 
 impl Producer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         api: DeezerApi,
         queue: TrackQueue,
@@ -687,6 +723,7 @@ impl Producer {
         updater: Option<TitleUpdater>,
         playlist: String,
         runtime: PipelineRuntime,
+        jingle_dir: Option<PathBuf>,
     ) -> Result<Self> {
         // CBR pipeline output paces exactly at the encode rate; native
         // passthrough falls back to the fetched format's nominal rate when
@@ -703,6 +740,32 @@ impl Producer {
             .is_active()
             .then(|| SessionEncoder::new(runtime.encode_bps))
             .transpose()?;
+        // Native filler needs its own encoder (same rate) to generate valid
+        // MP3 silence/jingles when there is no session encoder.
+        let filler_encoder = if encoder.is_none() {
+            let kbps = native_bitrate(fetch_format).unwrap_or(128);
+            Some(SessionEncoder::new(kbps)?)
+        } else {
+            None
+        };
+        let jingle_files = jingle_dir
+            .as_deref()
+            .map(collect_jingle_files)
+            .unwrap_or_default();
+        if let Some(dir) = &jingle_dir {
+            if jingle_files.is_empty() {
+                crate::warn!(
+                    "deezco: jingle-dir {} has no audio files (mp3/flac/ogg/wav); falling back to silence",
+                    dir.display()
+                );
+            } else {
+                crate::info!(
+                    "deezco: jingle-dir {} with {} file(s)",
+                    dir.display(),
+                    jingle_files.len()
+                );
+            }
+        }
         let mut prefetch = VecDeque::new();
         prefetch.push_back(tokio::spawn(fetch_next_track(TaskCtx {
             api: api.clone(),
@@ -730,6 +793,9 @@ impl Producer {
             meta_remaining: META_INTERVAL,
             prefetch,
             deadline: None,
+            jingle_files,
+            recent_jingles: VecDeque::new(),
+            filler_encoder,
         })
     }
 
@@ -759,7 +825,76 @@ impl Producer {
         if self.current.is_some() {
             return Ok(());
         }
-        self.load_next_track().await
+        // Try to promote any ready prefetch quickly; if none ready within
+        // 5s, fall back to filler (jingle/silence) so the Icecast source
+        // can connect immediately instead of hanging until Deezer recovers.
+        let mut attempts = 0;
+        while attempts < 4 {
+            let ready = self
+                .prefetch
+                .front()
+                .is_some_and(|h| h.is_finished());
+            if !ready {
+                break;
+            }
+            let handle = self.prefetch.pop_front().expect("ready front");
+            while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                self.spawn_prefetch();
+            }
+            match handle.await {
+                Ok(Ok((track, audio))) => {
+                    self.activate_track(track, audio);
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    crate::warn!("deezco: warm_up track fetch failed: {err}; skipping");
+                    attempts += 1;
+                    continue;
+                }
+                Err(err) => {
+                    crate::warn!("deezco: warm_up prefetch panicked: {err}; skipping");
+                    attempts += 1;
+                    self.spawn_prefetch();
+                    continue;
+                }
+            }
+        }
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        while start.elapsed() < timeout {
+            while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                self.spawn_prefetch();
+            }
+            let ready = self
+                .prefetch
+                .front()
+                .is_some_and(|h| h.is_finished());
+            if ready {
+                let handle = self.prefetch.pop_front().expect("ready front");
+                while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                    self.spawn_prefetch();
+                }
+                match handle.await {
+                    Ok(Ok((track, audio))) => {
+                        self.activate_track(track, audio);
+                        return Ok(());
+                    }
+                    Ok(Err(err)) => {
+                        crate::warn!("deezco: warm_up track fetch failed: {err}; skipping");
+                        continue;
+                    }
+                    Err(err) => {
+                        crate::warn!("deezco: warm_up prefetch panicked: {err}; skipping");
+                        self.spawn_prefetch();
+                        continue;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        crate::warn!("deezco: warm_up no real track ready after 5s, using filler");
+        self.load_filler().await;
+        Ok(())
     }
 
     /// Spawn a background prefetch for the next track and push it to
@@ -848,9 +983,207 @@ impl Producer {
         // continuous for as long as the source connection is open.
     }
 
+    /// Pick a random jingle that wasn't played recently.
+    fn pick_jingle(&mut self) -> Option<PathBuf> {
+        if self.jingle_files.is_empty() {
+            return None;
+        }
+        let candidates: Vec<&PathBuf> = self
+            .jingle_files
+            .iter()
+            .filter(|p| !self.recent_jingles.contains(p))
+            .collect();
+        let pool = if candidates.is_empty() {
+            self.jingle_files.iter().collect::<Vec<_>>()
+        } else {
+            candidates
+        };
+        let choice = (*pool.choose(&mut rand::rng())?).clone();
+        self.recent_jingles.push_back(choice.clone());
+        if self.recent_jingles.len() > JINGLE_RECENT_WINDOW {
+            self.recent_jingles.pop_front();
+        }
+        Some(choice)
+    }
+
+    /// Try to load a jingle file as the current track. Returns true on success.
+    async fn load_jingle_file(&mut self, path: PathBuf) -> bool {
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                crate::warn!("deezco: jingle {} is empty, skipping", path.display());
+                return false;
+            }
+            Err(err) => {
+                crate::warn!("deezco: failed to read jingle {}: {err}", path.display());
+                return false;
+            }
+        };
+        // Decode in blocking thread (Symphonia is CPU-bound).
+        let decode = tokio::task::spawn_blocking(move || {
+            SymphoniaDecoder::new().decode(&bytes).map(|buf| buf.into_samples())
+        })
+        .await;
+        let pcm = match decode {
+            Ok(Ok(samples)) if !samples.is_empty() => samples,
+            Ok(Ok(_)) => {
+                crate::warn!("deezco: jingle {} decoded to empty PCM", path.display());
+                return false;
+            }
+            Ok(Err(err)) => {
+                crate::warn!("deezco: failed to decode jingle {}: {err}", path.display());
+                return false;
+            }
+            Err(err) => {
+                crate::warn!("deezco: jingle decode task panicked for {}: {err}", path.display());
+                return false;
+            }
+        };
+        let title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Jingle")
+            .to_string();
+        let display = format!("Jingle - {title}");
+        crate::info!("deezco: playing jingle \"{display}\" ({} frames)", pcm.len() / 2);
+        if let Some(updater) = &self.updater {
+            let updater = updater.clone();
+            let t = display.clone();
+            tokio::spawn(async move {
+                if let Err(err) = updater.update(&t).await
+                    && !err.to_string().contains("404")
+                {
+                    crate::warn!("deezco: jingle title update failed: {err}");
+                }
+            });
+        }
+        if self.encoder.is_some() {
+            // Pipeline CBR: PCM goes through the session encoder.
+            let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
+            self.current = Some(CurrentTrack {
+                title: display,
+                audio: CurrentAudio::Pcm { samples: pcm, pos: 0 },
+                bytes_per_sec: bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some(self.runtime.encode_bps);
+            }
+        } else {
+            // Native: encode PCM to MP3 via filler encoder so we get valid MP3 bytes.
+            let Some(encoder) = self.ensure_filler_encoder() else {
+                crate::warn!("deezco: filler encoder missing for jingle");
+                return false;
+            };
+            let mut mp3 = Vec::new();
+            let mut pos = 0;
+            while pos < pcm.len() {
+                let end = (pos + FEED_FRAMES * 2).min(pcm.len());
+                match encoder.encode_chunk(&pcm[pos..end]) {
+                    Ok(out) => mp3.extend_from_slice(out),
+                    Err(err) => {
+                        crate::warn!("deezco: jingle encode failed: {err}");
+                        return false;
+                    }
+                }
+                pos = end;
+            }
+            if mp3.is_empty() {
+                crate::warn!("deezco: jingle {} produced no MP3 bytes", path.display());
+                return false;
+            }
+            self.current = Some(CurrentTrack {
+                title: display,
+                audio: CurrentAudio::Native { data: mp3, pos: 0 },
+                bytes_per_sec: self.nominal_bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some((self.nominal_bps * 8 / 1000) as u32);
+            }
+        }
+        true
+    }
+
+    /// Ensure native filler encoder exists and matches the current advertised rate.
+    fn ensure_filler_encoder(&mut self) -> Option<&mut SessionEncoder> {
+        let target_kbps = self
+            .actual_kbps
+            .unwrap_or((self.nominal_bps * 8 / 1000) as u32);
+        let needs = match &self.filler_encoder {
+            Some(enc) => enc.bitrate_kbps() != target_kbps,
+            None => true,
+        };
+        if needs {
+            match SessionEncoder::new(target_kbps) {
+                Ok(enc) => self.filler_encoder = Some(enc),
+                Err(err) => {
+                    crate::warn!(
+                        "deezco: failed to create filler encoder at {target_kbps} kbps: {err}"
+                    );
+                    return None;
+                }
+            }
+        }
+        self.filler_encoder.as_mut()
+    }
+
+    /// Load a short silence filler as the current track. Always succeeds.
+    fn load_silence_filler(&mut self) {
+        let frames = (BUS_RATE as f32 * FILLER_SILENCE_SECS) as usize;
+        let pcm = vec![0.0; frames * 2];
+        crate::warn!("deezco: no track ready, playing silence filler ({FILLER_SILENCE_SECS:.1}s)");
+        if self.encoder.is_some() {
+            let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
+            self.current = Some(CurrentTrack {
+                title: "Silence".to_string(),
+                audio: CurrentAudio::Pcm { samples: pcm, pos: 0 },
+                bytes_per_sec: bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some(self.runtime.encode_bps);
+            }
+        } else {
+            let Some(encoder) = self.ensure_filler_encoder() else {
+                crate::warn!("deezco: filler encoder missing for silence");
+                return;
+            };
+            let mut mp3 = Vec::new();
+            let mut pos = 0;
+            while pos < pcm.len() {
+                let end = (pos + FEED_FRAMES * 2).min(pcm.len());
+                match encoder.encode_chunk(&pcm[pos..end]) {
+                    Ok(out) => mp3.extend_from_slice(out),
+                    Err(err) => {
+                        crate::warn!("deezco: silence encode failed: {err}");
+                        return;
+                    }
+                }
+                pos = end;
+            }
+            self.current = Some(CurrentTrack {
+                title: "Silence".to_string(),
+                audio: CurrentAudio::Native { data: mp3, pos: 0 },
+                bytes_per_sec: self.nominal_bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some((self.nominal_bps * 8 / 1000) as u32);
+            }
+        }
+    }
+
+    /// Try jingle, fall back to silence. Always leaves `self.current` ready.
+    async fn load_filler(&mut self) {
+        if let Some(path) = self.pick_jingle()
+            && self.load_jingle_file(path).await
+        {
+            return;
+        }
+        self.load_silence_filler();
+    }
+
     /// Load the next track: pop from the prefetch queue (or fetch directly
     /// when the queue drained) and top up the queue. On failure, the track
     /// is skipped and the next prefetched track is tried.
+    #[allow(dead_code)]
     async fn load_next_track(&mut self) -> Result<()> {
         loop {
             let handle = if let Some(h) = self.prefetch.pop_front() {
@@ -868,10 +1201,15 @@ impl Producer {
                 }
                 Ok(Err(err)) => {
                     crate::warn!("deezco: track fetch failed: {err}; skipping");
+                    // Keep the pipeline full so the next attempt doesn't block
+                    // on a cold spawn (that would create a silent gap).
+                    self.spawn_prefetch();
                     continue;
                 }
                 Err(err) => {
-                    return Err(err);
+                    crate::warn!("deezco: prefetch task panicked: {err}; skipping");
+                    self.spawn_prefetch();
+                    continue;
                 }
             }
         }
@@ -910,23 +1248,60 @@ impl Producer {
         }
         loop {
             if self.current.is_none() {
-                let started = std::time::Instant::now();
-                if let Err(err) = self.load_next_track().await {
-                    crate::warn!(
-                        "deezco: track fetch failed: {err}; retrying in {:?}",
-                        RETRY_DELAY
-                    );
-                    sleep(RETRY_DELAY).await;
+                // Non-blocking promotion: if a prefetched track is ready, use it.
+                // Otherwise play filler (jingle or silence) to keep the Icecast
+                // source alive. The previous code blocked on `handle.await`
+                // here with no bytes returned, so Icecast's silent-source
+                // timeout killed the connection and listeners disconnected.
+                let mut promoted = false;
+                let mut attempts = 0;
+                while attempts < 4 {
+                    let ready = self
+                        .prefetch
+                        .front()
+                        .is_some_and(|h| h.is_finished());
+                    if !ready {
+                        break;
+                    }
+                    let handle = self
+                        .prefetch
+                        .pop_front()
+                        .expect("ready front just checked");
+                    while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                        self.spawn_prefetch();
+                    }
+                    match handle.await {
+                        Ok(Ok((track, audio))) => {
+                            self.activate_track(track, audio);
+                            promoted = true;
+                            break;
+                        }
+                        Ok(Err(err)) => {
+                            crate::warn!("deezco: track fetch failed: {err}; skipping");
+                            attempts += 1;
+                            continue;
+                        }
+                        Err(err) => {
+                            crate::warn!("deezco: prefetch panicked: {err}; skipping");
+                            self.spawn_prefetch();
+                            attempts += 1;
+                            continue;
+                        }
+                    }
+                }
+                if promoted {
                     continue;
                 }
-                // A slow prep makes the stream go silent: silent-source hosts
-                // drop the connection, so surface the stall.
-                if started.elapsed() > Duration::from_secs(2) {
-                    crate::warn!(
-                        "deezco: next track took {:?} to prepare (stream was silent)",
-                        started.elapsed()
-                    );
+                // No ready real track — ensure queue stays full for next check
+                // and emit filler so the TCP stream never stalls.
+                while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                    self.spawn_prefetch();
                 }
+                // If everything is still pending (cold start, CDN stall, empty
+                // playlist), `load_next_track` would have blocked for seconds
+                // with no bytes out. Filler keeps bytes flowing.
+                self.load_filler().await;
+                continue;
             }
             if self.metadata && self.meta_remaining == 0 {
                 self.meta_remaining = META_INTERVAL;
@@ -1309,6 +1684,7 @@ pub async fn stream(
         xfade: Arc::new(Mutex::new(XfadeShared::default())),
         stereo_lib,
     };
+    let jingle_dir = config.jingle_dir.clone();
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
         queue.clone(),
@@ -1317,6 +1693,7 @@ pub async fn stream(
         Some(updater.clone()),
         config.playlist.clone(),
         runtime,
+        jingle_dir,
     )?));
 
     let mut reconnect_delay = RECONNECT_DELAY;

@@ -9,6 +9,7 @@ use crate::dedupe::{
 use crate::files::{sanitize_filename, track_belongs_to_artist};
 use crate::models::*;
 use crate::track::{available_format, download_track, dry_run_track_label};
+use futures_util::StreamExt;
 
 // Re-export items that other modules reach via `crate::download::` so the
 // public surface stays stable after the split.
@@ -237,10 +238,32 @@ pub async fn download_artist(
         println!("Found {} albums/releases\n", albums.len());
         let mut total = 0;
         let mut rejected = 0;
-        for album in &albums {
-            let album_title = album.alb_title.as_deref().unwrap_or("Unknown Album");
+        // Fetch album tracks concurrently — was sequential (N RTTs serial).
+        let results = futures_util::stream::iter(albums.iter())
+            .map(|album| {
+                let api = api.clone();
+                let alb_id = album.id_str();
+                let album_title = album
+                    .alb_title
+                    .clone()
+                    .unwrap_or_else(|| "Unknown Album".to_string());
+                async move {
+                    let res = api.get_album_tracks(&alb_id).await;
+                    (album_title, res)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        for (album_title, tracks_res) in results {
             println!("--- Album: {} ---", album_title);
-            let tracks = api.get_album_tracks(&album.id_str()).await?;
+            let tracks = match tracks_res {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("  [err] Failed to get album tracks: {}", e);
+                    continue;
+                }
+            };
             for track in tracks {
                 if !track_belongs_to_artist(&track, art_id, artist_name) {
                     println!("    [skip] Not by {}", artist_name);
@@ -298,31 +321,60 @@ pub async fn download_artist(
         );
     }
 
-    // Gather every album's tracks so they can be downloaded in parallel
+    // Gather every album's tracks concurrently (was sequential before).
     let mut jobs: Vec<(PathBuf, GwTrack)> = Vec::new();
-    for album in &albums {
-        let alb_id = album.id_str();
-        let album_title = album.alb_title.as_deref().unwrap_or("Unknown Album");
-        let album_dir = artist_dir.join(sanitize_filename(album_title));
-
-        println!("--- Album: {} ---", album_title);
-
-        let tracks = match api.get_album_tracks(&alb_id).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("  [err] Failed to get album tracks: {}", e);
+    let fetch_results =
+        futures_util::stream::iter(albums.iter())
+            .map(|album| {
+                let api = api.clone();
+                let alb_id = album.id_str();
+                let album_title = album
+                    .alb_title
+                    .clone()
+                    .unwrap_or_else(|| "Unknown Album".to_string());
+                let album_dir = artist_dir.join(sanitize_filename(&album_title));
+                let art_id = art_id.to_string();
+                let artist_name = artist_name.to_string();
+                async move {
+                    match api.get_album_tracks(&alb_id).await {
+                        Ok(tracks) => {
+                            let mut filtered = Vec::new();
+                            let mut skipped = 0usize;
+                            for track in tracks {
+                                if !track_belongs_to_artist(&track, &art_id, &artist_name) {
+                                    skipped += 1;
+                                } else {
+                                    filtered.push((album_dir.clone(), track));
+                                }
+                            }
+                            Ok::<(String, Vec<(PathBuf, GwTrack)>, usize), (String, anyhow::Error)>(
+                                (album_title, filtered, skipped),
+                            )
+                        }
+                        Err(e) => Err((album_title, e)),
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+    for res in fetch_results {
+        match res {
+            Ok((album_title, filtered, skipped)) => {
+                println!("--- Album: {} ---", album_title);
+                if skipped > 0 {
+                    println!("    [skip] {} track(s) not by {}", skipped, artist_name);
+                }
+                total_skipped += skipped;
+                jobs.extend(filtered);
+            }
+            Err((album_title, e)) => {
+                eprintln!(
+                    "  [err] Failed to get album tracks for {}: {}",
+                    album_title, e
+                );
                 total_failed += 1;
-                continue;
             }
-        };
-
-        for track in tracks {
-            if !track_belongs_to_artist(&track, art_id, artist_name) {
-                total_skipped += 1;
-                println!("    [skip] Not by {}", artist_name);
-                continue;
-            }
-            jobs.push((album_dir.clone(), track));
         }
     }
 

@@ -1837,7 +1837,8 @@ impl Producer {
                         self.jingle_handles.len(),
                         self.prefetch.len()
                     );
-                } else if self.consecutive_filler > 5 && self.consecutive_filler % 10 == 0 {
+                } else if self.consecutive_filler > 5 && self.consecutive_filler.is_multiple_of(10)
+                {
                     crate::warn!(
                         "deezco: still in filler loop: {} consecutive filler (last error: {}) — will keep retrying prefetch",
                         self.consecutive_filler,

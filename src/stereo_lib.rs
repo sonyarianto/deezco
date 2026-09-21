@@ -313,7 +313,10 @@ impl StereoLibHandle {
             "stereo-tool-lib input must be stereo frames"
         );
         let block = PROCESS_BLOCK_FRAMES * 2;
-        for chunk in buf.chunks_mut(block) {
+        let total_frames = buf.len() / 2;
+        let total_blocks = total_frames.div_ceil(PROCESS_BLOCK_FRAMES);
+        let mut last_log = std::time::Instant::now();
+        for (idx, chunk) in buf.chunks_mut(block).enumerate() {
             // The library documents in-place processing with identical
             // in/out size; frames = samples / channels.
             let frames = (chunk.len() / 2) as i32;
@@ -328,6 +331,19 @@ impl StereoLibHandle {
                     2,
                     crate::audio::BUS_RATE as i32,
                 );
+            }
+            // Progress every ~5s or at the end — cheap throttle, not per-block spam.
+            // For a 3:35 track (9493260 frames, ~1159 blocks) this is ~20 lines in 107s.
+            let is_last = idx + 1 == total_blocks;
+            if is_last || last_log.elapsed().as_secs() >= 5 {
+                let percent = (idx + 1) * 100 / total_blocks;
+                crate::info!(
+                    "deezco: stereo-tool-lib progress {percent}% ({}/{} blocks, {} frames)",
+                    idx + 1,
+                    total_blocks,
+                    total_frames
+                );
+                last_log = std::time::Instant::now();
             }
         }
     }

@@ -49,6 +49,11 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const FILLER_SILENCE_SECS: f32 = 2.0;
 /// Avoid repeating the same jingle immediately.
 const JINGLE_RECENT_WINDOW: usize = 3;
+/// How many jingles to keep decoded + DSP-processed ahead of time. With
+/// Stereo Tool the per-track process is ~2× realtime, so a cold on-demand
+/// load would stall the source TCP and create audible gaps between filler
+/// and the next track. Prefetching 5 keeps filler instant.
+const JINGLE_PREFETCH: usize = 5;
 
 /// Scan a directory for audio files to use as filler jingles.
 fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -711,6 +716,14 @@ struct Producer {
     recent_jingles: VecDeque<PathBuf>,
     /// Encoder for native filler (silence/jingles) when pipeline is inactive.
     filler_encoder: Option<SessionEncoder>,
+    /// Decoded + DSP-processed jingles ready to play instantly. Stored as
+    /// loudness-corrected + DSP-processed PCM **before** crossfade — crossfade
+    /// is applied at playback with the current `XfadeShared` tail so the mix
+    /// stays correct even though the jingle was prefetched minutes earlier.
+    /// Keeps up to `JINGLE_PREFETCH` entries to avoid gaps after ST.
+    jingle_cache: VecDeque<(String, Vec<f32>)>,
+    #[allow(clippy::type_complexity)]
+    jingle_handles: VecDeque<JoinHandle<Result<(String, Vec<f32>)>>>,
 }
 
 impl Producer {
@@ -775,7 +788,7 @@ impl Producer {
             seq: 0,
             runtime: runtime.clone(),
         })));
-        Ok(Self {
+        let mut this = Self {
             api,
             queue,
             fetch_format,
@@ -796,7 +809,21 @@ impl Producer {
             jingle_files,
             recent_jingles: VecDeque::new(),
             filler_encoder,
-        })
+            jingle_cache: VecDeque::new(),
+            jingle_handles: VecDeque::new(),
+        };
+        // Prefetch up to JINGLE_PREFETCH jingles decoded + DSP-processed in
+        // the background so filler is instant even with --stereo-tool (≈2×
+        // realtime). Without this the on-demand ST process would stall the
+        // source TCP and create the gap reported after jingles. Duplicates are
+        // allowed — a single-file dir still gets 5 ready instances.
+        for _ in 0..JINGLE_PREFETCH {
+            if this.jingle_files.is_empty() {
+                break;
+            }
+            this.spawn_jingle_task();
+        }
+        Ok(this)
     }
 
     /// Advance the pacing deadline by `take` bytes at `bytes_per_sec`.
@@ -998,6 +1025,211 @@ impl Producer {
             self.recent_jingles.pop_front();
         }
         Some(choice)
+    }
+
+    fn spawn_jingle_task(&mut self) {
+        let Some(path) = self.pick_jingle() else {
+            return;
+        };
+        let pipeline = self.runtime.pipeline.clone();
+        let stereo_lib = self.runtime.stereo_lib.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<(String, Vec<f32>)> {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("failed to read jingle {}", path.display()))?;
+            if bytes.is_empty() {
+                bail!("jingle {} is empty", path.display());
+            }
+            let title = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Jingle")
+                .to_string();
+            let display = format!("Jingle - {title}");
+            // Decode + loudness + DSP without crossfade (crossfade is cheap
+            // and must use the current XfadeShared tail at playback time).
+            let mut pcm = SymphoniaDecoder::new()
+                .decode(&bytes)
+                .with_context(|| format!("decode jingle {}", path.display()))?
+                .into_samples();
+            if pcm.is_empty() {
+                bail!("jingle {} decoded to empty PCM", path.display());
+            }
+            if pipeline.is_active()
+                && let Some(target) = pipeline.loudness
+                && let Some(corr) = crate::loudness::analyze(&pcm, crate::audio::BUS_RATE, target)
+            {
+                crate::loudness::apply_correction(&mut pcm, corr.gain_db);
+            }
+            if pipeline.is_active() {
+                let mut chain = pipeline.build_chain();
+                if let Some(shared) = &stereo_lib {
+                    let reset = pipeline
+                        .stereo_lib
+                        .as_ref()
+                        .is_some_and(|c| c.reset_per_track);
+                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                        shared.clone(),
+                        reset,
+                    ));
+                }
+                if !chain.is_empty() {
+                    chain
+                        .process(&mut pcm)
+                        .with_context(|| format!("DSP jingle {}", path.display()))?;
+                }
+            }
+            Ok((display, pcm))
+        });
+        self.jingle_handles.push_back(handle);
+    }
+
+    async fn poll_jingle_cache(&mut self) {
+        // Drain any finished prefetch tasks into the ready cache (non-blocking:
+        // only handles where is_finished() is true are awaited, so no stall).
+        let mut drained = 0;
+        while let Some(front) = self.jingle_handles.front() {
+            if !front.is_finished() {
+                break;
+            }
+            let handle = self.jingle_handles.pop_front().expect("just checked");
+            match handle.await {
+                Ok(Ok((title, pcm))) if !pcm.is_empty() => {
+                    self.jingle_cache.push_back((title, pcm));
+                    drained += 1;
+                }
+                Ok(Ok(_)) => {
+                    crate::warn!("deezco: jingle prefetch produced empty PCM, retrying");
+                    self.spawn_jingle_task();
+                }
+                Ok(Err(err)) => {
+                    crate::warn!("deezco: jingle prefetch failed: {err}");
+                    self.spawn_jingle_task();
+                }
+                Err(err) => {
+                    crate::warn!("deezco: jingle prefetch panicked: {err}");
+                    self.spawn_jingle_task();
+                }
+            }
+            if drained >= JINGLE_PREFETCH {
+                break;
+            }
+        }
+        // Keep the pipeline full.
+        while self.jingle_cache.len() + self.jingle_handles.len() < JINGLE_PREFETCH
+            && !self.jingle_files.is_empty()
+        {
+            self.spawn_jingle_task();
+        }
+    }
+
+    /// Try to play a prefetched jingle from the cache. Returns true when a
+    /// cached jingle was activated (instant, no ST stall). Falls back to
+    /// on-demand load when the cache is empty.
+    async fn try_load_cached_jingle(&mut self) -> bool {
+        self.poll_jingle_cache().await;
+        let (display, mut pcm) = if let Some(item) = self.jingle_cache.pop_front() {
+            // Refill in background for the next gap.
+            // Spawn eagerly so the cache stays full while this jingle plays.
+            self.poll_jingle_cache().await;
+            item
+        } else if let Some(handle) = self.jingle_handles.pop_front() {
+            // Cache miss but a prefetch is in flight — wait for it instead of
+            // starting a fresh on-demand ST run (which would duplicate work and
+            // still stall). This is still a stall if ST is slow, but it reuses
+            // the already-half-done work rather than starting over.
+            match handle.await {
+                Ok(Ok((title, pcm))) if !pcm.is_empty() => {
+                    self.poll_jingle_cache().await;
+                    (title, pcm)
+                }
+                Ok(Ok(_)) => return false,
+                Ok(Err(err)) => {
+                    crate::warn!("deezco: jingle prefetch failed: {err}");
+                    self.poll_jingle_cache().await;
+                    return false;
+                }
+                Err(err) => {
+                    crate::warn!("deezco: jingle prefetch panicked: {err}");
+                    self.poll_jingle_cache().await;
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        };
+        crate::info!(
+            "deezco: playing jingle \"{display}\" ({} frames, from cache)",
+            pcm.len() / 2
+        );
+        if let Some(updater) = &self.updater {
+            let updater = updater.clone();
+            let t = display.clone();
+            tokio::spawn(async move {
+                if let Err(err) = updater.update(&t).await
+                    && !err.to_string().contains("404")
+                {
+                    crate::warn!("deezco: jingle title update failed: {err}");
+                }
+            });
+        }
+        if self.encoder.is_some() {
+            if self.runtime.pipeline.crossfade.is_enabled() {
+                let mut shared = self.runtime.xfade.lock().await;
+                let (out, new_tail) = render_track_overlap(
+                    &shared.tail,
+                    pcm,
+                    self.runtime.pipeline.crossfade.overlap_frames(),
+                    self.runtime.pipeline.crossfade.curve,
+                );
+                shared.tail = new_tail;
+                pcm = out;
+            }
+            // pcm is already DSP-processed in the prefetch task, so no second
+            // chain here — just set the current track.
+            let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
+            self.current = Some(CurrentTrack {
+                title: display,
+                audio: CurrentAudio::Pcm {
+                    samples: pcm,
+                    pos: 0,
+                },
+                bytes_per_sec: bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some(self.runtime.encode_bps);
+            }
+        } else {
+            let Some(encoder) = self.ensure_filler_encoder() else {
+                crate::warn!("deezco: filler encoder missing for cached jingle");
+                return false;
+            };
+            let mut mp3 = Vec::new();
+            let mut pos = 0;
+            while pos < pcm.len() {
+                let end = (pos + FEED_FRAMES * 2).min(pcm.len());
+                match encoder.encode_chunk(&pcm[pos..end]) {
+                    Ok(out) => mp3.extend_from_slice(out),
+                    Err(err) => {
+                        crate::warn!("deezco: cached jingle encode failed: {err}");
+                        return false;
+                    }
+                }
+                pos = end;
+            }
+            if mp3.is_empty() {
+                crate::warn!("deezco: cached jingle produced no MP3 bytes");
+                return false;
+            }
+            self.current = Some(CurrentTrack {
+                title: display,
+                audio: CurrentAudio::Native { data: mp3, pos: 0 },
+                bytes_per_sec: self.nominal_bps,
+            });
+            if self.actual_kbps.is_none() {
+                self.actual_kbps = Some((self.nominal_bps * 8 / 1000) as u32);
+            }
+        }
+        true
     }
 
     /// Try to load a jingle file as the current track. Returns true on success.
@@ -1328,6 +1560,9 @@ impl Producer {
 
     /// Try jingle, fall back to silence. Always leaves `self.current` ready.
     async fn load_filler(&mut self) {
+        if self.try_load_cached_jingle().await {
+            return;
+        }
         if let Some(path) = self.pick_jingle()
             && self.load_jingle_file(path).await
         {

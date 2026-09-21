@@ -447,6 +447,12 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
             });
         }
     };
+    crate::info!(
+        "deezco: prefetch track #{} got \"{}\" ({})",
+        ctx.seq,
+        track.display_name(),
+        track.id_str()
+    );
     let fetched = match prepare_track_audio(&ctx.api, &track, ctx.fetch_format).await {
         Ok(fetched) => fetched,
         Err(err) => {
@@ -465,7 +471,8 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
     let actual = available_format(&track, ctx.fetch_format);
     if actual != ctx.fetch_format {
         crate::info!(
-            "deezco: source \"{title}\" is {actual} (fallback from {}) → session {} kbps CBR",
+            "deezco: source \"{title}\" ({}) is {actual} (fallback from {}) → session {} kbps CBR",
+            track.id_str(),
             ctx.fetch_format,
             ctx.runtime.encode_bps,
         );
@@ -474,11 +481,16 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
         && ctx.runtime.encode_bps > native
     {
         crate::warn!(
-            "deezco: upscaling \"{title}\" ({actual} → {} kbps); consider --bitrate {native}",
+            "deezco: upscaling \"{title}\" ({}) ({actual} → {} kbps); consider --bitrate {native}",
+            track.id_str(),
             ctx.runtime.encode_bps,
         );
     }
-    crate::info!("deezco: decoding \"{title}\" ({} bytes MP3)...", mp3_len);
+    crate::info!(
+        "deezco: decoding \"{title}\" ({}) ({} bytes MP3)...",
+        track.id_str(),
+        mp3_len
+    );
     let decode_started = std::time::Instant::now();
     // Decode + loudness share one blocking hop: both are full-track CPU
     // (Symphonia decode, then BS.1770's ~16M biquad ticks for a 3-minute
@@ -939,7 +951,10 @@ impl Producer {
     fn spawn_prefetch(&mut self) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        crate::warn!("deezco: prefetching track #{seq} in background");
+        crate::warn!(
+            "deezco: prefetching track #{seq} (playlist {}) in background",
+            self.playlist
+        );
         self.prefetch
             .push_back(tokio::spawn(fetch_next_track(TaskCtx {
                 api: self.api.clone(),
@@ -961,12 +976,17 @@ impl Producer {
     fn activate_track(&mut self, track: GwTrack, audio: PreparedAudio) {
         if self.runtime.pipeline.crossfade.is_enabled() {
             crate::info!(
-                "deezco: now playing: \"{}\" (crossfade {:.1}s)",
+                "deezco: now playing: \"{}\" ({}) (crossfade {:.1}s)",
                 track.display_name(),
+                track.id_str(),
                 self.runtime.pipeline.crossfade.duration_secs
             );
         } else {
-            crate::info!("deezco: now playing: \"{}\"", track.display_name());
+            crate::info!(
+                "deezco: now playing: \"{}\" ({})",
+                track.display_name(),
+                track.id_str()
+            );
         }
         if let Some(updater) = &self.updater {
             let updater = updater.clone();

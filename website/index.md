@@ -59,12 +59,6 @@ deezco serve --port 9001
 deezco stream 908622995 --server http://localhost:8000 --mount /radio --password hackme --crossfade 6 --target-lufs -14
 ```
 
-<div class="tip custom-block" style="padding-top: 8px">
-
-**Manual deploy to Vercel:** this site lives in `website/` as a VitePress app. See [Deployment](/guide/installation#deploy-the-website-to-vercel-manual) for Vercel steps (import repo → set Root Directory = `website` → Build Command `npm run docs:build` → Output `website/.vitepress/dist`).
-
-</div>
-
 ## Why Deezco?
 
 - **Zero runtime deps** for downloads & native streaming; FFmpeg/LAME replaced by bundled Symphonia + LAME MP3 encoder.

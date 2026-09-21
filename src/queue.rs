@@ -91,7 +91,9 @@ impl TrackQueue {
             .get(playlist_id)
             .cloned()
             .unwrap_or_else(|| playlist_id.to_string());
-        crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
+        if crate::track::debug_enabled() {
+            crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
+        }
         let fetched = api.get_playlist_tracks(playlist_id).await;
 
         // Re-acquire the queue lock to publish the fetched tracks. Another
@@ -118,7 +120,7 @@ impl TrackQueue {
                     avoid_recent_repeat(&mut tracks, &queue.recent);
                     queue.tracks = tracks.into();
                     queue.last_fetch = Some(Instant::now());
-                } else {
+                } else if crate::track::debug_enabled() {
                     // Another task already refreshed; keep its result and drop
                     // the redundant fetch (still shuffled, still avoids recent).
                     crate::warn!("deezco: refresh race won by concurrent task, using cached queue");

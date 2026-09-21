@@ -52,8 +52,19 @@ const JINGLE_RECENT_WINDOW: usize = 3;
 /// How many jingles to keep decoded + DSP-processed ahead of time. With
 /// Stereo Tool the per-track process is ~2× realtime, so a cold on-demand
 /// load would stall the source TCP and create audible gaps between filler
-/// and the next track. Prefetching 5 keeps filler instant.
-const JINGLE_PREFETCH: usize = 5;
+/// and the next track. Prefetching 5 keeps filler instant when the pipeline
+/// is light (no ST). With ST the single shared instance serializes all DSP,
+/// so 5 prefetched jingles would starve the real track for ~30-60 s — cap to 1.
+const JINGLE_PREFETCH_LIGHT: usize = 5;
+const JINGLE_PREFETCH_ST: usize = 1;
+
+fn jingle_prefetch_target(pipeline: &PipelineConfig) -> usize {
+    if pipeline.stereo_tool.is_some() || pipeline.stereo_lib.is_some() {
+        JINGLE_PREFETCH_ST
+    } else {
+        JINGLE_PREFETCH_LIGHT
+    }
+}
 
 /// Scan a directory for audio files to use as filler jingles.
 fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -720,7 +731,8 @@ struct Producer {
     /// loudness-corrected + DSP-processed PCM **before** crossfade — crossfade
     /// is applied at playback with the current `XfadeShared` tail so the mix
     /// stays correct even though the jingle was prefetched minutes earlier.
-    /// Keeps up to `JINGLE_PREFETCH` entries to avoid gaps after ST.
+    /// Keeps up to `JINGLE_PREFETCH_LIGHT` (5) or `JINGLE_PREFETCH_ST` (1
+    /// when ST is active) to avoid gaps without starving the real track.
     jingle_cache: VecDeque<(String, Vec<f32>)>,
     #[allow(clippy::type_complexity)]
     jingle_handles: VecDeque<JoinHandle<Result<(String, Vec<f32>)>>>,
@@ -812,12 +824,13 @@ impl Producer {
             jingle_cache: VecDeque::new(),
             jingle_handles: VecDeque::new(),
         };
-        // Prefetch up to JINGLE_PREFETCH jingles decoded + DSP-processed in
-        // the background so filler is instant even with --stereo-tool (≈2×
-        // realtime). Without this the on-demand ST process would stall the
-        // source TCP and create the gap reported after jingles. Duplicates are
-        // allowed — a single-file dir still gets 5 ready instances.
-        for _ in 0..JINGLE_PREFETCH {
+        // Prefetch jingles decoded + DSP-processed in the background so filler
+        // is instant even with --stereo-tool (≈2× realtime). Without this the
+        // on-demand ST process would stall the source TCP and create the gap
+        // reported after jingles. Light pipeline keeps 5, ST keeps 1 to avoid
+        // starving the real track (single shared ST instance serializes).
+        let target = jingle_prefetch_target(&this.runtime.pipeline);
+        for _ in 0..target {
             if this.jingle_files.is_empty() {
                 break;
             }
@@ -1110,12 +1123,13 @@ impl Producer {
                     self.spawn_jingle_task();
                 }
             }
-            if drained >= JINGLE_PREFETCH {
+            if drained >= jingle_prefetch_target(&self.runtime.pipeline) {
                 break;
             }
         }
         // Keep the pipeline full.
-        while self.jingle_cache.len() + self.jingle_handles.len() < JINGLE_PREFETCH
+        let target = jingle_prefetch_target(&self.runtime.pipeline);
+        while self.jingle_cache.len() + self.jingle_handles.len() < target
             && !self.jingle_files.is_empty()
         {
             self.spawn_jingle_task();

@@ -68,11 +68,17 @@ fn jingle_prefetch_target(pipeline: &PipelineConfig) -> usize {
 
 impl Producer {
     fn jingle_target(&self) -> usize {
-        // ST-aware warm-up must not starve the very first real track. Keep
-        // 1 until we have actually played a real track; afterwards keep 5 so
-        // burst failures (many holes) are bridged without gaps. Light pipeline
-        // (no ST) can keep 5 from the start — decode is cheap.
-        if self.has_had_real_track {
+        // ST-aware: no jingles at all before the first real track is ready —
+        // otherwise the single shared ST instance (Mutex) blocks the track's
+        // 120s DSP behind a 15s jingle and warm_up looks stuck. Jingles are
+        // warmed to 5 after has_had_real_track, on a different background
+        // window while the track is playing. Light pipeline (no ST) can keep
+        // 5 from the start — decode is cheap and not contended.
+        if !self.has_had_real_track
+            && jingle_prefetch_target(&self.runtime.pipeline) == JINGLE_PREFETCH_ST
+        {
+            0
+        } else if self.has_had_real_track {
             JINGLE_PREFETCH_LIGHT
         } else {
             jingle_prefetch_target(&self.runtime.pipeline)

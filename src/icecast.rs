@@ -66,6 +66,20 @@ fn jingle_prefetch_target(pipeline: &PipelineConfig) -> usize {
     }
 }
 
+impl Producer {
+    fn jingle_target(&self) -> usize {
+        // ST-aware warm-up must not starve the very first real track. Keep
+        // 1 until we have actually played a real track; afterwards keep 5 so
+        // burst failures (many holes) are bridged without gaps. Light pipeline
+        // (no ST) can keep 5 from the start — decode is cheap.
+        if self.has_had_real_track {
+            JINGLE_PREFETCH_LIGHT
+        } else {
+            jingle_prefetch_target(&self.runtime.pipeline)
+        }
+    }
+}
+
 /// Scan a directory for audio files to use as filler jingles.
 fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -736,6 +750,7 @@ struct Producer {
     jingle_cache: VecDeque<(String, Vec<f32>)>,
     #[allow(clippy::type_complexity)]
     jingle_handles: VecDeque<JoinHandle<Result<(String, Vec<f32>)>>>,
+    has_had_real_track: bool,
 }
 
 impl Producer {
@@ -823,13 +838,14 @@ impl Producer {
             filler_encoder,
             jingle_cache: VecDeque::new(),
             jingle_handles: VecDeque::new(),
+            has_had_real_track: false,
         };
         // Prefetch jingles decoded + DSP-processed in the background so filler
         // is instant even with --stereo-tool (≈2× realtime). Without this the
         // on-demand ST process would stall the source TCP and create the gap
-        // reported after jingles. Light pipeline keeps 5, ST keeps 1 to avoid
-        // starving the real track (single shared ST instance serializes).
-        let target = jingle_prefetch_target(&this.runtime.pipeline);
+        // reported after jingles. Light pipeline keeps 5, ST keeps 1 until the
+        // first real track has played then 5 to bridge burst failures.
+        let target = this.jingle_target();
         for _ in 0..target {
             if this.jingle_files.is_empty() {
                 break;
@@ -1012,6 +1028,16 @@ impl Producer {
             audio,
             bytes_per_sec,
         });
+        self.has_had_real_track = true;
+        // After the first real track, warm the jingle cache to 5 for burst
+        // holes (many failed tracks). Done without awaiting — tasks run in
+        // background while the track plays, so the next hole is bridged.
+        let target = self.jingle_target();
+        while self.jingle_cache.len() + self.jingle_handles.len() < target
+            && !self.jingle_files.is_empty()
+        {
+            self.spawn_jingle_task();
+        }
         // Note: `meta_remaining` intentionally lives on the Producer and is
         // carried across track changes — the ICY interval must stay
         // continuous for as long as the source connection is open.
@@ -1123,12 +1149,22 @@ impl Producer {
                     self.spawn_jingle_task();
                 }
             }
-            if drained >= jingle_prefetch_target(&self.runtime.pipeline) {
+            if drained >= self.jingle_target() {
                 break;
             }
         }
-        // Keep the pipeline full.
-        let target = jingle_prefetch_target(&self.runtime.pipeline);
+        // Keep the pipeline full. After the first real track we keep 5 to
+        // bridge burst failures (many holes) without gaps; before that keep
+        // 1 so the first track's ST isn't starved.
+        let target = self.jingle_target();
+        // Also avoid spawning new jingle ST while the first real track's ST
+        // is still pending — otherwise the 5 jingles would again starve it.
+        let first_track_pending = !self.has_had_real_track
+            && self.runtime.pipeline.is_active()
+            && self.prefetch.front().is_some_and(|h| !h.is_finished());
+        if first_track_pending && !self.jingle_cache.is_empty() {
+            return;
+        }
         while self.jingle_cache.len() + self.jingle_handles.len() < target
             && !self.jingle_files.is_empty()
         {

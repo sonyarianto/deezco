@@ -51,7 +51,7 @@ export default defineConfig({
       { icon: 'github', link: 'https://github.com/sonyarianto/deezco' }
     ],
     footer: {
-      message: 'Released under the MIT License.'
+      message: 'Released under the MIT License'
     },
     editLink: {
       pattern: 'https://github.com/sonyarianto/deezco/edit/main/website/:path',

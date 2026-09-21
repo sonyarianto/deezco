@@ -14,9 +14,13 @@ use crate::models::*;
 /// to print download-stage messages (start/finish, byte counts) that help
 /// diagnose stalls and throttling without cluttering normal output.
 pub(crate) fn debug_enabled() -> bool {
-    std::env::var("DEEZCO_DEBUG")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("DEEZCO_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Quality and format settings shared by every download command.
@@ -184,9 +188,17 @@ pub async fn fetch_track_audio_from_url(
         bail!("Downloaded file is empty");
     }
 
-    // Decrypt the stream
-    let blowfish_key = crypto::generate_blowfish_key(sng_id);
-    let final_data = crypto::decrypt_stream(&data, &blowfish_key);
+    // Decrypt the stream off the async executor (Blowfish CBC per 2048B
+    // touches ~1.6k key expansions for a 10MB track — must not stall the
+    // tokio worker). The spawn_blocking work is the decrypt only; depadding
+    // is cheap and stays on the async thread.
+    let sng_id_owned = sng_id.to_string();
+    let final_data = tokio::task::spawn_blocking(move || {
+        let blowfish_key = crypto::generate_blowfish_key(&sng_id_owned);
+        crypto::decrypt_stream(&data, &blowfish_key)
+    })
+    .await
+    .context("decrypt task panicked")?;
 
     // Remove leading null bytes (depadding) - but not for ftyp (MP4)
     let output_data = if !final_data.is_empty() && final_data[0] == 0 {

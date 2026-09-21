@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::crypto;
 use crate::files::{is_audio_file, sanitize_filename};
 
 async fn remove_empty_dirs(root: &Path) -> Result<()> {
@@ -82,10 +81,24 @@ pub async fn clean_artist_directory(artist_dir: &Path, artist_name: &str) -> Res
 }
 
 async fn audio_file_hash(path: &Path) -> Result<String> {
-    let data = tokio::fs::read(path)
+    use md5::{Digest, Md5};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("Failed to read audio file for hashing: {}", path.display()))?;
-    Ok(crypto::md5_hex(&data))
+        .with_context(|| format!("Failed to open audio file for hashing: {}", path.display()))?;
+    let mut hasher = Md5::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.with_context(|| {
+            format!("Failed to read audio file for hashing: {}", path.display())
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub async fn collect_audio_files(root: &Path) -> Result<Vec<PathBuf>> {

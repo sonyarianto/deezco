@@ -636,10 +636,7 @@ async fn main() -> Result<()> {
             if let Some(dir) = &jingle_dir
                 && !dir.is_dir()
             {
-                anyhow::bail!(
-                    "--jingle-dir {} is not a directory",
-                    dir.display()
-                );
+                anyhow::bail!("--jingle-dir {} is not a directory", dir.display());
             }
             let config = icecast::IcecastConfig {
                 server,

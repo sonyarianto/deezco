@@ -830,10 +830,7 @@ impl Producer {
         // can connect immediately instead of hanging until Deezer recovers.
         let mut attempts = 0;
         while attempts < 4 {
-            let ready = self
-                .prefetch
-                .front()
-                .is_some_and(|h| h.is_finished());
+            let ready = self.prefetch.front().is_some_and(|h| h.is_finished());
             if !ready {
                 break;
             }
@@ -865,10 +862,7 @@ impl Producer {
             while self.prefetch.len() < Self::PREFETCH_AHEAD {
                 self.spawn_prefetch();
             }
-            let ready = self
-                .prefetch
-                .front()
-                .is_some_and(|h| h.is_finished());
+            let ready = self.prefetch.front().is_some_and(|h| h.is_finished());
             if ready {
                 let handle = self.prefetch.pop_front().expect("ready front");
                 while self.prefetch.len() < Self::PREFETCH_AHEAD {
@@ -1021,7 +1015,9 @@ impl Producer {
         };
         // Decode in blocking thread (Symphonia is CPU-bound).
         let decode = tokio::task::spawn_blocking(move || {
-            SymphoniaDecoder::new().decode(&bytes).map(|buf| buf.into_samples())
+            SymphoniaDecoder::new()
+                .decode(&bytes)
+                .map(|buf| buf.into_samples())
         })
         .await;
         let pcm = match decode {
@@ -1035,7 +1031,10 @@ impl Producer {
                 return false;
             }
             Err(err) => {
-                crate::warn!("deezco: jingle decode task panicked for {}: {err}", path.display());
+                crate::warn!(
+                    "deezco: jingle decode task panicked for {}: {err}",
+                    path.display()
+                );
                 return false;
             }
         };
@@ -1045,7 +1044,10 @@ impl Producer {
             .unwrap_or("Jingle")
             .to_string();
         let display = format!("Jingle - {title}");
-        crate::info!("deezco: playing jingle \"{display}\" ({} frames)", pcm.len() / 2);
+        crate::info!(
+            "deezco: playing jingle \"{display}\" ({} frames)",
+            pcm.len() / 2
+        );
         if let Some(updater) = &self.updater {
             let updater = updater.clone();
             let t = display.clone();
@@ -1062,7 +1064,10 @@ impl Producer {
             let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
             self.current = Some(CurrentTrack {
                 title: display,
-                audio: CurrentAudio::Pcm { samples: pcm, pos: 0 },
+                audio: CurrentAudio::Pcm {
+                    samples: pcm,
+                    pos: 0,
+                },
                 bytes_per_sec: bps,
             });
             if self.actual_kbps.is_none() {
@@ -1135,7 +1140,10 @@ impl Producer {
             let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
             self.current = Some(CurrentTrack {
                 title: "Silence".to_string(),
-                audio: CurrentAudio::Pcm { samples: pcm, pos: 0 },
+                audio: CurrentAudio::Pcm {
+                    samples: pcm,
+                    pos: 0,
+                },
                 bytes_per_sec: bps,
             });
             if self.actual_kbps.is_none() {
@@ -1256,17 +1264,11 @@ impl Producer {
                 let mut promoted = false;
                 let mut attempts = 0;
                 while attempts < 4 {
-                    let ready = self
-                        .prefetch
-                        .front()
-                        .is_some_and(|h| h.is_finished());
+                    let ready = self.prefetch.front().is_some_and(|h| h.is_finished());
                     if !ready {
                         break;
                     }
-                    let handle = self
-                        .prefetch
-                        .pop_front()
-                        .expect("ready front just checked");
+                    let handle = self.prefetch.pop_front().expect("ready front just checked");
                     while self.prefetch.len() < Self::PREFETCH_AHEAD {
                         self.spawn_prefetch();
                     }

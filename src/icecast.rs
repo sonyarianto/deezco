@@ -877,20 +877,30 @@ impl Producer {
     /// Ensure the first track is loaded and ready. Used before opening the
     /// Icecast connection so audio flows immediately upon registration:
     /// hosts like caster.fm drop silent sources within seconds.
+    /// No hardcoded timeout — waits until the first real track is ready
+    /// (decode → DSP) and also ensures the next track is already being
+    /// prefetched so there is no gap after the first one. Jingles stay as
+    /// fallback only for later holes, not for warm-up.
     async fn warm_up(&mut self) -> Result<()> {
         if self.current.is_some() {
             return Ok(());
         }
-        // Try to promote any ready prefetch quickly; if none ready within
-        // 5s, fall back to filler (jingle/silence) so the Icecast source
-        // can connect immediately instead of hanging until Deezer recovers.
-        let mut attempts = 0;
-        while attempts < 4 {
-            let ready = self.prefetch.front().is_some_and(|h| h.is_finished());
-            if !ready {
-                break;
-            }
-            let handle = self.prefetch.pop_front().expect("ready front");
+        // Keep the prefetch pipeline full while we wait.
+        while self.prefetch.len() < Self::PREFETCH_AHEAD {
+            self.spawn_prefetch();
+        }
+        // Wait indefinitely for the first real track — no 5s hardcode.
+        // Each handle is awaited directly (which waits for decode + ST) and
+        // on failure we keep the pipeline full and try the next one. This
+        // guarantees the bus is ready (Pcm ready for the session encoder)
+        // before we register the source.
+        loop {
+            let handle = self
+                .prefetch
+                .pop_front()
+                .expect("prefetch queue must have an entry");
+            // Keep queue full so the *next* track is already in flight while
+            // we wait for the front one — no gap after the first track.
             while self.prefetch.len() < Self::PREFETCH_AHEAD {
                 self.spawn_prefetch();
             }
@@ -900,51 +910,21 @@ impl Producer {
                     return Ok(());
                 }
                 Ok(Err(err)) => {
-                    crate::warn!("deezco: warm_up track fetch failed: {err}; skipping");
-                    attempts += 1;
+                    // Empty playlist or fetch error — keep trying next seq.
+                    // If the playlist is truly empty this will loop, but
+                    // run_connection's retry will eventually surface via
+                    // next_track's Empty handling; warm_up must not fallback
+                    // to filler here (bus must be real track).
+                    crate::warn!("deezco: warm_up track fetch failed: {err}; retrying");
                     continue;
                 }
                 Err(err) => {
-                    crate::warn!("deezco: warm_up prefetch panicked: {err}; skipping");
-                    attempts += 1;
+                    crate::warn!("deezco: warm_up prefetch panicked: {err}; retrying");
                     self.spawn_prefetch();
                     continue;
                 }
             }
         }
-        let start = Instant::now();
-        let timeout = Duration::from_secs(5);
-        while start.elapsed() < timeout {
-            while self.prefetch.len() < Self::PREFETCH_AHEAD {
-                self.spawn_prefetch();
-            }
-            let ready = self.prefetch.front().is_some_and(|h| h.is_finished());
-            if ready {
-                let handle = self.prefetch.pop_front().expect("ready front");
-                while self.prefetch.len() < Self::PREFETCH_AHEAD {
-                    self.spawn_prefetch();
-                }
-                match handle.await {
-                    Ok(Ok((track, audio))) => {
-                        self.activate_track(track, audio);
-                        return Ok(());
-                    }
-                    Ok(Err(err)) => {
-                        crate::warn!("deezco: warm_up track fetch failed: {err}; skipping");
-                        continue;
-                    }
-                    Err(err) => {
-                        crate::warn!("deezco: warm_up prefetch panicked: {err}; skipping");
-                        self.spawn_prefetch();
-                        continue;
-                    }
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        crate::warn!("deezco: warm_up no real track ready after 5s, using filler");
-        self.load_filler().await;
-        Ok(())
     }
 
     /// Spawn a background prefetch for the next track and push it to

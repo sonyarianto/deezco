@@ -67,6 +67,10 @@ fn jingle_prefetch_target(pipeline: &PipelineConfig) -> usize {
 }
 
 impl Producer {
+    fn has_pending_track(&self) -> bool {
+        self.prefetch.iter().any(|h| !h.is_finished())
+    }
+
     fn jingle_target(&self) -> usize {
         // ST-aware: no jingles at all before the first real track is ready —
         // otherwise the single shared ST instance (Mutex) blocks the track's
@@ -77,8 +81,22 @@ impl Producer {
         if !self.has_had_real_track
             && jingle_prefetch_target(&self.runtime.pipeline) == JINGLE_PREFETCH_ST
         {
-            0
-        } else if self.has_had_real_track {
+            return 0;
+        }
+        // After the first track, burst holes need 5 jingles — but when ST is
+        // active the shared Mutex serializes all DSP, so 5 jingles (+2 tracks)
+        // starve the real track for 30-60s (see 2026-09-21 13:34 infinite-jingle
+        // log: 3.5 min with no track, only Jingle progress). Keep at most 1
+        // jingle ready while a track DSP is still pending, so the track wins
+        // the Mutex first. Once track prefetches are all finished the cache
+        // can expand back to 5 without starving.
+        if self.has_had_real_track
+            && jingle_prefetch_target(&self.runtime.pipeline) == JINGLE_PREFETCH_ST
+            && self.has_pending_track()
+        {
+            return JINGLE_PREFETCH_ST;
+        }
+        if self.has_had_real_track {
             JINGLE_PREFETCH_LIGHT
         } else {
             jingle_prefetch_target(&self.runtime.pipeline)
@@ -768,11 +786,19 @@ struct Producer {
     /// is applied at playback with the current `XfadeShared` tail so the mix
     /// stays correct even though the jingle was prefetched minutes earlier.
     /// Keeps up to `JINGLE_PREFETCH_LIGHT` (5) or `JINGLE_PREFETCH_ST` (1
-    /// when ST is active) to avoid gaps without starving the real track.
+    /// when ST is active); with ST the effective target throttles to 1 while
+    /// a track prefetch is still pending so the real track wins the shared
+    /// libStereoTool Mutex (2026-09-21 starvation fix).
     jingle_cache: VecDeque<(String, Vec<f32>)>,
     #[allow(clippy::type_complexity)]
     jingle_handles: VecDeque<JoinHandle<Result<(String, Vec<f32>)>>>,
     has_had_real_track: bool,
+    /// Diagnostics for filler starvation: counts consecutive jingle/silence
+    /// plays without a real track and remembers the last track error, so a
+    /// stuck loop (see 2026-09-21 infinite-jingle) surfaces as a throttled
+    /// warn with actionable context instead of silent 3-minute jingle spam.
+    consecutive_filler: usize,
+    last_track_error: Option<String>,
 }
 
 impl Producer {
@@ -861,6 +887,8 @@ impl Producer {
             jingle_cache: VecDeque::new(),
             jingle_handles: VecDeque::new(),
             has_had_real_track: false,
+            consecutive_filler: 0,
+            last_track_error: None,
         };
         // Prefetch jingles decoded + DSP-processed in the background so filler
         // is instant even with --stereo-tool (≈2× realtime). Without this the
@@ -1039,6 +1067,15 @@ impl Producer {
             bytes_per_sec,
         });
         self.has_had_real_track = true;
+        // Real track broke the filler streak — reset diagnostics and surface recovery.
+        if self.consecutive_filler > 0 {
+            crate::info!(
+                "deezco: recovered after {} consecutive filler(s)",
+                self.consecutive_filler
+            );
+        }
+        self.consecutive_filler = 0;
+        self.last_track_error = None;
         // After the first real track, warm the jingle cache to 5 for burst
         // holes (many failed tracks). Done without awaiting — tasks run in
         // background while the track plays, so the next hole is bridged.
@@ -1167,11 +1204,21 @@ impl Producer {
             }
         }
         // Keep the pipeline full. After the first real track we keep 5 to
-        // bridge burst failures (many holes) without gaps; before that keep
-        // 1 so the first track's ST isn't starved.
+        // bridge burst failures — but with ST the shared Mutex would starve
+        // real tracks, so jingle_target() throttles to 1 while a track is
+        // pending (see 2026-09-21 infinite-jingle). Before the first track we
+        // keep 0.
         let target = self.jingle_target();
-        // Also avoid spawning new jingle ST while the first real track's ST
-        // is still pending — otherwise the 5 jingles would again starve it.
+        // Avoid spawning new jingle ST while any track ST is still pending and
+        // we already have at least one jingle ready — the track must win the
+        // Mutex first (covers both warm_up and steady-state).
+        let track_pending = self.has_pending_track() && self.runtime.pipeline.is_active();
+        if track_pending
+            && !self.jingle_cache.is_empty()
+            && jingle_prefetch_target(&self.runtime.pipeline) == JINGLE_PREFETCH_ST
+        {
+            return;
+        }
         let first_track_pending = !self.has_had_real_track
             && self.runtime.pipeline.is_active()
             && self.prefetch.front().is_some_and(|h| !h.is_finished());
@@ -1729,12 +1776,16 @@ impl Producer {
                             break;
                         }
                         Ok(Err(err)) => {
-                            crate::warn!("deezco: track fetch failed: {err}; skipping");
+                            let msg = err.to_string();
+                            crate::warn!("deezco: track fetch failed: {msg}; skipping");
+                            self.last_track_error = Some(msg);
                             attempts += 1;
                             continue;
                         }
                         Err(err) => {
-                            crate::warn!("deezco: prefetch panicked: {err}; skipping");
+                            let msg = err.to_string();
+                            crate::warn!("deezco: prefetch panicked: {msg}; skipping");
+                            self.last_track_error = Some(msg);
                             self.spawn_prefetch();
                             attempts += 1;
                             continue;
@@ -1749,10 +1800,50 @@ impl Producer {
                 while self.prefetch.len() < Self::PREFETCH_AHEAD {
                     self.spawn_prefetch();
                 }
+                // Diagnostics: how many tracks are pending vs stuck, so filler
+                // loops without a track surface reason before 3 minutes of
+                // opaque jingle spam (2026-09-21 log).
+                if self.has_pending_track() {
+                    // At least one track is still being fetched/decoded/DSP'd;
+                    // filler is bridging the gap while the Mutex is contended.
+                    // Throttled to 1 jingle via jingle_target() so the track wins.
+                    crate::warn!(
+                        "deezco: no ready track yet ({} prefetch pending, {} jingle cached/{} handles, consecutive filler {}) — playing filler to keep Icecast alive",
+                        self.prefetch.iter().filter(|h| !h.is_finished()).count(),
+                        self.jingle_cache.len(),
+                        self.jingle_handles.len(),
+                        self.consecutive_filler + 1
+                    );
+                } else if let Some(err) = &self.last_track_error {
+                    crate::warn!(
+                        "deezco: no ready track and no pending prefetch (last error: {err}; {} jingle cached) — playing filler",
+                        self.jingle_cache.len()
+                    );
+                }
                 // If everything is still pending (cold start, CDN stall, empty
                 // playlist), `load_next_track` would have blocked for seconds
                 // with no bytes out. Filler keeps bytes flowing.
                 self.load_filler().await;
+                // Track filler streak for starvation detection; activate_track
+                // resets it on real track recovery.
+                self.consecutive_filler += 1;
+                if self.consecutive_filler == 5 {
+                    crate::warn!(
+                        "deezco: filler loop: {} consecutive jingle/silence without a real track (last track error: {}) — check playlist {} is non-empty, ARL valid, and ST Mutex not starved; jingle cache {}/{}, pending tracks {}",
+                        self.consecutive_filler,
+                        self.last_track_error.as_deref().unwrap_or("none"),
+                        self.playlist,
+                        self.jingle_cache.len(),
+                        self.jingle_handles.len(),
+                        self.prefetch.len()
+                    );
+                } else if self.consecutive_filler > 5 && self.consecutive_filler % 10 == 0 {
+                    crate::warn!(
+                        "deezco: still in filler loop: {} consecutive filler (last error: {}) — will keep retrying prefetch",
+                        self.consecutive_filler,
+                        self.last_track_error.as_deref().unwrap_or("none")
+                    );
+                }
                 continue;
             }
             if self.metadata && self.meta_remaining == 0 {

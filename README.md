@@ -295,7 +295,11 @@ deezco stream 908622995 --server http://sapircast.caster.fm:14508 \
 # Filler when no track is ready (failed download, empty playlist, or next
 # prefetch still pending). Instead of stalling the TCP stream and letting
 # Icecast drop the source, a random jingle from the directory is played;
-# without --jingle-dir a 2s silence filler keeps the connection alive:
+# without --jingle-dir a 2s silence filler keeps the connection alive.
+# When the PCM pipeline is active (--crossfade/--gain-db/--target-lufs/
+# --bitrate/--stereo-tool*/--stereo-tool-lib) filler PCM follows the same
+# path as regular tracks (loudness -> crossfade -> DSP -> session CBR) so
+# jingles stay sonically consistent:
 deezco stream 908622995 --server http://localhost:8000 --mount /radio \
   --password hackme --jingle-dir ./jingles
 

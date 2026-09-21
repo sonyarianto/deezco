@@ -1001,6 +1001,10 @@ impl Producer {
     }
 
     /// Try to load a jingle file as the current track. Returns true on success.
+    /// When the pipeline is active the jingle follows the exact same path as
+    /// regular tracks: loudness normalization -> crossfade -> DSP (gain + Stereo
+    /// Tool/lib) -> session encoder. This keeps jingles sonically consistent
+    /// with the music instead of bypassing the broadcast chain.
     async fn load_jingle_file(&mut self, path: PathBuf) -> bool {
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) if !b.is_empty() => b,
@@ -1013,14 +1017,47 @@ impl Producer {
                 return false;
             }
         };
-        // Decode in blocking thread (Symphonia is CPU-bound).
-        let decode = tokio::task::spawn_blocking(move || {
-            SymphoniaDecoder::new()
-                .decode(&bytes)
-                .map(|buf| buf.into_samples())
-        })
-        .await;
-        let pcm = match decode {
+        let title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Jingle")
+            .to_string();
+        let display = format!("Jingle - {title}");
+        // When the pipeline is active, decode + loudness share one blocking hop
+        // (same as fetch_next_track) so the filler matches the music's LUFS.
+        let pipeline_active = self.runtime.pipeline.is_active();
+        let loudness_target = self.runtime.pipeline.loudness;
+        let display_for_loudness = display.clone();
+        let decode = if pipeline_active && loudness_target.is_some() {
+            tokio::task::spawn_blocking(move || {
+                let mut buf = SymphoniaDecoder::new().decode(&bytes)?;
+                if let Some(target) = loudness_target {
+                    match crate::loudness::analyze(buf.samples(), crate::audio::BUS_RATE, target) {
+                        Some(correction) => {
+                            crate::info!(
+                                "deezco: loudness \"{display_for_loudness}\": {:.1} LUFS -> {:+.1} dB (target {target:.0})",
+                                correction.integrated_lufs,
+                                correction.gain_db,
+                            );
+                            crate::loudness::apply_correction(buf.samples_mut(), correction.gain_db);
+                        }
+                        None => {
+                            crate::warn!("deezco: loudness \"{display_for_loudness}\": unmeasurable, passing through");
+                        }
+                    }
+                }
+                Ok::<Vec<f32>, anyhow::Error>(buf.into_samples())
+            })
+            .await
+        } else {
+            tokio::task::spawn_blocking(move || {
+                SymphoniaDecoder::new()
+                    .decode(&bytes)
+                    .map(|buf| buf.into_samples())
+            })
+            .await
+        };
+        let mut pcm = match decode {
             Ok(Ok(samples)) if !samples.is_empty() => samples,
             Ok(Ok(_)) => {
                 crate::warn!("deezco: jingle {} decoded to empty PCM", path.display());
@@ -1038,12 +1075,6 @@ impl Producer {
                 return false;
             }
         };
-        let title = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Jingle")
-            .to_string();
-        let display = format!("Jingle - {title}");
         crate::info!(
             "deezco: playing jingle \"{display}\" ({} frames)",
             pcm.len() / 2
@@ -1059,13 +1090,78 @@ impl Producer {
                 }
             });
         }
+        // Pipeline path: loudness already applied above; now crossfade + DSP
+        // before the session encoder so jingles are indistinguishable from
+        // regular tracks (no loudness jump, no bypassed Stereo Tool).
         if self.encoder.is_some() {
-            // Pipeline CBR: PCM goes through the session encoder.
+            // Crossfade: mix the held tail (previous track/jingle) with the
+            // jingle head and publish the jingle tail for the next track.
+            // Version is NOT advanced — filler is not a sequenced prefetch
+            // task — but the tail is still updated so the next real track
+            // crossfades from the jingle instead of hard-cutting.
+            if self.runtime.pipeline.crossfade.is_enabled() {
+                let mut shared = self.runtime.xfade.lock().await;
+                let (out, new_tail) = render_track_overlap(
+                    &shared.tail,
+                    pcm,
+                    self.runtime.pipeline.crossfade.overlap_frames(),
+                    self.runtime.pipeline.crossfade.curve,
+                );
+                shared.tail = new_tail;
+                pcm = out;
+            }
+            // DSP chain (gain + Stereo Tool/lib) on the already-leveled and
+            // crossfaded PCM. Runs on a blocking thread; the libStereoTool
+            // mutex is held inside process() and serializes with prefetch
+            // tasks. Filler does not claim the ordered DSP turn — it simply
+            // serializes on the mutex — which keeps stream order (filler
+            // between two tracks runs between their DSP calls) without
+            // stalling the sequenced handoff.
+            let pipeline = self.runtime.pipeline.clone();
+            let stereo_lib = self.runtime.stereo_lib.clone();
+            let display_for_dsp = display.clone();
+            let dsp_result = tokio::task::spawn_blocking(move || {
+                let mut chain = pipeline.build_chain();
+                if let Some(shared) = &stereo_lib {
+                    let reset = pipeline
+                        .stereo_lib
+                        .as_ref()
+                        .is_some_and(|c| c.reset_per_track);
+                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                        shared.clone(),
+                        reset,
+                    ));
+                }
+                if !chain.is_empty() {
+                    let names = chain.names().join(" -> ");
+                    crate::info!(
+                        "deezco: DSP ({names}) \"{display_for_dsp}\" ({} frames)...",
+                        pcm.len() / 2
+                    );
+                }
+                if let Err(err) = chain.process(&mut pcm) {
+                    crate::warn!(
+                        "deezco: jingle DSP failed for \"{display_for_dsp}\": {err}; bypassing"
+                    );
+                }
+                pcm
+            })
+            .await;
+            let processed = match dsp_result {
+                Ok(samples) => samples,
+                Err(err) => {
+                    crate::warn!(
+                        "deezco: jingle DSP task panicked for {}: {err}",
+                        path.display()
+                    );
+                    return false;
+                }
+            };
             let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
             self.current = Some(CurrentTrack {
                 title: display,
                 audio: CurrentAudio::Pcm {
-                    samples: pcm,
+                    samples: processed,
                     pos: 0,
                 },
                 bytes_per_sec: bps,
@@ -1132,16 +1228,68 @@ impl Producer {
     }
 
     /// Load a short silence filler as the current track. Always succeeds.
-    fn load_silence_filler(&mut self) {
+    /// When the pipeline is active the silence is crossfaded and DSP-processed
+    /// just like a real track (gain is no-op on silence, Stereo Tool on silence
+    /// is effectively silence + latency) so the stream offsets stay consistent.
+    async fn load_silence_filler(&mut self) {
         let frames = (BUS_RATE as f32 * FILLER_SILENCE_SECS) as usize;
-        let pcm = vec![0.0; frames * 2];
+        let mut pcm = vec![0.0; frames * 2];
         crate::warn!("deezco: no track ready, playing silence filler ({FILLER_SILENCE_SECS:.1}s)");
         if self.encoder.is_some() {
+            if self.runtime.pipeline.crossfade.is_enabled() {
+                let mut shared = self.runtime.xfade.lock().await;
+                let (out, new_tail) = render_track_overlap(
+                    &shared.tail,
+                    pcm,
+                    self.runtime.pipeline.crossfade.overlap_frames(),
+                    self.runtime.pipeline.crossfade.curve,
+                );
+                shared.tail = new_tail;
+                pcm = out;
+            }
+            // Silence is already 0.0 — gain/loudness are no-ops — but run the
+            // chain anyway so latency and state handling match regular tracks.
+            let pipeline = self.runtime.pipeline.clone();
+            let stereo_lib = self.runtime.stereo_lib.clone();
+            let dsp_result = tokio::task::spawn_blocking(move || {
+                let mut chain = pipeline.build_chain();
+                if let Some(shared) = &stereo_lib {
+                    let reset = pipeline
+                        .stereo_lib
+                        .as_ref()
+                        .is_some_and(|c| c.reset_per_track);
+                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                        shared.clone(),
+                        reset,
+                    ));
+                }
+                if !chain.is_empty() {
+                    // Silence through DSP is still silence; just keep the
+                    // processing slot consistent (and log for visibility).
+                    let names = chain.names().join(" -> ");
+                    crate::info!(
+                        "deezco: DSP ({names}) \"Silence\" ({} frames)...",
+                        pcm.len() / 2
+                    );
+                }
+                if let Err(err) = chain.process(&mut pcm) {
+                    crate::warn!("deezco: silence DSP failed: {err}; bypassing");
+                }
+                pcm
+            })
+            .await;
+            let processed = match dsp_result {
+                Ok(samples) => samples,
+                Err(err) => {
+                    crate::warn!("deezco: silence DSP task panicked: {err}");
+                    return;
+                }
+            };
             let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
             self.current = Some(CurrentTrack {
                 title: "Silence".to_string(),
                 audio: CurrentAudio::Pcm {
-                    samples: pcm,
+                    samples: processed,
                     pos: 0,
                 },
                 bytes_per_sec: bps,
@@ -1185,7 +1333,7 @@ impl Producer {
         {
             return;
         }
-        self.load_silence_filler();
+        self.load_silence_filler().await;
     }
 
     /// Load the next track: pop from the prefetch queue (or fetch directly

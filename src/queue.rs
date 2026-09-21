@@ -61,6 +61,43 @@ impl TrackQueue {
         api: &DeezerApi,
         playlist_id: &str,
     ) -> Result<GwTrack, NextTrackError> {
+        // Fast path: queue already has fresh tracks — pop without any I/O
+        // and without holding the lock across an await.
+        {
+            let mut queues = self.queues.lock().await;
+            if let Some(queue) = queues.get_mut(playlist_id) {
+                let stale = queue
+                    .last_fetch
+                    .is_none_or(|fetched| fetched.elapsed() >= self.refresh);
+                if !queue.tracks.is_empty() && !stale {
+                    let track = queue.tracks.pop_front().ok_or(NextTrackError::Empty)?;
+                    queue.recent.push_back(track.id_str());
+                    if queue.recent.len() > RECENT_WINDOW {
+                        queue.recent.pop_front();
+                    }
+                    return Ok(track);
+                }
+            }
+        }
+
+        // Need a refresh (queue missing, empty, or stale). Fetch outside
+        // the queue lock so concurrent callers aren't blocked on the network
+        // (MutexGuard must not be held across .await). The display name is
+        // also fetched without holding the queue lock.
+        let display = self
+            .names
+            .lock()
+            .await
+            .get(playlist_id)
+            .cloned()
+            .unwrap_or_else(|| playlist_id.to_string());
+        crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
+        let fetched = api.get_playlist_tracks(playlist_id).await;
+
+        // Re-acquire the queue lock to publish the fetched tracks. Another
+        // concurrent caller may have already refreshed while we were in the
+        // network call — re-check staleness and avoid clobbering its fresh
+        // queue if we lost the race.
         let mut queues = self.queues.lock().await;
         let queue = queues
             .entry(playlist_id.to_string())
@@ -72,30 +109,27 @@ impl TrackQueue {
         let stale = queue
             .last_fetch
             .is_none_or(|fetched| fetched.elapsed() >= self.refresh);
-        if queue.tracks.is_empty() || stale {
-            let display = self
-                .names
-                .lock()
-                .await
-                .get(playlist_id)
-                .cloned()
-                .unwrap_or_else(|| playlist_id.to_string());
-            crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
-            match api.get_playlist_tracks(playlist_id).await {
-                Ok(tracks) if !tracks.is_empty() => {
+        let needs_update = queue.tracks.is_empty() || stale;
+        match fetched {
+            Ok(tracks) if !tracks.is_empty() => {
+                if needs_update {
                     let mut tracks = tracks;
                     tracks.shuffle(&mut rand::rng());
                     avoid_recent_repeat(&mut tracks, &queue.recent);
                     queue.tracks = tracks.into();
                     queue.last_fetch = Some(Instant::now());
+                } else {
+                    // Another task already refreshed; keep its result and drop
+                    // the redundant fetch (still shuffled, still avoids recent).
+                    crate::warn!("deezco: refresh race won by concurrent task, using cached queue");
                 }
-                Ok(_) => {} // Deezer returned no tracks: keep the cached queue.
-                Err(err) if !queue.tracks.is_empty() => {
-                    crate::warn!("deezco: playlist fetch failed, keeping cache: {err}");
-                }
-                Err(err) => {
-                    return Err(NextTrackError::Fetch(err.to_string()));
-                }
+            }
+            Ok(_) => {} // Deezer returned no tracks: keep the cached queue.
+            Err(err) if !queue.tracks.is_empty() => {
+                crate::warn!("deezco: playlist fetch failed, keeping cache: {err}");
+            }
+            Err(err) => {
+                return Err(NextTrackError::Fetch(err.to_string()));
             }
         }
         let track = queue.tracks.pop_front().ok_or(NextTrackError::Empty)?;

@@ -70,4 +70,3 @@ deezco stream 908622995 --server http://localhost:8000 --mount /radio --password
 - **Zero runtime deps** for downloads & native streaming; FFmpeg/LAME replaced by bundled Symphonia + LAME MP3 encoder.
 - **Predictable quality:** sorted results & JSON output by `quality` by default, not relevance.
 - **Radio-grade continuity:** session-persistent CBR encoder — no splice clicks, no per-track re-encode boundaries.
-- **Small binary:** `opt-level=z + lto + strip` (< 4 MB).

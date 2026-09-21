@@ -51,8 +51,7 @@ export default defineConfig({
       { icon: 'github', link: 'https://github.com/sonyarianto/deezco' }
     ],
     footer: {
-      message: 'Released under the MIT License.',
-      copyright: 'Copyright © 2026 Sony Arianto'
+      message: 'Released under the MIT License.'
     },
     editLink: {
       pattern: 'https://github.com/sonyarianto/deezco/edit/main/website/:path',

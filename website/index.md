@@ -4,7 +4,7 @@ layout: home
 hero:
   name: "Deezco"
   text: "Deezer downloader & Icecast radio"
-  tagline: "Fast, lightweight, zero runtime dependencies. FLAC / MP3 320 / 128 with parallel downloads, Blowfish decryption, and a broadcast-grade Icecast pipeline."
+  tagline: "Fast, lightweight, zero runtime dependencies. FLAC / MP3 320 / 128 with parallel downloads and a broadcast-grade Icecast pipeline."
   actions:
     - theme: brand
       text: Get Started

@@ -12,7 +12,6 @@ Deezco is a fast, lightweight **Deezer music downloader** and **Icecast radio st
 
 - Parallel downloads (configurable `-c/--concurrency`)
 - FLAC / MP3 320 / 128 with automatic fallback + `--min-quality` / `--max-quality` / `--exact`
-- Blowfish CBC decryption (Deezer's encrypted streams) — native Rust, no FFmpeg
 - 30s preview mode (`--preview`, `--preview-and-full`)
 - Skip-existing + progress bars + persistent login (`~/.config/deezco/.arl`)
 - JSON output (`--json`) & dry-run (`--dry-run`) for scripting

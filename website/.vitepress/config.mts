@@ -6,14 +6,12 @@ export default defineConfig({
   lang: 'en-US',
   base: '/',
   head: [
-    ['link', { rel: 'icon', href: '/favicon.svg' }],
     ['meta', { name: 'theme-color', content: '#7c3aed' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'Deezco — Deezer downloader & radio streamer' }],
     ['meta', { property: 'og:description', content: 'Fast, lightweight Deezer downloader + Icecast radio streamer with FLAC/MP3, loudness leveling, crossfade & Stereo Tool.' }],
   ],
   themeConfig: {
-    logo: '/logo.svg',
     search: { provider: 'local' },
     nav: [
       { text: 'Guide', link: '/guide/introduction' },

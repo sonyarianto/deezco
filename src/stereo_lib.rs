@@ -34,6 +34,23 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
+use std::cell::RefCell;
+
+thread_local! {
+    static PROCESS_LABEL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub fn set_process_label(label: String) {
+    PROCESS_LABEL.with(|c| *c.borrow_mut() = Some(label));
+}
+
+pub fn clear_process_label() {
+    PROCESS_LABEL.with(|c| *c.borrow_mut() = None);
+}
+
+fn current_label() -> Option<String> {
+    PROCESS_LABEL.with(|c| c.borrow().clone())
+}
 
 /// `loadsave_type` for [`StereoLibHandle::load_preset`]: all settings except
 /// configuration settings. Matches the header example
@@ -305,6 +322,13 @@ impl StereoLibHandle {
     /// whole multi-minute track never becomes a single gigantic FFI call.
     /// Must be called with the external mutex held.
     pub fn process_buffer(&mut self, buf: &mut [f32]) {
+        let label = current_label();
+        self.process_buffer_with_label(buf, label.as_deref());
+    }
+
+    /// Same as `process_buffer` but logs progress with a label (track/jingle
+    /// title) so the `progress` line is unambiguous.
+    pub fn process_buffer_with_label(&mut self, buf: &mut [f32], label: Option<&str>) {
         if buf.is_empty() {
             return;
         }
@@ -316,6 +340,7 @@ impl StereoLibHandle {
         let total_frames = buf.len() / 2;
         let total_blocks = total_frames.div_ceil(PROCESS_BLOCK_FRAMES);
         let mut last_log = std::time::Instant::now();
+        let label_suffix = label.map(|l| format!(" \"{l}\"")).unwrap_or_default();
         for (idx, chunk) in buf.chunks_mut(block).enumerate() {
             // The library documents in-place processing with identical
             // in/out size; frames = samples / channels.
@@ -337,12 +362,22 @@ impl StereoLibHandle {
             let is_last = idx + 1 == total_blocks;
             if is_last || last_log.elapsed().as_secs() >= 5 {
                 let percent = (idx + 1) * 100 / total_blocks;
-                crate::info!(
-                    "deezco: stereo-tool-lib progress {percent}% ({}/{} blocks, {} frames)",
-                    idx + 1,
-                    total_blocks,
-                    total_frames
-                );
+                if label_suffix.is_empty() {
+                    crate::info!(
+                        "deezco: stereo-tool-lib progress {percent}% ({}/{} blocks, {} frames)",
+                        idx + 1,
+                        total_blocks,
+                        total_frames
+                    );
+                } else {
+                    crate::info!(
+                        "deezco: stereo-tool-lib progress {percent}%{} ({}/{} blocks, {} frames)",
+                        label_suffix,
+                        idx + 1,
+                        total_blocks,
+                        total_frames
+                    );
+                }
                 last_log = std::time::Instant::now();
             }
         }

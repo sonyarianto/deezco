@@ -582,7 +582,9 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
     }
     // The version was already published above, so `advance_past` here is a
     // harmless no-op that only guards the non-crossfade path ordering.
+    let title_for_label = title.clone();
     let dsp_join = tokio::task::spawn_blocking(move || {
+        crate::stereo_lib::set_process_label(title_for_label.clone());
         let mut chain = pipeline.build_chain();
         if let Some(shared) = &stereo_lib {
             chain.push(crate::stereo_lib::StereoLibProcessor::shared(
@@ -594,7 +596,9 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
             ));
         }
         let mut out = out_pcm;
-        chain.process(&mut out)?;
+        let res = chain.process(&mut out);
+        crate::stereo_lib::clear_process_label();
+        res?;
         Ok(out)
     })
     .await;
@@ -1092,9 +1096,12 @@ impl Producer {
                     ));
                 }
                 if !chain.is_empty() {
-                    chain
+                    crate::stereo_lib::set_process_label(display.clone());
+                    let res = chain
                         .process(&mut pcm)
-                        .with_context(|| format!("DSP jingle {}", path.display()))?;
+                        .with_context(|| format!("DSP jingle {}", path.display()));
+                    crate::stereo_lib::clear_process_label();
+                    res?;
                 }
             }
             Ok((display, pcm))
@@ -1401,11 +1408,13 @@ impl Producer {
                         pcm.len() / 2
                     );
                 }
+                crate::stereo_lib::set_process_label(display_for_dsp.clone());
                 if let Err(err) = chain.process(&mut pcm) {
                     crate::warn!(
                         "deezco: jingle DSP failed for \"{display_for_dsp}\": {err}; bypassing"
                     );
                 }
+                crate::stereo_lib::clear_process_label();
                 pcm
             })
             .await;
@@ -1534,9 +1543,11 @@ impl Producer {
                         pcm.len() / 2
                     );
                 }
+                crate::stereo_lib::set_process_label("Silence".to_string());
                 if let Err(err) = chain.process(&mut pcm) {
                     crate::warn!("deezco: silence DSP failed: {err}; bypassing");
                 }
+                crate::stereo_lib::clear_process_label();
                 pcm
             })
             .await;

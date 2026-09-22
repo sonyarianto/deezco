@@ -18,7 +18,11 @@ main{flex:1;display:grid;grid-template-columns:320px 1fr;gap:0;min-height:0}
 #sidebar button:disabled{opacity:.5;cursor:not-allowed}
 #sidebar button.secondary{background:#222;border-color:#333}
 #playlistInfo{font-size:12px;opacity:.6}
-#trackList{flex:1;overflow:auto;display:flex;flex-direction:column;gap:6px;max-height:50vh}
+#trackList{flex:1;overflow:auto;display:flex;flex-direction:column;gap:6px;max-height:50vh;scrollbar-width:thin;scrollbar-color:#6c2cff transparent}
+#trackList::-webkit-scrollbar{width:8px}
+#trackList::-webkit-scrollbar-track{background:transparent}
+#trackList::-webkit-scrollbar-thumb{background:#333;border-radius:999px}
+#trackList::-webkit-scrollbar-thumb:hover{background:#6c2cff}
 .track{padding:8px 10px;border-radius:8px;background:#1a1a1a;border:1px solid #222;cursor:pointer;font-size:13px}
 .track:hover{border-color:#444}
 .track.active{border-color:#6c2cff;background:#1e1630}
@@ -38,7 +42,7 @@ code{font-size:12px;background:#222;padding:2px 6px;border-radius:4px}
 <body>
 <header>
   <h1>Deezco</h1>
-  <span>web player · crabsoup compatible · <code>GET /playlists/{id}/next</code> tetap jalan</span>
+  <span>web player</span>
   <span id="health" class="badge" style="margin-left:auto">checking…</span>
 </header>
 <main>
@@ -49,7 +53,7 @@ code{font-size:12px;background:#222;padding:2px 6px;border-radius:4px}
     <div id="playlistInfo"></div>
     <div id="trackList"></div>
     <div class="status">
-      Crabsoup endpoints:<br>
+      API endpoints:<br>
       <code>GET /playlists/:id</code><br>
       <code>GET /playlists/:id/next</code><br>
       <code>GET /tracks/:id</code>

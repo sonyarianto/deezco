@@ -559,6 +559,7 @@ async fn main() -> Result<()> {
         } => serve::serve(api, format, &host, port, refresh_secs).await?,
         Commands::Stream {
             playlist,
+            music_dir,
             server,
             mount,
             username,
@@ -633,6 +634,9 @@ async fn main() -> Result<()> {
                 key: stereo_tool_key,
                 reset_per_track: stereo_tool_reset_track,
             });
+            if music_dir.exists() && !music_dir.is_dir() {
+                anyhow::bail!("--music-dir {} is not a directory", music_dir.display());
+            }
             if let Some(dir) = &jingle_dir
                 && !dir.is_dir()
             {
@@ -649,6 +653,7 @@ async fn main() -> Result<()> {
                 url,
                 public,
                 playlist: extract_id(&playlist, "playlist"),
+                music_dir,
                 jingle_dir,
             };
             let pipeline = icecast::PipelineConfig {

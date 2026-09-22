@@ -51,3 +51,13 @@ pub fn is_audio_file(path: &Path) -> bool {
         })
         .unwrap_or(false)
 }
+
+/// Audio formats the streamer supports: mp3 + flac only.
+/// Everything is decoded to the PCM bus and re-encoded to session CBR
+/// (or passed through natively for mp3), so the pipeline stays uniform.
+pub fn is_music_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_lowercase().as_str(), "mp3" | "flac"))
+        .unwrap_or(false)
+}

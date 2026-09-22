@@ -168,10 +168,19 @@ pub enum Commands {
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
     },
-    /// Stream a playlist to an Icecast server as a live radio source
+    /// Stream a Deezer playlist to an Icecast server as a live radio source.
+    /// Tracks are downloaded to --music-dir first (skip if already there),
+    /// then decoded/DSP/encoded from the local file — never streamed
+    /// straight from the CDN, so a failed download just skips instead of
+    /// poisoning the DSP/crossfade handoff.
     Stream {
-        /// Deezer playlist URL or playlist ID
+        /// Deezer playlist URL or playlist ID (what to download)
         playlist: String,
+        /// Directory where tracks are downloaded/cached (mp3/flac).
+        /// Files already on disk are reused, so a restart replays
+        /// instantly without re-downloading.
+        #[arg(long)]
+        music_dir: PathBuf,
         /// Icecast server base URL, e.g. http://localhost:8000
         #[arg(long)]
         server: String,
@@ -252,12 +261,12 @@ pub enum Commands {
         /// the PCM bus.
         #[arg(long, default_value_t = 44100)]
         stereo_rate: u32,
-        /// How often to refetch the playlist so web edits are picked up
+        /// How often to rescan --music-dir so new downloads are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
-        /// Directory containing jingle/filler audio files (mp3/flac/ogg/wav).
-        /// When the Deezer playlist has no ready track (download failed, empty,
-        /// or next prefetch still pending) a random jingle is played instead of
+        /// Directory containing jingle/filler audio files (mp3/flac).
+        /// When the library has no ready track (empty, or next prefetch
+        /// still pending) a random jingle is played instead of
         /// silence, keeping the Icecast source alive without dead air.
         /// Falls back to generated silence when unset or empty.
         #[arg(long)]

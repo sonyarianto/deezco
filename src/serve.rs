@@ -148,7 +148,14 @@ async fn track_audio(State(state): State<ServeState>, Path(id): Path<String>) ->
             return ApiError::new(StatusCode::NOT_FOUND, err.to_string()).into_response();
         }
     };
-    match download::fetch_track_audio(&state.api, &track, state.format, false).await {
+    match download::fetch_track_audio(
+        &state.api,
+        &track,
+        state.format,
+        &download::ProgressMode::Hidden,
+    )
+    .await
+    {
         Ok(fetched) => (
             StatusCode::OK,
             [

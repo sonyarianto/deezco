@@ -1,11 +1,12 @@
 # Streaming to Icecast
 
-`stream` pushes a playlist to an Icecast server as a live radio source (MP3 128/320 — FLAC needs the PCM pipeline). It sends ICY metadata, paces in real time, prefetches the next track, and reconnects on drop.
+`stream` pushes a Deezer playlist to an Icecast server as a live radio source (MP3 128/320 — FLAC needs the PCM pipeline). Tracks are downloaded to `--music-dir` first (already-cached files are reused), then decoded/DSP/encoded from the local file — never streamed straight from the CDN. It sends ICY metadata, paces in real time, prefetches the next track, and reconnects on drop.
 
 ## Basic
 
 ```bash
 deezco stream 908622995 \
+  --music-dir ./library \
   --server http://localhost:8000 \
   --mount /radio \
   --password hackme \
@@ -14,7 +15,7 @@ deezco stream 908622995 \
 
 # password via env
 export DEEZCO_ICECAST_PASSWORD=hackme
-deezco stream https://www.deezer.com/en/playlist/908622995 --server http://localhost:8000 --mount /radio --public
+deezco stream https://www.deezer.com/en/playlist/908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --public
 ```
 
 Listeners tune in at the mount URL.
@@ -22,7 +23,7 @@ Listeners tune in at the mount URL.
 ## Refresh & reconnect
 
 ```bash
-deezco stream 908622995 --server http://localhost:8000 --mount /radio --password hackme --refresh-secs 60
+deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --refresh-secs 60
 ```
 
 Playlist edits are picked up periodically. Drops reconnect with exponential backoff (5s → 300s).
@@ -41,10 +42,10 @@ deezco stream ... --no-metadata
 When no track is ready (failed download, empty playlist, prefetch pending) the source stays alive with filler instead of stalling:
 
 ```bash
-deezco stream 908622995 --server http://localhost:8000 --mount /radio --password hackme --jingle-dir ./jingles
+deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --jingle-dir ./jingles
 ```
 
-- Random file from `--jingle-dir` (mp3/flac/ogg/wav), recent-window 3
+- Random file from `--jingle-dir` (mp3/flac), recent-window 3
 - Falls back to 2s generated silence
 - When the PCM pipeline is active, filler follows the same path as tracks (`loudness -> crossfade -> DSP -> CBR`) for sonic consistency
 
@@ -81,7 +82,7 @@ deezco stream ... --crossfade 6 \
 Pipeline details:
 
 - Bus: `f32` stereo @ 44.1 kHz
-- Order: `MP3 -> decode -> loudnorm -> crossfade -> ProcessorChain (gain -> Stereo Tool) -> CBR encode`
+- Order: `file (mp3/flac) -> decode -> loudnorm -> crossfade -> ProcessorChain (gain -> Stereo Tool) -> CBR encode`
 - Session encoder is persistent — no splice clicks; carry-over frames bridge track boundaries
 - `SessionEncoder` bitrate snapped to discrete MPEG rates (`nearest_bitrate`)
 - Failures in Stereo Tool bypass the track instead of killing the stream

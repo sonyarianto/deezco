@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -91,7 +91,15 @@ async fn get_download_url(
 }
 
 /// Download a plain (non-encrypted) URL to a file, used for previews.
-async fn download_to_file(api: &DeezerApi, url: &str, filepath: &Path) -> Result<()> {
+/// Shows a bar like full tracks (labeled `(preview)`) so batch runs stay
+/// live even in preview-only mode.
+async fn download_to_file(
+    api: &DeezerApi,
+    url: &str,
+    filepath: &Path,
+    display: &str,
+    progress: &ProgressMode<'_>,
+) -> Result<()> {
     let response = api
         .client()
         .get(url)
@@ -103,11 +111,26 @@ async fn download_to_file(api: &DeezerApi, url: &str, filepath: &Path) -> Result
         bail!("Preview download failed with status: {}", response.status());
     }
 
+    let total_size = response.content_length().unwrap_or(0);
+    let label = format!("{display} (preview)");
+    let pb = match progress {
+        ProgressMode::Hidden => None,
+        _ if total_size == 0 => None,
+        ProgressMode::Single => Some(single_bar(total_size)),
+        ProgressMode::Shared(mp) => Some(shared_bar(mp, total_size, &label)),
+    };
+
     let mut file = tokio::fs::File::create(filepath).await?;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        file.write_all(&chunk.context("Error reading preview stream")?)
-            .await?;
+        let chunk = chunk.context("Error reading preview stream")?;
+        if let Some(ref pb) = pb {
+            pb.inc(chunk.len() as u64);
+        }
+        file.write_all(&chunk).await?;
+    }
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
     }
     file.flush().await?;
     Ok(())
@@ -118,15 +141,69 @@ pub struct FetchedTrack {
     pub data: Vec<u8>,
 }
 
+/// How download progress is reported.
+///
+/// Batch commands run several downloads concurrently; each one gets its own
+/// bar inside a shared [`MultiProgress`] so the bars stay coordinated
+/// instead of overwriting each other on the terminal.
+pub enum ProgressMode<'a> {
+    /// No output (daemon paths: `stream` cache fill, `serve`).
+    Hidden,
+    /// A standalone bar on stdout (single-track CLI).
+    Single,
+    /// One coordinated bar labeled with the track name (batch CLI).
+    Shared(&'a MultiProgress),
+}
+
+/// Print a `[skip]` line through the right channel: silence for daemons,
+/// plain stdout for single downloads, above the bars for batch downloads.
+fn report_skip(progress: &ProgressMode<'_>, filename: &str) {
+    match progress {
+        ProgressMode::Hidden => {}
+        ProgressMode::Single => println!("  [skip] {filename} (already exists)"),
+        ProgressMode::Shared(mp) => {
+            let _ = mp.println(format!("  [skip] {filename} (already exists)"));
+        }
+    }
+}
+
+/// Standalone bar for single-track downloads.
+fn single_bar(total_size: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb
+}
+
+/// Coordinated bar for batch downloads: narrower bar plus the track label.
+/// `{wide_msg}` (not `{msg}`) truncates the label to the terminal width, so
+/// long "Artist - Title" names never wrap — a wrapped bar would leave
+/// trailing spaces behind on `finish_and_clear` and glue the next line to it.
+fn shared_bar(mp: &MultiProgress, total_size: u64, display: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new(total_size));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  [{bar:25.cyan/blue}] {bytes}/{total_bytes} ({eta}) {wide_msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb.set_message(display.to_string());
+    pb
+}
+
 /// Resolve a track's download URL and fetch its decrypted audio.
 pub async fn fetch_track_audio(
     api: &DeezerApi,
     track: &GwTrack,
     format: TrackFormat,
-    show_progress: bool,
+    progress: &ProgressMode<'_>,
 ) -> Result<FetchedTrack> {
     let (url, _) = get_download_url(api, track, format).await?;
-    fetch_track_audio_from_url(api, &url, &track.id_str(), show_progress).await
+    fetch_track_audio_from_url(api, &url, &track.id_str(), &track.display_name(), progress).await
 }
 
 /// Fetch and decrypt audio from an already-resolved stream URL.
@@ -134,7 +211,8 @@ pub async fn fetch_track_audio_from_url(
     api: &DeezerApi,
     url: &str,
     sng_id: &str,
-    show_progress: bool,
+    display: &str,
+    progress: &ProgressMode<'_>,
 ) -> Result<FetchedTrack> {
     // Download using the shared API client
     if debug_enabled() {
@@ -155,17 +233,11 @@ pub async fn fetch_track_audio_from_url(
 
     let total_size = response.content_length().unwrap_or(0);
 
-    let pb = if show_progress && total_size > 0 {
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("##-"),
-        );
-        Some(pb)
-    } else {
-        None
+    let pb = match progress {
+        ProgressMode::Hidden => None,
+        _ if total_size == 0 => None,
+        ProgressMode::Single => Some(single_bar(total_size)),
+        ProgressMode::Shared(mp) => Some(shared_bar(mp, total_size, display)),
     };
 
     // Download to memory (needed for decryption)
@@ -226,7 +298,7 @@ pub async fn download_track(
     api: &DeezerApi,
     track: &GwTrack,
     output_dir: &Path,
-    show_progress: bool,
+    progress: &ProgressMode<'_>,
     options: DownloadOptions,
 ) -> Result<PathBuf> {
     let artist = sanitize_filename(&track.artist());
@@ -252,9 +324,9 @@ pub async fn download_track(
                 Some(url) => url,
                 None => bail!("Track has no preview available"),
             };
-            download_to_file(api, &url, &filepath).await?;
-        } else if show_progress {
-            println!("  [skip] {} (already exists)", filename);
+            download_to_file(api, &url, &filepath, &track.display_name(), progress).await?;
+        } else {
+            report_skip(progress, &filename);
         }
         if !options.preview_and_full {
             return Ok(filepath);
@@ -282,13 +354,12 @@ pub async fn download_track(
 
     // Skip if already exists
     if filepath.exists() {
-        if show_progress {
-            println!("  [skip] {} (already exists)", filename);
-        }
+        report_skip(progress, &filename);
         return Ok(filepath);
     }
 
-    let fetched = fetch_track_audio_from_url(api, &url, &sng_id, show_progress).await?;
+    let fetched =
+        fetch_track_audio_from_url(api, &url, &sng_id, &track.display_name(), progress).await?;
 
     // Write to file
     let mut file = tokio::fs::File::create(&filepath).await?;

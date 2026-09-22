@@ -16,12 +16,14 @@ use crate::audio::{
     BUS_RATE, CrossfadeConfig, FrameDecoder, PcmBuffer, SessionEncoder, SymphoniaDecoder,
     nearest_bitrate, render_track_overlap,
 };
-use crate::download::{FetchedTrack, fetch_track_audio};
+use crate::download::FetchedTrack;
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
-use crate::files::is_audio_file;
+use crate::files::is_music_file;
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{NextTrackError, TrackQueue};
-use crate::track::{available_format, debug_enabled};
+use crate::track::{
+    DownloadOptions, ProgressMode, available_format, debug_enabled, download_track,
+};
 use rand::seq::IndexedRandom;
 
 /// How many bytes of audio between in-band ICY metadata blocks. The source
@@ -104,7 +106,8 @@ impl Producer {
     }
 }
 
-/// Scan a directory for audio files to use as filler jingles.
+/// Scan a directory for audio files to use as filler jingles (mp3/flac only,
+/// matching the streamer's supported formats).
 fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -112,7 +115,7 @@ fn collect_jingle_files(dir: &std::path::Path) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && is_audio_file(&path) {
+        if path.is_file() && is_music_file(&path) {
             files.push(path);
         }
     }
@@ -143,6 +146,10 @@ pub struct IcecastConfig {
     pub url: Option<String>,
     pub public: bool,
     pub playlist: String,
+    /// Directory where playlist tracks are downloaded before streaming.
+    /// Files already on disk are reused; decode/DSP stages only ever see
+    /// file bytes, never a network buffer.
+    pub music_dir: PathBuf,
     /// Directory of filler jingles. When the playlist has no ready track
     /// a random file from here is played to keep the source alive.
     pub jingle_dir: Option<PathBuf>,
@@ -344,12 +351,16 @@ fn native_bitrate(format: TrackFormat) -> Option<u32> {
     }
 }
 
-/// Download and decrypt audio for a track that is already known
-/// (e.g. a retry after a CDN failure).
+/// Download a track into `music_dir` (skipped when already cached) and read
+/// it back from disk. Decode/DSP stages only ever see these file bytes —
+/// never a network buffer — so a failed download just skips the track
+/// (filler bridges the gap) instead of feeding partial audio into
+/// Stereo Tool or the crossfade tail.
 async fn prepare_track_audio(
     api: &DeezerApi,
     track: &GwTrack,
     fetch_format: TrackFormat,
+    music_dir: &std::path::Path,
 ) -> Result<FetchedTrack> {
     if debug_enabled() {
         crate::warn!(
@@ -357,8 +368,30 @@ async fn prepare_track_audio(
             track.display_name()
         );
     }
-    let fetched = fetch_track_audio(api, track, fetch_format, false).await?;
-    Ok(fetched)
+    // Same quality negotiation as the downloader; quality flags other than
+    // the requested format are intentionally not applied here to preserve
+    // the streamer's historical silent-fallback behaviour.
+    let options = DownloadOptions {
+        format: fetch_format,
+        min_format: None,
+        preview: false,
+        preview_and_full: false,
+    };
+    let path = download_track(api, track, music_dir, &ProgressMode::Hidden, options)
+        .await
+        .with_context(|| {
+            format!(
+                "stream cache download failed for \"{}\"",
+                track.display_name()
+            )
+        })?;
+    let data = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("stream cache read failed for {}", path.display()))?;
+    if data.is_empty() {
+        bail!("cached file {} is empty", path.display());
+    }
+    Ok(FetchedTrack { data })
 }
 
 /// Ordered handoff between consecutive prefetch tasks: the held PCM tail of
@@ -421,6 +454,8 @@ struct TaskCtx {
     queue: TrackQueue,
     fetch_format: TrackFormat,
     playlist: String,
+    /// Local cache dir: track bytes always come from a file here.
+    music_dir: PathBuf,
     /// Position in activation order; gates the crossfade handoff.
     seq: u64,
     /// Session pipeline: config, resolved encode bitrate, shared handoff.
@@ -477,13 +512,14 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(GwTrack, PreparedAudio)> {
         track.display_name(),
         track.id_str()
     );
-    let fetched = match prepare_track_audio(&ctx.api, &track, ctx.fetch_format).await {
-        Ok(fetched) => fetched,
-        Err(err) => {
-            advance_past(&ctx.runtime.xfade, ctx.seq).await;
-            return Err(err);
-        }
-    };
+    let fetched =
+        match prepare_track_audio(&ctx.api, &track, ctx.fetch_format, &ctx.music_dir).await {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                advance_past(&ctx.runtime.xfade, ctx.seq).await;
+                return Err(err);
+            }
+        };
     if !ctx.runtime.pipeline.is_active() {
         return Ok((track, PreparedAudio::Native(fetched.data)));
     }
@@ -746,6 +782,8 @@ struct Producer {
     updater: Option<TitleUpdater>,
     nominal_bps: u64,
     playlist: String,
+    /// Local cache dir every prefetch task downloads into / reads from.
+    music_dir: PathBuf,
     /// Session pipeline config plus the shared crossfade handoff.
     runtime: PipelineRuntime,
     /// Session CBR encoder (`None` on native passthrough). Lives for the
@@ -811,6 +849,7 @@ impl Producer {
         updater: Option<TitleUpdater>,
         playlist: String,
         runtime: PipelineRuntime,
+        music_dir: PathBuf,
         jingle_dir: Option<PathBuf>,
     ) -> Result<Self> {
         // CBR pipeline output paces exactly at the encode rate; native
@@ -860,6 +899,7 @@ impl Producer {
             queue: queue.clone(),
             fetch_format,
             playlist: playlist.clone(),
+            music_dir: music_dir.clone(),
             seq: 0,
             runtime: runtime.clone(),
         })));
@@ -871,6 +911,7 @@ impl Producer {
             updater,
             nominal_bps,
             playlist,
+            music_dir,
             runtime,
             encoder,
             out: Vec::new(),
@@ -995,6 +1036,7 @@ impl Producer {
                 queue: self.queue.clone(),
                 fetch_format: self.fetch_format,
                 playlist: self.playlist.clone(),
+                music_dir: self.music_dir.clone(),
                 seq,
                 runtime: self.runtime.clone(),
             })));
@@ -2155,11 +2197,12 @@ pub async fn stream(
     };
     queue.set_name(&config.playlist, &playlist_name).await;
     crate::info!(
-        "deezco: streaming \"{}\" ({}) to {}{} (refresh every {}s)",
+        "deezco: streaming \"{}\" ({}) to {}{} via {} (refresh every {}s)",
         playlist_name,
         config.playlist,
         config.server.trim_end_matches('/'),
         config.mount,
+        config.music_dir.display(),
         refresh_secs
     );
     if pipeline.is_active() {
@@ -2229,6 +2272,8 @@ pub async fn stream(
         stereo_lib,
     };
     let jingle_dir = config.jingle_dir.clone();
+    let music_dir = config.music_dir.clone();
+    tokio::fs::create_dir_all(&music_dir).await?;
     let producer = Arc::new(Mutex::new(Producer::new(
         api.clone(),
         queue.clone(),
@@ -2237,6 +2282,7 @@ pub async fn stream(
         Some(updater.clone()),
         config.playlist.clone(),
         runtime,
+        music_dir,
         jingle_dir,
     )?));
 

@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 // Re-export items that other modules reach via `crate::download::` so the
 // public surface stays stable after the split.
 pub(crate) use crate::track::format_annotation;
-pub use crate::track::{DownloadOptions, FetchedTrack, fetch_track_audio};
+pub use crate::track::{DownloadOptions, FetchedTrack, ProgressMode, fetch_track_audio};
 
 /// Download a playlist by ID
 pub async fn download_playlist(
@@ -378,24 +378,23 @@ pub async fn download_artist(
         }
     }
 
-    // Download all tracks in parallel, then dedupe in completion order
-    let total = jobs.len();
+    // Download all tracks in parallel (each with its own live bar), then
+    // dedupe in completion order. Successes already showed a bar each, so
+    // only links and failures are printed to keep big discographies readable.
     let results = download_tracks_concurrently(api, &jobs, concurrency, options).await;
-    for (i, (display, outcome)) in results.into_iter().enumerate() {
-        println!("  [{}/{}] {}", i + 1, total, display);
+    for (display, outcome) in results.into_iter() {
         match outcome {
             Ok(path) => {
                 if dedupe_audio_file(&path, &mut audio_hash_index).await? {
                     total_linked += 1;
-                    println!("    [link] Duplicate audio linked to existing file");
+                    println!("    [link] {display}: duplicate audio linked to existing file");
                 }
 
                 total_downloaded += 1;
-                println!("    [ok] Downloaded");
             }
             Err(e) => {
                 total_failed += 1;
-                eprintln!("    [err] Failed: {}", e);
+                eprintln!("    [err] {display}: {e}");
             }
         }
     }
@@ -498,7 +497,7 @@ pub async fn download_single_track(
 
     // Single tracks land in <output>/<Artist>/
     let track_dir = output_dir.join(sanitize_filename(&track.artist()));
-    let path = download_track(api, &track, &track_dir, true, options)
+    let path = download_track(api, &track, &track_dir, &ProgressMode::Single, options)
         .await
         .context("Failed to download track")?;
     println!("\nSaved to: {}", path.display());

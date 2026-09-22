@@ -61,7 +61,7 @@ Icecast PUT /mount (run_connection di src/icecast.rs)  |  /tracks/{id} untuk pla
 
 ### API (rencana, additive)
 
-- `POST /api/icecast/start` `{playlist, server, mount, password}` → spawn `icecast::stream` di background task.
+- `POST /api/icecast/start` `{playlist, music_dir, server, mount, password}` → spawn `icecast::stream` di background task.
 - `POST /api/icecast/stop` → abort handle.
 - `POST /api/icecast/skip` → `queue.next_track` + `Producer::load_next_track`.
 - `GET /api/icecast/status` → `{connected, advertised_kbps, reconnect_delay, current_title, listeners?}` — `advertised_kbps`/`current_title` dari method `Producer` yang sama — via broadcast/SSE.

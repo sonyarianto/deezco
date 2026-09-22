@@ -1,6 +1,6 @@
 [package]
 name = "deezco"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -23,7 +23,7 @@ rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock", "std"] }
 libloading = "0.9"
 libc = "0.2"
-symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac"] }
 mp3lame-encoder = "0.2"
 
 [lints.rust]

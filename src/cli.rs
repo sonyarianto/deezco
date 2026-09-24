@@ -168,17 +168,14 @@ pub enum Commands {
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
     },
-    /// Stream a Deezer playlist to an Icecast server as a live radio source.
-    /// Tracks are downloaded to --music-dir first (skip if already there),
-    /// then decoded/DSP/encoded from the local file — never streamed
-    /// straight from the CDN, so a failed download just skips instead of
-    /// poisoning the DSP/crossfade handoff.
+    /// Stream local audio files to an Icecast server as a live radio source.
+    /// The station admin downloads tracks first (playlist/favorites/album),
+    /// then `stream` plays pure local files from --music-dir — no Deezer
+    /// API, no login, shuffle + loop with periodic rescan for new files.
     Stream {
-        /// Deezer playlist URL or playlist ID (what to download)
-        playlist: String,
-        /// Directory where tracks are downloaded/cached (mp3/flac).
-        /// Files already on disk are reused, so a restart replays
-        /// instantly without re-downloading.
+        /// Directory with station library audio files (mp3/flac, recursive).
+        /// Downloaded beforehand via e.g. `deezco playlist <id> -o ./library`.
+        /// New files are picked up on rescan; missing/empty dir plays filler.
         #[arg(long)]
         music_dir: PathBuf,
         /// Icecast server base URL, e.g. http://localhost:8000

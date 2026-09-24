@@ -53,7 +53,7 @@ deezco [OPTIONS] [COMMAND]
 | `album` | Download an album by URL or ID |
 | `following` | Download all releases from every artist you follow |
 | `serve` | Serve playlists as HTTP audio for external media players (crabsoup, etc.) |
-| `stream` | Stream a playlist to an Icecast server as a live radio source |
+| `stream` | Stream local `--music-dir` files to an Icecast server as a live radio source (no login) |
 | `login` | Save ARL and verify login (uses `--arl`, `DEEZCO_ARL`, or prompt; only `--arl`/prompt is persisted) |
 | `logout` | Remove stored login credentials |
 
@@ -255,19 +255,22 @@ deezco serve --refresh-secs 60
 
 ### Live streaming to Icecast
 
-`stream` pushes a playlist to an Icecast server as a live radio source (MP3
-128 or 320 — FLAC needs an active pipeline flag, otherwise it is rejected).
-Tracks are downloaded to `--music-dir` first (already-cached files are
-reused, so restarts replay instantly), then decoded/DSP/encoded from the
-local file — never streamed straight from the CDN. It sends track titles
-to listeners via
+`stream` plays pure local files from `--music-dir` to an Icecast server as
+a live radio source (MP3 native passthrough — FLAC files need an active
+pipeline flag, otherwise they are skipped). The station admin downloads
+first (e.g. `deezco playlist 908622995 -o ./library`), then `stream`
+shuffles + loops the library with periodic rescan for new files — no Deezer
+API, no login. It sends track titles to listeners via
 ICY metadata, paces playback in real time, prefetches the next track so
 changes are seamless, and reconnects automatically if the connection
 drops.
 
 ```bash
-# Stream a playlist to an Icecast mount as a 24/7 radio source
-deezco stream 908622995 \
+# 1. admin downloads the library once
+deezco playlist 908622995 -o ./library
+
+# 2. stream it to an Icecast mount as a 24/7 radio source (no login needed)
+deezco stream \
   --music-dir ./library \
   --server http://localhost:8000 \
   --mount /radio \
@@ -277,17 +280,17 @@ deezco stream 908622995 \
 
 # The password can also come from the environment
 export DEEZCO_ICECAST_PASSWORD=hackme
-deezco stream https://www.deezer.com/en/playlist/908622995 \
+deezco stream \
   --music-dir ./library \
   --server http://localhost:8000 --mount /radio --public
 
 # Non-default source username (defaults to "source")
-deezco stream 908622995 --music-dir ./library --server http://sapircast.caster.fm:14508 \
+deezco stream --music-dir ./library --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --username source
 
-# Listeners tune in at the mount; playlist edits are picked up periodically
-# (new tracks are downloaded into --music-dir on the fly)
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+# Listeners tune in at the mount; new files the admin downloads into
+# --music-dir are picked up on rescan
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --refresh-secs 60
 
 # Some source proxies (notably caster.fm's custom Icecast) reset the source
@@ -295,10 +298,10 @@ deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --m
 # connection keeps dropping at track changes, disable in-stream metadata;
 # track titles then still update through Icecast's admin endpoint, so
 # listeners keep seeing "now playing":
-deezco stream 908622995 --music-dir ./library --server http://sapircast.caster.fm:14508 \
+deezco stream --music-dir ./library --server http://sapircast.caster.fm:14508 \
   --mount /hDQFK --password hackme --no-metadata
 
-# Filler when no track is ready (empty playlist, or next
+# Filler when no track is ready (empty library, or next
 # prefetch still pending). Instead of stalling the TCP stream and letting
 # Icecast drop the source, a random jingle from the directory is played;
 # without --jingle-dir a 2s silence filler keeps the connection alive.
@@ -311,8 +314,8 @@ deezco stream 908622995 --music-dir ./library --server http://sapircast.caster.f
 # and avoids the 2026-09-21 infinite-jingle starvation), expanding to 5
 # only when tracks are fully prefetched to bridge burst holes; filler
 # streaks (5+ consecutive) are now warned with last track error and
-# playlist context (use DEEZCO_DEBUG=1 and 2>&1 to see playlist fetch):
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+# music-dir context (use DEEZCO_DEBUG=1):
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --jingle-dir ./jingles
 
 # PCM pipeline options (equal-power crossfade + static DSP gain).
@@ -320,19 +323,19 @@ deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --m
 # one session encoder turns the endless PCM stream into continuous CBR —
 # track boundaries never exist at the MP3 level, so splices cannot click
 # (native MP3 passthrough without these flags needs nothing extra):
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --gain-db 3
 
 # Force the session bitrate (8..=320 kbps); also activates the pipeline
-# alone as a transcode. Without it, the fetched format's native rate wins
-# (320, or 128 on quality fallback):
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+# alone as a transcode. Without it, each file's own estimated rate wins
+# on native passthrough:
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --bitrate 128
 
 # R128 loudness normalization: every track is measured (ITU-R BS.1770
 # gating) and corrected toward the target before the mix, so consecutive
 # tracks play at one consistent level. -9 hot, -14 streaming, -23 broadcast:
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 --target-lufs -14
 
 # Broadcast processing via the licensed Thimeo Stereo Tool CLI. Every track
@@ -340,7 +343,7 @@ deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --m
 # each track boundary, and a tool failure bypasses the track instead of
 # killing the stream. The key is visible in `ps aux` while running,
 # like the official CLI:
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 \
   --stereo-tool /opt/stereo_tool_cmd_64 \
   --stereo-tool-sts /etc/stereo/audio.sts \
@@ -351,7 +354,7 @@ deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --m
 # roundtrip, key stays out of `ps aux`, and processor state persists across
 # tracks by default (--stereo-tool-reset-track restores CLI-like resets).
 # Conflicts with --stereo-tool (pick one backend):
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio \
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 \
   --stereo-tool-lib /opt/libStereoTool_intel64.so \
   --stereo-tool-sts /etc/stereo/audio.sts \

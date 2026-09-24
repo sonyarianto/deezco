@@ -15,7 +15,7 @@ deezco [OPTIONS] [COMMAND]
 | `favorites` | Download your liked songs |
 | `following` | Download all releases from followed artists |
 | `serve` | Serve playlists as HTTP audio (+ web player) |
-| `stream` | Stream a playlist to Icecast |
+| `stream` | Stream local `--music-dir` files to Icecast (no login) |
 | `login` | Save ARL and verify login |
 | `logout` | Remove stored credentials |
 
@@ -50,10 +50,10 @@ deezco [OPTIONS] [COMMAND]
 deezco serve [--host 127.0.0.1] [--port 9001] [--refresh-secs 780]
 ```
 
-## Stream options
+## Stream options (pure-local, no login)
 
 ```
-deezco stream <PLAYLIST> --server <URL> --mount <MOUNT> --password <PW>
+deezco stream --music-dir <DIR> --server <URL> --mount <MOUNT> --password <PW>
   [--username source] [--name TEXT] [--genre TEXT] [--url TEXT] [--public]
   [--no-metadata] [--refresh-secs 780] [--jingle-dir DIR]
   [--crossfade 0..12] [--gain-db -24..24] [--bitrate 8..320]

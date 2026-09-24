@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,7 @@ use rand::seq::SliceRandom;
 use tokio::sync::Mutex;
 
 use crate::api::DeezerApi;
+use crate::files::is_music_file;
 use crate::models::GwTrack;
 
 /// The no-repeat guard: a reshuffled queue never opens with a track that
@@ -24,13 +26,12 @@ struct PlaylistQueue {
 pub struct TrackQueue {
     refresh: Duration,
     queues: Arc<Mutex<HashMap<String, PlaylistQueue>>>,
-    names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub enum NextTrackError {
-    /// The playlist has no playable tracks
+    /// No playable tracks (empty playlist / empty music-dir)
     Empty,
-    /// Fetching the playlist from Deezer failed and no cache exists
+    /// Fetching failed and no cache exists
     Fetch(String),
 }
 
@@ -39,16 +40,7 @@ impl TrackQueue {
         Self {
             refresh,
             queues: Arc::new(Mutex::new(HashMap::new())),
-            names: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Cache a playlist name for display in log messages.
-    pub async fn set_name(&self, playlist_id: &str, name: &str) {
-        self.names
-            .lock()
-            .await
-            .insert(playlist_id.to_string(), name.to_string());
     }
 
     /// Pop the next track for a playlist. Each playlist is fetched once,
@@ -82,17 +74,9 @@ impl TrackQueue {
 
         // Need a refresh (queue missing, empty, or stale). Fetch outside
         // the queue lock so concurrent callers aren't blocked on the network
-        // (MutexGuard must not be held across .await). The display name is
-        // also fetched without holding the queue lock.
-        let display = self
-            .names
-            .lock()
-            .await
-            .get(playlist_id)
-            .cloned()
-            .unwrap_or_else(|| playlist_id.to_string());
+        // (MutexGuard must not be held across .await).
         if crate::track::debug_enabled() {
-            crate::warn!("deezco: refreshing playlist \"{display}\" ({playlist_id})");
+            crate::warn!("deezco: refreshing playlist ({playlist_id})");
         }
         let fetched = api.get_playlist_tracks(playlist_id).await;
 
@@ -153,6 +137,169 @@ fn avoid_recent_repeat(tracks: &mut [GwTrack], recent: &VecDeque<String>) {
     if let Some(swap_idx) = tracks.iter().position(|t| !recent.contains(&t.id_str())) {
         tracks.swap(0, swap_idx);
     }
+}
+
+/// A local audio file ready for streaming: path + human title.
+/// `duration_secs` / `actual_kbps` are filled after decode (0/None = unknown,
+/// pacing falls back to the nominal rate).
+#[derive(Clone, Debug)]
+pub struct LocalTrack {
+    pub path: PathBuf,
+    pub title: String,
+    pub duration_secs: u64,
+    pub actual_kbps: Option<u32>,
+}
+
+impl LocalTrack {
+    pub fn display_name(&self) -> String {
+        self.title.clone()
+    }
+
+    pub fn duration_secs(&self) -> u64 {
+        self.duration_secs
+    }
+}
+
+/// Human title for a file: stem without extension, e.g. `Artist - Title`.
+pub fn local_title(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Unknown Track")
+        .to_string()
+}
+
+struct LocalQueueState {
+    files: VecDeque<PathBuf>,
+    last_scan: Option<Instant>,
+    recent: VecDeque<PathBuf>,
+}
+
+/// Pure-local station library: recursive mp3/flac scan of `--music-dir`,
+/// shuffled + looped with a no-repeat guard. Rescanned when empty or when
+/// the last scan is older than `refresh`, so files the admin downloads
+/// appear without restarting the stream.
+#[derive(Clone)]
+pub struct LocalFileQueue {
+    refresh: Duration,
+    music_dir: PathBuf,
+    state: Arc<Mutex<LocalQueueState>>,
+}
+
+impl LocalFileQueue {
+    pub fn new(music_dir: PathBuf, refresh: Duration) -> Self {
+        Self {
+            refresh,
+            music_dir,
+            state: Arc::new(Mutex::new(LocalQueueState {
+                files: VecDeque::new(),
+                last_scan: None,
+                recent: VecDeque::new(),
+            })),
+        }
+    }
+
+    pub fn music_dir(&self) -> &Path {
+        &self.music_dir
+    }
+
+    /// Pop the next file for playback.
+    pub async fn next_file(&self) -> Result<LocalTrack, NextTrackError> {
+        // Fast path: fresh queue with files — pop without I/O.
+        {
+            let mut state = self.state.lock().await;
+            let stale = state.last_scan.is_none_or(|t| t.elapsed() >= self.refresh);
+            if !state.files.is_empty() && !stale {
+                let path = state.files.pop_front().ok_or(NextTrackError::Empty)?;
+                state.recent.push_back(path.clone());
+                if state.recent.len() > RECENT_WINDOW {
+                    state.recent.pop_front();
+                }
+                return Ok(LocalTrack {
+                    title: local_title(&path),
+                    path,
+                    duration_secs: 0,
+                    actual_kbps: None,
+                });
+            }
+        }
+
+        // Need a rescan (empty or stale). Scan outside the lock.
+        let scanned = collect_music_files(&self.music_dir).await;
+
+        let mut state = self.state.lock().await;
+        let stale = state.last_scan.is_none_or(|t| t.elapsed() >= self.refresh);
+        let needs_update = state.files.is_empty() || stale;
+        match scanned {
+            Ok(mut files) if !files.is_empty() => {
+                if needs_update {
+                    files.sort();
+                    files.shuffle(&mut rand::rng());
+                    let mut files = files;
+                    avoid_recent_repeat_paths(&mut files, &state.recent);
+                    state.files = files.into();
+                    state.last_scan = Some(Instant::now());
+                }
+            }
+            Ok(_) => {
+                // No files on disk: keep cached queue if any.
+                if state.files.is_empty() {
+                    return Err(NextTrackError::Empty);
+                }
+            }
+            Err(err) if !state.files.is_empty() => {
+                crate::warn!("deezco: music-dir scan failed, keeping cache: {err}");
+            }
+            Err(err) => {
+                return Err(NextTrackError::Fetch(err.to_string()));
+            }
+        }
+        let path = state.files.pop_front().ok_or(NextTrackError::Empty)?;
+        state.recent.push_back(path.clone());
+        if state.recent.len() > RECENT_WINDOW {
+            state.recent.pop_front();
+        }
+        Ok(LocalTrack {
+            title: local_title(&path),
+            path,
+            duration_secs: 0,
+            actual_kbps: None,
+        })
+    }
+}
+
+fn avoid_recent_repeat_paths(files: &mut [PathBuf], recent: &VecDeque<PathBuf>) {
+    let Some(front) = files.first() else {
+        return;
+    };
+    if !recent.contains(front) {
+        return;
+    }
+    if let Some(idx) = files.iter().position(|p| !recent.contains(p)) {
+        files.swap(0, idx);
+    }
+}
+
+/// Recursive mp3/flac scan (sorted by caller before shuffle).
+async fn collect_music_files(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let ft = entry.file_type().await?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() && is_music_file(&path) {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

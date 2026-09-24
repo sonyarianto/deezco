@@ -376,8 +376,10 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
-    // Login and prepare the output dir for every command except logout
-    if !matches!(command, Commands::Logout) {
+    // Login and prepare the output dir for every command except logout.
+    // Stream is pure-local (no Deezer API, no ARL) — the admin downloads
+    // first, then streams from --music-dir.
+    if !matches!(command, Commands::Logout | Commands::Stream { .. }) {
         if !auth::login(&api, flag_arl.as_deref(), env_arl.as_deref()).await? {
             return Ok(());
         }
@@ -558,7 +560,6 @@ async fn main() -> Result<()> {
             refresh_secs,
         } => serve::serve(api, format, &host, port, refresh_secs).await?,
         Commands::Stream {
-            playlist,
             music_dir,
             server,
             mount,
@@ -652,7 +653,6 @@ async fn main() -> Result<()> {
                 genre,
                 url,
                 public,
-                playlist: extract_id(&playlist, "playlist"),
                 music_dir,
                 jingle_dir,
             };
@@ -667,9 +667,9 @@ async fn main() -> Result<()> {
                 stereo_tool,
                 stereo_lib,
             };
-            // Fail fast on missing pipeline binaries before login/network.
+            // Fail fast on missing pipeline binaries (no login/network needed).
             icecast::check_prerequisites(&pipeline)?;
-            icecast::stream(api, format, config, refresh_secs, pipeline).await?;
+            icecast::stream(format, config, refresh_secs, pipeline).await?;
         }
     }
 

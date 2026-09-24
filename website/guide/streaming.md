@@ -1,11 +1,15 @@
 # Streaming to Icecast
 
-`stream` pushes a Deezer playlist to an Icecast server as a live radio source (MP3 128/320 — FLAC needs the PCM pipeline). Tracks are downloaded to `--music-dir` first (already-cached files are reused), then decoded/DSP/encoded from the local file — never streamed straight from the CDN. It sends ICY metadata, paces in real time, prefetches the next track, and reconnects on drop.
+`stream` plays pure local files from `--music-dir` to an Icecast server as a live radio source (MP3 native passthrough — FLAC needs the PCM pipeline). The station admin downloads first (e.g. `deezco playlist 908622995 -o ./library`), then `stream` shuffles + loops the library with periodic rescan for new files. No Deezer API, no login. It sends ICY metadata, paces in real time, prefetches the next track, and reconnects on drop.
 
 ## Basic
 
 ```bash
-deezco stream 908622995 \
+# 1. admin downloads the library once
+deezco playlist 908622995 -o ./library
+
+# 2. stream it 24/7 (no login needed)
+deezco stream \
   --music-dir ./library \
   --server http://localhost:8000 \
   --mount /radio \
@@ -15,18 +19,18 @@ deezco stream 908622995 \
 
 # password via env
 export DEEZCO_ICECAST_PASSWORD=hackme
-deezco stream https://www.deezer.com/en/playlist/908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --public
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --public
 ```
 
 Listeners tune in at the mount URL.
 
-## Refresh & reconnect
+## Rescan & reconnect
 
 ```bash
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --refresh-secs 60
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --refresh-secs 60
 ```
 
-Playlist edits are picked up periodically. Drops reconnect with exponential backoff (5s → 300s).
+New files the admin downloads into `--music-dir` are picked up on rescan. Drops reconnect with exponential backoff (5s → 300s).
 
 ## Metadata
 
@@ -39,10 +43,10 @@ deezco stream ... --no-metadata
 
 ## Filler (jingles / silence)
 
-When no track is ready (failed download, empty playlist, prefetch pending) the source stays alive with filler instead of stalling:
+When no track is ready (empty library, corrupt file, prefetch pending) the source stays alive with filler instead of stalling:
 
 ```bash
-deezco stream 908622995 --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --jingle-dir ./jingles
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --jingle-dir ./jingles
 ```
 
 - Random file from `--jingle-dir` (mp3/flac), recent-window 3

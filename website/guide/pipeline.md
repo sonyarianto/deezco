@@ -23,7 +23,7 @@ Prefetch tasks do `decode -> loudnorm -> crossfade -> DSP` in parallel on `spawn
 
 ## Bitrate
 
-`PipelineConfig::encode_bitrate` snaps `--bitrate` via `nearest_bitrate` to discrete MPEG rates (ties down). Without `--bitrate`, the fetched format's native rate wins (320 or 128). FLAC fetch as MP3 320 when pipeline active (Icecast can't stream FLAC).
+`PipelineConfig::encode_bitrate` snaps `--bitrate` via `nearest_bitrate` to discrete MPEG rates (ties down). Without `--bitrate`, the nominal format's native rate wins (320 default, or 128). FLAC files need the pipeline (Icecast can't stream FLAC natively) and are skipped without one.
 
 ## Loudness
 

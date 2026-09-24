@@ -55,8 +55,9 @@ deezco playlist https://www.deezer.com/en/playlist/908622995
 deezco serve --port 9001
 # -> http://127.0.0.1:9001/
 
-# stream to Icecast
-deezco stream 908622995 --server http://localhost:8000 --mount /radio --password hackme --crossfade 6 --target-lufs -14
+# stream to Icecast (download first, then stream local files — no login)
+deezco playlist 908622995 -o ./library
+deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --crossfade 6 --target-lufs -14
 ```
 
 ## Why Deezco?

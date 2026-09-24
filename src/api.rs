@@ -23,12 +23,6 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 #[derive(Clone)]
 pub struct DeezerApi {
     client: Client,
-    /// Client for the Icecast source PUT: connect timeout only, deliberately
-    /// *no* total timeout — the request body is endless by design and any
-    /// total timer would kill a healthy stream. Must stay separate from
-    /// `client`, whose total `REQUEST_TIMEOUT` would otherwise do exactly
-    /// that.
-    source_client: Client,
     api_token: Arc<Mutex<Option<String>>>,
     pub current_user: Arc<Mutex<Option<CurrentUser>>>,
 }
@@ -43,16 +37,9 @@ impl DeezerApi {
             .timeout(REQUEST_TIMEOUT)
             .tcp_nodelay(true)
             .build()?;
-        let source_client = Client::builder()
-            .user_agent(USER_AGENT)
-            .danger_accept_invalid_certs(true)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_nodelay(true)
-            .build()?;
 
         Ok(Self {
             client,
-            source_client,
             api_token: Arc::new(Mutex::new(None)),
             current_user: Arc::new(Mutex::new(None)),
         })
@@ -61,11 +48,6 @@ impl DeezerApi {
     /// HTTP client used for API calls and stream downloads
     pub fn client(&self) -> &Client {
         &self.client
-    }
-
-    /// HTTP client used for the Icecast source PUT (no total timeout).
-    pub fn source_client(&self) -> &Client {
-        &self.source_client
     }
 
     /// Login using ARL cookie

@@ -11,7 +11,7 @@
 | `album` | Download album by URL/ID |
 | `following` | Download all releases from every followed artist |
 | `serve` | Serve playlists as HTTP audio |
-| `stream` | Stream a playlist to Icecast |
+| `stream` | Stream local `--music-dir` files to Icecast (no login) |
 | `login` / `logout` | Manage ARL |
 
 ## Global options

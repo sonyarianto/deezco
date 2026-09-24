@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 // Re-export items that other modules reach via `crate::download::` so the
 // public surface stays stable after the split.
 pub(crate) use crate::track::format_annotation;
-pub use crate::track::{DownloadOptions, FetchedTrack, ProgressMode, fetch_track_audio};
+pub use crate::track::{DownloadOptions, ProgressMode, fetch_track_audio};
 
 /// Download a playlist by ID
 pub async fn download_playlist(

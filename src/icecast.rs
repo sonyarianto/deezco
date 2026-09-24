@@ -955,7 +955,7 @@ impl Producer {
             return Ok(());
         }
         // Keep the prefetch pipeline full while we wait.
-        while self.prefetch.len() < Self::PREFETCH_AHEAD {
+        while self.prefetch.len() < self.prefetch_ahead() {
             self.spawn_prefetch();
         }
         // Wait indefinitely for the first real track — no 5s hardcode.
@@ -970,7 +970,7 @@ impl Producer {
                 .expect("prefetch queue must have an entry");
             // Keep queue full so the *next* track is already in flight while
             // we wait for the front one — no gap after the first track.
-            while self.prefetch.len() < Self::PREFETCH_AHEAD {
+            while self.prefetch.len() < self.prefetch_ahead() {
                 self.spawn_prefetch();
             }
             match handle.await {
@@ -1017,8 +1017,22 @@ impl Producer {
             })));
     }
 
-    /// Number of tracks prefetched ahead of the current one.
-    const PREFETCH_AHEAD: usize = 2;
+    /// Number of tracks prefetched ahead of the current one. Stereo Tool
+    /// (CLI or lib) is CPU-heavy (~2x realtime per track); two concurrent
+    /// jobs plus the session encoder can saturate a small box and starve
+    /// the paced TCP sender (audible stutter after the buffered first
+    /// track runs out). One heavy job at a time leaves headroom for it.
+    const PREFETCH_AHEAD_LIGHT: usize = 2;
+    const PREFETCH_AHEAD_ST: usize = 1;
+
+    fn prefetch_ahead(&self) -> usize {
+        if self.runtime.pipeline.stereo_tool.is_some() || self.runtime.pipeline.stereo_lib.is_some()
+        {
+            Self::PREFETCH_AHEAD_ST
+        } else {
+            Self::PREFETCH_AHEAD_LIGHT
+        }
+    }
 
     /// Activate prepared audio: print "now playing", update the Icecast
     /// title, top up the prefetch queue, and set `self.current`. Stays
@@ -1052,10 +1066,10 @@ impl Producer {
                 }
             });
         }
-        // Top up the prefetch queue so there are always PREFETCH_AHEAD
+        // Top up the prefetch queue so there are always prefetch_ahead()
         // tracks ready (or being fetched) ahead of the current one.
         // (Each spawn logs its own seq number; see `spawn_prefetch`.)
-        while self.prefetch.len() < Self::PREFETCH_AHEAD {
+        while self.prefetch.len() < self.prefetch_ahead() {
             self.spawn_prefetch();
         }
         // Resolve the real output bitrate so the advertised rate matches what
@@ -1783,7 +1797,7 @@ impl Producer {
                         break;
                     }
                     let handle = self.prefetch.pop_front().expect("ready front just checked");
-                    while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                    while self.prefetch.len() < self.prefetch_ahead() {
                         self.spawn_prefetch();
                     }
                     match handle.await {
@@ -1814,7 +1828,7 @@ impl Producer {
                 }
                 // No ready real track — ensure queue stays full for next check
                 // and emit filler so the TCP stream never stalls.
-                while self.prefetch.len() < Self::PREFETCH_AHEAD {
+                while self.prefetch.len() < self.prefetch_ahead() {
                     self.spawn_prefetch();
                 }
                 // Diagnostics: how many tracks are pending vs stuck, so filler

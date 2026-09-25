@@ -1,6 +1,11 @@
 # Streaming to Icecast
 
-`stream` plays pure local files from `--music-dir` to an Icecast server as a live radio source (MP3 native passthrough — FLAC needs the PCM pipeline). The station admin downloads first (e.g. `deezco playlist 908622995 -o ./library`), then `stream` shuffles + loops the library with periodic rescan for new files. No Deezer API, no login. It sends ICY metadata, paces in real time, prefetches the next track, and reconnects on drop.
+`stream` has two source modes (`--mode`, default `local`).
+
+- **`local`** — plays pure local files from `--music-dir` (MP3 native passthrough — FLAC needs the PCM pipeline). The station admin downloads first (e.g. `deezco playlist 908622995 -o ./library`), then `stream` shuffles + loops the library with periodic rescan for new files. No Deezer API, no login.
+- **`deezer`** — streams a Deezer playlist directly: each track is fetched into memory, DSP-processed, then streamed. Zero disk usage (2 tracks prefetched ahead), but requires login (ARL); `--quality flac` needs an active pipeline flag.
+
+Both modes send ICY metadata, pace in real time, prefetch the next track, and reconnect on drop.
 
 ## Basic
 
@@ -17,6 +22,13 @@ deezco stream \
   --name "My Radio" \
   --genre "Electronic"
 
+# ...or stream the playlist straight from memory (login required, zero disk)
+deezco stream --mode deezer --playlist 908622995 \
+  --server http://localhost:8000 \
+  --mount /radio \
+  --password hackme \
+  --name "My Radio"
+
 # password via env
 export DEEZCO_ICECAST_PASSWORD=hackme
 deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --public
@@ -30,7 +42,7 @@ Listeners tune in at the mount URL.
 deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --refresh-secs 60
 ```
 
-New files the admin downloads into `--music-dir` are picked up on rescan. Drops reconnect with exponential backoff (5s → 300s).
+New files the admin downloads into `--music-dir` are picked up on rescan (`local` mode); playlist edits on the Deezer web page show up within one refresh interval (`deezer` mode). Drops reconnect with exponential backoff (5s → 300s).
 
 ## Metadata
 
@@ -43,7 +55,7 @@ deezco stream ... --no-metadata
 
 ## Filler (jingles / silence)
 
-When no track is ready (empty library, corrupt file, prefetch pending) the source stays alive with filler instead of stalling:
+When no track is ready (empty source, corrupt file, slow fetch, prefetch pending) the source stays alive with filler instead of stalling:
 
 ```bash
 deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio --password hackme --jingle-dir ./jingles

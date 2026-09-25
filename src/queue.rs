@@ -140,23 +140,15 @@ fn avoid_recent_repeat(tracks: &mut [GwTrack], recent: &VecDeque<String>) {
 }
 
 /// A local audio file ready for streaming: path + human title.
-/// `duration_secs` / `actual_kbps` are filled after decode (0/None = unknown,
-/// pacing falls back to the nominal rate).
 #[derive(Clone, Debug)]
 pub struct LocalTrack {
     pub path: PathBuf,
     pub title: String,
-    pub duration_secs: u64,
-    pub actual_kbps: Option<u32>,
 }
 
 impl LocalTrack {
     pub fn display_name(&self) -> String {
         self.title.clone()
-    }
-
-    pub fn duration_secs(&self) -> u64 {
-        self.duration_secs
     }
 }
 
@@ -218,8 +210,6 @@ impl LocalFileQueue {
                 return Ok(LocalTrack {
                     title: local_title(&path),
                     path,
-                    duration_secs: 0,
-                    actual_kbps: None,
                 });
             }
         }
@@ -262,8 +252,6 @@ impl LocalFileQueue {
         Ok(LocalTrack {
             title: local_title(&path),
             path,
-            duration_secs: 0,
-            actual_kbps: None,
         })
     }
 }

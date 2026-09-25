@@ -15,7 +15,7 @@ deezco [OPTIONS] [COMMAND]
 | `favorites` | Download your liked songs |
 | `following` | Download all releases from followed artists |
 | `serve` | Serve playlists as HTTP audio (+ web player) |
-| `stream` | Stream local `--music-dir` files to Icecast (no login) |
+| `stream` | Stream to Icecast: `--mode local` (default) plays `--music-dir` files, no login; `--mode deezer` streams a playlist from memory, login required |
 | `login` | Save ARL and verify login |
 | `logout` | Remove stored credentials |
 
@@ -50,15 +50,19 @@ deezco [OPTIONS] [COMMAND]
 deezco serve [--host 127.0.0.1] [--port 9001] [--refresh-secs 780]
 ```
 
-## Stream options (pure-local, no login)
+## Stream options
 
 ```
+# local files (default, no login)
 deezco stream --music-dir <DIR> --server <URL> --mount <MOUNT> --password <PW>
-  [--username source] [--name TEXT] [--genre TEXT] [--url TEXT] [--public]
-  [--no-metadata] [--refresh-secs 780] [--jingle-dir DIR]
-  [--crossfade 0..12] [--gain-db -24..24] [--bitrate 8..320]
-  [--target-lufs -40..0] [--stereo-tool PATH] [--stereo-tool-lib PATH]
-  [--stereo-tool-sts PATH] [--stereo-tool-key KEY] [--stereo-tool-reset-track]
+# deezer playlist (in-memory, zero disk, requires login)
+deezco stream --mode deezer --playlist <ID> --server <URL> --mount <MOUNT> --password <PW>
+# shared flags:
+# [--username source] [--name TEXT] [--genre TEXT] [--url TEXT] [--public]
+# [--no-metadata] [--refresh-secs 780] [--jingle-dir DIR]
+# [--crossfade 0..30] [--gain-db -24..24] [--bitrate 8..320]
+# [--target-lufs -23..-6] [--stereo-tool PATH] [--stereo-tool-lib PATH]
+# [--stereo-tool-sts PATH] [--stereo-tool-key KEY] [--stereo-tool-reset-track]
 ```
 
 ## Env vars

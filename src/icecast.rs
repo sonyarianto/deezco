@@ -11,15 +11,16 @@ use reqwest::header;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 
+use crate::api::DeezerApi;
 use crate::audio::{
     BUS_RATE, CrossfadeConfig, FrameDecoder, PcmBuffer, SessionEncoder, SymphoniaDecoder,
     nearest_bitrate, render_track_overlap,
 };
 use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
 use crate::files::is_music_file;
-use crate::models::TrackFormat;
-use crate::queue::{LocalFileQueue, LocalTrack, NextTrackError};
-use crate::track::debug_enabled;
+use crate::models::{GwTrack, TrackFormat};
+use crate::queue::{LocalFileQueue, LocalTrack, NextTrackError, TrackQueue};
+use crate::track::{ProgressMode, available_format, debug_enabled, fetch_track_audio};
 use rand::seq::IndexedRandom;
 
 /// How many bytes of audio between in-band ICY metadata blocks. The source
@@ -141,13 +142,64 @@ pub struct IcecastConfig {
     pub genre: Option<String>,
     pub url: Option<String>,
     pub public: bool,
-    /// Station library with audio files (mp3/flac, recursive).
-    /// Admin downloads beforehand; new files are picked up on rescan.
-    /// Decode/DSP stages only ever see file bytes.
-    pub music_dir: PathBuf,
-    /// Directory of filler jingles. When the library has no ready track
+    /// Deezer playlist ID (what to stream) in `deezer` mode.
+    /// `None` in `local` mode.
+    pub playlist: Option<String>,
+    /// Station library with audio files (mp3/flac, recursive) in `local`
+    /// mode. Admin downloads beforehand; new files are picked up on rescan.
+    /// Decode/DSP stages only ever see file bytes. `None` in `deezer`
+    /// mode, which fetches each track into memory and never touches disk.
+    pub music_dir: Option<PathBuf>,
+    /// Directory of filler jingles. When no real track is ready
     /// a random file from here is played to keep the source alive.
     pub jingle_dir: Option<PathBuf>,
+}
+
+/// Where `stream` gets its audio: local files on disk, or Deezer playlist
+/// tracks fetched into memory (zero disk usage — bytes live only in RAM
+/// and are dropped after playing).
+#[derive(Clone)]
+enum StreamSource {
+    Local(LocalFileQueue),
+    Deezer {
+        api: DeezerApi,
+        queue: TrackQueue,
+        playlist: String,
+        /// Format fetched from the CDN (MP3 320 unless the pipeline
+        /// transcodes a lossless request).
+        fetch_format: TrackFormat,
+    },
+}
+
+impl StreamSource {
+    /// Short label for prefetch / filler-starvation log lines.
+    fn label(&self) -> String {
+        match self {
+            StreamSource::Local(queue) => queue.music_dir().display().to_string(),
+            StreamSource::Deezer { playlist, .. } => format!("playlist {playlist}"),
+        }
+    }
+}
+
+/// A track ready for the streaming path, regardless of source mode:
+/// display title, log detail (file path or Deezer id), plus pacing info
+/// filled after decode (`duration_secs` 0 / `actual_kbps` None = unknown,
+/// pacing falls back to the nominal rate).
+struct StreamTrack {
+    title: String,
+    detail: String,
+    duration_secs: u64,
+    actual_kbps: Option<u32>,
+}
+
+impl StreamTrack {
+    fn display_name(&self) -> String {
+        self.title.clone()
+    }
+
+    fn duration_secs(&self) -> u64 {
+        self.duration_secs
+    }
 }
 
 /// PCM-bus pipeline configuration.
@@ -368,6 +420,30 @@ async fn prepare_track_audio(track: &LocalTrack) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Fetch a Deezer playlist track's decrypted audio into memory (zero disk
+/// usage — the bytes below live only in RAM). A failed fetch just skips
+/// the track (filler bridges the gap) instead of feeding partial audio
+/// into Stereo Tool or the crossfade tail.
+async fn prepare_remote_audio(
+    api: &DeezerApi,
+    track: &GwTrack,
+    fetch_format: TrackFormat,
+) -> Result<Vec<u8>> {
+    if debug_enabled() {
+        crate::warn!(
+            "[deezco-debug] preparing track \"{}\" for stream",
+            track.display_name()
+        );
+    }
+    let fetched = fetch_track_audio(api, track, fetch_format, &ProgressMode::Hidden)
+        .await
+        .with_context(|| format!("stream fetch failed for \"{}\"", track.display_name()))?;
+    if fetched.data.is_empty() {
+        bail!("fetched audio for \"{}\" is empty", track.display_name());
+    }
+    Ok(fetched.data)
+}
+
 /// Ordered handoff between consecutive prefetch tasks: the held PCM tail of
 /// the previous track plus two sequence numbers. Tasks decode and DSP fully
 /// in parallel; only the microsecond mix-and-publish step and the shared
@@ -424,7 +500,7 @@ async fn advance_past(shared: &Arc<Mutex<XfadeShared>>, seq: u64) {
 /// a single argument and later stages can grow without reshuffling callers.
 #[derive(Clone)]
 struct TaskCtx {
-    queue: LocalFileQueue,
+    source: StreamSource,
     /// Position in activation order; gates the crossfade handoff.
     seq: u64,
     /// Session pipeline: config, resolved encode bitrate, shared handoff.
@@ -453,56 +529,170 @@ enum PreparedAudio {
     Pcm(Vec<f32>),
 }
 
-/// Fetch the next local file from the queue and prepare its audio: native MP3
-/// passthrough by default, or decode → loudnorm → crossfade → DSP when the
-/// pipeline is active (the session encoder downstream turns PCM into
-/// continuous CBR). Slow CPU work runs on blocking threads inside the
-/// background task, so track changes stay instant on the streaming path.
+/// Fetch the next track from the stream source and prepare its audio:
+/// native MP3 passthrough by default, or decode → loudnorm → crossfade →
+/// DSP when the pipeline is active (the session encoder downstream turns
+/// PCM into continuous CBR). Slow CPU work runs on blocking threads inside
+/// the background task, so track changes stay instant on the streaming path.
+///
+/// Local mode reads file bytes from `--music-dir`; deezer mode fetches the
+/// playlist track's decrypted audio into memory (zero disk usage).
 ///
 /// Every slow stage logs start/finish with timings: without them a
 /// multi-minute Stereo Tool process looks like a hang.
-async fn fetch_next_track(ctx: TaskCtx) -> Result<(LocalTrack, PreparedAudio)> {
-    let mut track = match ctx.queue.next_file().await {
-        Ok(track) => track,
-        Err(err) => {
-            // Queue failures must also advance the crossfade/DSP handoff,
-            // otherwise every later task would wait forever on claim_turn.
-            advance_past(&ctx.runtime.xfade, ctx.seq).await;
-            return Err(match err {
-                NextTrackError::Empty => anyhow::anyhow!("music-dir has no playable tracks"),
-                NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
-            });
+async fn fetch_next_track(ctx: TaskCtx) -> Result<(StreamTrack, PreparedAudio)> {
+    /// One track's raw bytes plus the source-specific metadata the shared
+    /// pipeline stages below need.
+    struct Fetched {
+        title: String,
+        detail: String,
+        data: Vec<u8>,
+        /// Local FLAC files need a pipeline flag for MP3 encoding.
+        is_flac: bool,
+        /// Deezer-reported duration, for remote native-passthrough pacing.
+        duration_secs: u64,
+        /// Quality actually fetched from the CDN (remote only): drives the
+        /// fallback log and the advertised rate on native passthrough.
+        actual_format: Option<TrackFormat>,
+    }
+    let source = ctx.source.clone();
+    let fetched = match source {
+        StreamSource::Local(queue) => {
+            let track = match queue.next_file().await {
+                Ok(track) => track,
+                Err(err) => {
+                    // Queue failures must also advance the crossfade/DSP
+                    // handoff, otherwise every later task would wait forever
+                    // on claim_turn.
+                    advance_past(&ctx.runtime.xfade, ctx.seq).await;
+                    return Err(match err {
+                        NextTrackError::Empty => {
+                            anyhow::anyhow!("music-dir has no playable tracks")
+                        }
+                        NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
+                    });
+                }
+            };
+            crate::info!(
+                "deezco: prefetch track #{} got \"{}\" ({})",
+                ctx.seq,
+                track.display_name(),
+                track.path.display()
+            );
+            let data = match prepare_track_audio(&track).await {
+                Ok(data) => data,
+                Err(err) => {
+                    advance_past(&ctx.runtime.xfade, ctx.seq).await;
+                    return Err(err);
+                }
+            };
+            let is_flac = track
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
+            Fetched {
+                title: track.display_name(),
+                detail: track.path.display().to_string(),
+                data,
+                is_flac,
+                duration_secs: 0,
+                actual_format: None,
+            }
+        }
+        StreamSource::Deezer {
+            api,
+            queue,
+            playlist,
+            fetch_format,
+        } => {
+            let track = match queue.next_track(&api, &playlist).await {
+                Ok(track) => track,
+                Err(err) => {
+                    // Queue failures must also advance the crossfade/DSP
+                    // handoff, otherwise every later task would wait forever
+                    // on claim_turn.
+                    advance_past(&ctx.runtime.xfade, ctx.seq).await;
+                    return Err(match err {
+                        NextTrackError::Empty => {
+                            anyhow::anyhow!("playlist has no playable tracks")
+                        }
+                        NextTrackError::Fetch(message) => anyhow::anyhow!("{message}"),
+                    });
+                }
+            };
+            crate::info!(
+                "deezco: prefetch track #{} got \"{}\" ({})",
+                ctx.seq,
+                track.display_name(),
+                track.id_str()
+            );
+            let data = match prepare_remote_audio(&api, &track, fetch_format).await {
+                Ok(data) => data,
+                Err(err) => {
+                    advance_past(&ctx.runtime.xfade, ctx.seq).await;
+                    return Err(err);
+                }
+            };
+            // Source vs session: on a free account the fetch falls back
+            // (e.g. 320 -> 128) while the session CBR stays fixed, so an
+            // upscale (128 -> 320) would waste bandwidth without adding
+            // quality. Surface it per track.
+            let actual = available_format(&track, fetch_format);
+            if ctx.runtime.pipeline.is_active() {
+                let title = track.display_name();
+                if actual != fetch_format {
+                    crate::info!(
+                        "deezco: source \"{title}\" ({}) is {actual} (fallback from {fetch_format}) → session {} kbps CBR",
+                        track.id_str(),
+                        ctx.runtime.encode_bps,
+                    );
+                }
+                if let Some(native) = native_bitrate(actual)
+                    && ctx.runtime.encode_bps > native
+                {
+                    crate::warn!(
+                        "deezco: upscaling \"{title}\" ({}) ({actual} → {} kbps); consider --bitrate {native}",
+                        track.id_str(),
+                        ctx.runtime.encode_bps,
+                    );
+                }
+            }
+            Fetched {
+                title: track.display_name(),
+                detail: track.id_str(),
+                data,
+                is_flac: false,
+                duration_secs: track.duration_secs(),
+                actual_format: Some(actual),
+            }
         }
     };
-    crate::info!(
-        "deezco: prefetch track #{} got \"{}\" ({})",
-        ctx.seq,
-        track.display_name(),
-        track.path.display()
-    );
-    let data = match prepare_track_audio(&track).await {
-        Ok(data) => data,
-        Err(err) => {
-            advance_past(&ctx.runtime.xfade, ctx.seq).await;
-            return Err(err);
-        }
+    let mut track = StreamTrack {
+        title: fetched.title.clone(),
+        detail: fetched.detail.clone(),
+        duration_secs: fetched.duration_secs,
+        actual_kbps: fetched.actual_format.and_then(native_bitrate),
     };
-    let is_flac = track
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
     if !ctx.runtime.pipeline.is_active() {
-        if is_flac {
+        if fetched.is_flac {
             advance_past(&ctx.runtime.xfade, ctx.seq).await;
             return Err(anyhow::anyhow!(
                 "flac \"{}\" needs a pipeline flag (--bitrate/--crossfade/--gain-db/--target-lufs/--stereo-tool*) for MP3 encoding",
-                track.display_name()
+                fetched.title
             ));
         }
-        // Native MP3 passthrough still needs the real duration for pacing,
+        if fetched.actual_format.is_some() {
+            // Remote native passthrough: Deezer metadata paces the send
+            // (0 = unknown, falls back to nominal) and the fetched quality
+            // advertises. Bytes stream untouched, straight from memory.
+            return Ok((track, PreparedAudio::Native(fetched.data)));
+        }
+        // Local native passthrough still needs the real duration for pacing,
         // otherwise a 128k file paced at 320k nominal would play 2.5x fast.
         // Decode once for duration (blocking), then send the original bytes.
+        let title = fetched.title.clone();
+        let data = fetched.data;
         let decode_join = tokio::task::spawn_blocking(move || {
             let pcm = SymphoniaDecoder::new().decode(&data)?;
             Ok::<_, anyhow::Error>((pcm.frames(), data))
@@ -518,7 +708,7 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(LocalTrack, PreparedAudio)> {
             }
             Ok(Err(err)) => {
                 advance_past(&ctx.runtime.xfade, ctx.seq).await;
-                return Err(err.context(format!("decode failed for \"{}\"", track.display_name())));
+                return Err(err.context(format!("decode failed for \"{title}\"")));
             }
             Err(join_err) => {
                 advance_past(&ctx.runtime.xfade, ctx.seq).await;
@@ -526,13 +716,11 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(LocalTrack, PreparedAudio)> {
             }
         }
     }
-    let title = track.display_name();
-    let file_len = data.len();
-    crate::info!(
-        "deezco: decoding \"{title}\" ({}) ({} bytes)...",
-        track.path.display(),
-        file_len
-    );
+    let title = fetched.title;
+    let detail = fetched.detail;
+    let data = fetched.data;
+    let data_len = data.len();
+    crate::info!("deezco: decoding \"{title}\" ({detail}) ({data_len} bytes)...",);
     let decode_started = std::time::Instant::now();
     // Decode + loudness share one blocking hop: both are full-track CPU
     // (Symphonia decode, then BS.1770's ~16M biquad ticks for a 3-minute
@@ -583,19 +771,24 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(LocalTrack, PreparedAudio)> {
             return Err(anyhow::anyhow!("decoder task panicked: {join_err}"));
         }
     };
-    // Fill duration + estimated source rate for pacing/advertising.
-    // Upscale warning when the session CBR exceeds the file's own rate.
+    // Fill duration + source rate for pacing/advertising. Local files use
+    // the decoded length to estimate the file's own rate (upscale warning
+    // when the session CBR exceeds it); remote tracks keep the fetched
+    // Deezer quality (fallback/upscale already surfaced per track above,
+    // and the pipeline path advertises the session CBR anyway).
     {
         let duration = (pcm.frames() as u64 / u64::from(BUS_RATE)).max(1);
         track.duration_secs = duration;
-        let bps = bytes_per_sec(file_bytes.len(), duration, 16_000);
-        let source_kbps = (bps * 8 / 1000) as u32;
-        track.actual_kbps = Some(source_kbps);
-        if ctx.runtime.encode_bps > source_kbps {
-            crate::warn!(
-                "deezco: upscaling \"{title}\" ({source_kbps} → {} kbps); consider --bitrate {source_kbps}",
-                ctx.runtime.encode_bps,
-            );
+        if fetched.actual_format.is_none() {
+            let bps = bytes_per_sec(file_bytes.len(), duration, 16_000);
+            let source_kbps = (bps * 8 / 1000) as u32;
+            track.actual_kbps = Some(source_kbps);
+            if ctx.runtime.encode_bps > source_kbps {
+                crate::warn!(
+                    "deezco: upscaling \"{title}\" ({source_kbps} → {} kbps); consider --bitrate {source_kbps}",
+                    ctx.runtime.encode_bps,
+                );
+            }
         }
     }
     // Ordered micro-step: mix the held tail, publish this track's own tail.
@@ -717,7 +910,7 @@ struct CurrentTrack {
 }
 
 /// Background task that fetches and prepares the next track.
-type PrefetchHandle = JoinHandle<Result<(LocalTrack, PreparedAudio)>>;
+type PrefetchHandle = JoinHandle<Result<(StreamTrack, PreparedAudio)>>;
 
 /// How many stereo frames each progressive encode feed covers (~93 ms —
 /// several MP3 frames per call, small enough to stay responsive).
@@ -772,7 +965,7 @@ fn feed_encoder(
 /// reservoir restart — the splice click is gone by construction. ICY
 /// framing counts output bytes on both paths, so metadata stays aligned.
 struct Producer {
-    queue: LocalFileQueue,
+    source: StreamSource,
     source_client: reqwest::Client,
     metadata: bool,
     updater: Option<TitleUpdater>,
@@ -835,7 +1028,7 @@ struct Producer {
 impl Producer {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        queue: LocalFileQueue,
+        source: StreamSource,
         metadata: bool,
         updater: Option<TitleUpdater>,
         runtime: PipelineRuntime,
@@ -880,12 +1073,12 @@ impl Producer {
         }
         let mut prefetch = VecDeque::new();
         prefetch.push_back(tokio::spawn(fetch_next_track(TaskCtx {
-            queue: queue.clone(),
+            source: source.clone(),
             seq: 0,
             runtime: runtime.clone(),
         })));
         let mut this = Self {
-            queue,
+            source,
             source_client: icecast_source_client(),
             metadata,
             updater,
@@ -979,10 +1172,10 @@ impl Producer {
                     return Ok(());
                 }
                 Ok(Err(err)) => {
-                    // Empty music-dir or file error — wait before retrying so
-                    // an empty library doesn't busy-spin (local scan is
-                    // instant, unlike the old CDN fetch). New files appear on
-                    // the next rescan.
+                    // Empty source or track error — wait before retrying so
+                    // an empty library doesn't busy-spin (the local scan is
+                    // instant; the CDN fetch paces itself). New tracks
+                    // appear on the next rescan/refresh.
                     crate::warn!("deezco: warm_up track fetch failed: {err}; retrying");
                     sleep(RETRY_DELAY).await;
                     continue;
@@ -1007,11 +1200,11 @@ impl Producer {
         self.next_seq += 1;
         crate::warn!(
             "deezco: prefetching track #{seq} ({}) in background",
-            self.queue.music_dir().display()
+            self.source.label()
         );
         self.prefetch
             .push_back(tokio::spawn(fetch_next_track(TaskCtx {
-                queue: self.queue.clone(),
+                source: self.source.clone(),
                 seq,
                 runtime: self.runtime.clone(),
             })));
@@ -1038,19 +1231,19 @@ impl Producer {
     /// title, top up the prefetch queue, and set `self.current`. Stays
     /// instant: heavy work (decode/DSP) already happened in the task, and
     /// encoding is progressive downstream.
-    fn activate_track(&mut self, track: LocalTrack, audio: PreparedAudio) {
+    fn activate_track(&mut self, track: StreamTrack, audio: PreparedAudio) {
         if self.runtime.pipeline.crossfade.is_enabled() {
             crate::info!(
                 "deezco: now playing: \"{}\" ({}) (crossfade {:.1}s)",
                 track.display_name(),
-                track.path.display(),
+                track.detail,
                 self.runtime.pipeline.crossfade.duration_secs
             );
         } else {
             crate::info!(
                 "deezco: now playing: \"{}\" ({})",
                 track.display_name(),
-                track.path.display()
+                track.detail
             );
         }
         if let Some(updater) = &self.updater {
@@ -1074,7 +1267,7 @@ impl Producer {
         }
         // Resolve the real output bitrate so the advertised rate matches what
         // listeners receive: the session CBR on the pipeline path, or the
-        // per-file estimated rate on native passthrough.
+        // per-track source rate on native passthrough.
         self.actual_kbps = Some(if self.runtime.pipeline.is_active() {
             self.runtime.encode_bps
         } else {
@@ -1851,19 +2044,20 @@ impl Producer {
                         self.jingle_cache.len()
                     );
                 }
-                // If everything is still pending (cold start, slow decode, empty
-                // music-dir), `load_next_track` would have blocked for seconds
-                // with no bytes out. Filler keeps bytes flowing.
+                // If everything is still pending (cold start, slow decode,
+                // slow CDN fetch, empty source), `load_next_track` would have
+                // blocked for seconds with no bytes out. Filler keeps bytes
+                // flowing.
                 self.load_filler().await;
                 // Track filler streak for starvation detection; activate_track
                 // resets it on real track recovery.
                 self.consecutive_filler += 1;
                 if self.consecutive_filler == 5 {
                     crate::warn!(
-                        "deezco: filler loop: {} consecutive jingle/silence without a real track (last track error: {}) — check music-dir {} is non-empty and ST Mutex not starved; jingle cache {}/{}, pending tracks {}",
+                        "deezco: filler loop: {} consecutive jingle/silence without a real track (last track error: {}) — check source {} is non-empty (ARL valid in deezer mode) and ST Mutex not starved; jingle cache {}/{}, pending tracks {}",
                         self.consecutive_filler,
                         self.last_track_error.as_deref().unwrap_or("none"),
-                        self.queue.music_dir().display(),
+                        self.source.label(),
                         self.jingle_cache.len(),
                         self.jingle_handles.len(),
                         self.prefetch.len()
@@ -2149,31 +2343,93 @@ pub fn check_prerequisites(pipeline: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
-/// Stream local files to an Icecast mount forever, reconnecting whenever the
-/// source connection drops. With an active pipeline, prefetch tasks deliver
-/// processed PCM (decode → loudnorm → crossfade → DSP) and the session
-/// encoder below turns the endless PCM stream into continuous CBR — no
-/// boundary exists at the MP3 level, so splices cannot click. Otherwise
-/// local MP3 files stream untouched (FLAC files are skipped without a
-/// pipeline flag).
+/// Stream to an Icecast mount forever, reconnecting whenever the source
+/// connection drops. Two source modes: `local` plays files from
+/// `--music-dir` (no Deezer API, no login); `deezer` streams a Deezer
+/// playlist where each track is fetched into memory and never touches
+/// disk (requires a logged-in API handle). With an active pipeline,
+/// prefetch tasks deliver processed PCM (decode → loudnorm → crossfade →
+/// DSP) and the session encoder below turns the endless PCM stream into
+/// continuous CBR — no boundary exists at the MP3 level, so splices cannot
+/// click. Otherwise MP3 streams untouched (local FLAC files are skipped
+/// without a pipeline flag; `--quality flac` needs one too).
 pub async fn stream(
+    api: Option<DeezerApi>,
     format: TrackFormat,
     config: IcecastConfig,
     refresh_secs: u64,
     pipeline: PipelineConfig,
 ) -> Result<()> {
-    let encode_bps = pipeline.encode_bitrate(format);
+    // Resolve the source mode from the config the CLI validated: a playlist
+    // means deezer (in-memory fetch, needs login), a music-dir means local.
+    let source = match (config.playlist.clone(), config.music_dir.clone()) {
+        (Some(playlist), None) => {
+            let api = api.context("deezer stream mode requires login (ARL)")?;
+            // Lossless has no native MP3 to pass through: an active pipeline
+            // fetches MP3 320 and encodes from there; without one there is
+            // nothing to send.
+            let fetch_format = if pipeline.is_active() && format == TrackFormat::Flac {
+                TrackFormat::Mp3_320
+            } else {
+                format
+            };
+            if format == TrackFormat::Flac && !pipeline.is_active() {
+                bail!("streaming FLAC to Icecast is not supported; use --quality 320 or 128");
+            }
+            let queue = TrackQueue::new(Duration::from_secs(refresh_secs));
+            let playlist_name = match api.get_playlist_info(&playlist).await {
+                Ok(info) => info["DATA"]["TITLE"]
+                    .as_str()
+                    .unwrap_or("Unknown Playlist")
+                    .to_string(),
+                Err(_) => playlist.clone(),
+            };
+            crate::info!(
+                "deezco: streaming deezer playlist \"{playlist_name}\" ({playlist}) to {}{} (in-memory, zero disk; refresh every {}s)",
+                config.server.trim_end_matches('/'),
+                config.mount,
+                refresh_secs
+            );
+            StreamSource::Deezer {
+                api,
+                queue,
+                playlist,
+                fetch_format,
+            }
+        }
+        (None, Some(music_dir)) => {
+            tokio::fs::create_dir_all(&music_dir).await?;
+            let queue = LocalFileQueue::new(music_dir.clone(), Duration::from_secs(refresh_secs));
+            crate::info!(
+                "deezco: streaming {} to {}{} (rescan every {}s)",
+                music_dir.display(),
+                config.server.trim_end_matches('/'),
+                config.mount,
+                refresh_secs
+            );
+            StreamSource::Local(queue)
+        }
+        (Some(_), Some(_)) => {
+            bail!(
+                "--playlist and --music-dir conflict: pick --mode deezer (in-memory) or --mode local (files)"
+            );
+        }
+        (None, None) => {
+            bail!(
+                "stream needs a source: --playlist (with --mode deezer) or --music-dir (with --mode local)"
+            );
+        }
+    };
+    // Session CBR: explicit override snapped to a discrete MPEG rate, else
+    // the fetched format's native rate (320 for lossless sources fetched
+    // as MP3). This is the exact advertised rate on the pipeline path;
+    // native passthrough advertises per track.
+    let session_format = match &source {
+        StreamSource::Deezer { fetch_format, .. } => *fetch_format,
+        StreamSource::Local(_) => format,
+    };
+    let encode_bps = pipeline.encode_bitrate(session_format);
     check_prerequisites(&pipeline)?;
-    let music_dir = config.music_dir.clone();
-    tokio::fs::create_dir_all(&music_dir).await?;
-    let queue = LocalFileQueue::new(music_dir.clone(), Duration::from_secs(refresh_secs));
-    crate::info!(
-        "deezco: streaming {} to {}{} (rescan every {}s)",
-        music_dir.display(),
-        config.server.trim_end_matches('/'),
-        config.mount,
-        refresh_secs
-    );
     if pipeline.is_active() {
         crate::info!(
             "deezco: pipeline active: session CBR {encode_bps} kbps (decode → DSP per track in prefetch, continuous encode downstream)"
@@ -2242,7 +2498,7 @@ pub async fn stream(
     };
     let jingle_dir = config.jingle_dir.clone();
     let producer = Arc::new(Mutex::new(Producer::new(
-        queue.clone(),
+        source,
         config.metadata,
         Some(updater.clone()),
         runtime,

@@ -53,7 +53,7 @@ deezco [OPTIONS] [COMMAND]
 | `album` | Download an album by URL or ID |
 | `following` | Download all releases from every artist you follow |
 | `serve` | Serve playlists as HTTP audio for external media players (crabsoup, etc.) |
-| `stream` | Stream local `--music-dir` files to an Icecast server as a live radio source (no login) |
+| `stream` | Stream to an Icecast server as a live radio source: `--mode local` (default) plays `--music-dir` files with no login; `--mode deezer` streams a Deezer playlist from memory with zero disk usage (requires login) |
 | `login` | Save ARL and verify login (uses `--arl`, `DEEZCO_ARL`, or prompt; only `--arl`/prompt is persisted) |
 | `logout` | Remove stored login credentials |
 
@@ -255,14 +255,19 @@ deezco serve --refresh-secs 60
 
 ### Live streaming to Icecast
 
-`stream` plays pure local files from `--music-dir` to an Icecast server as
-a live radio source (MP3 native passthrough — FLAC files need an active
-pipeline flag, otherwise they are skipped). The station admin downloads
+`stream` has two source modes. `--mode local` (default) plays pure local
+files from `--music-dir` to an Icecast server as a live radio source (MP3
+native passthrough — FLAC files need an active pipeline flag, otherwise
+they are skipped). The station admin downloads
 first (e.g. `deezco playlist 908622995 -o ./library`), then `stream`
 shuffles + loops the library with periodic rescan for new files — no Deezer
-API, no login. It sends track titles to listeners via
-ICY metadata, paces playback in real time, prefetches the next track so
-changes are seamless, and reconnects automatically if the connection
+API, no login. `--mode deezer` instead streams a Deezer playlist directly:
+each track is fetched into memory, DSP-processed, then streamed — zero disk
+usage, with 2 tracks prefetched ahead — but it requires login (ARL), and
+`--quality flac` needs an active pipeline flag. Both modes send track
+titles to listeners via
+ICY metadata, pace playback in real time, prefetch the next track so
+changes are seamless, and reconnect automatically if the connection
 drops.
 
 ```bash
@@ -277,6 +282,14 @@ deezco stream \
   --password hackme \
   --name "My Radio" \
   --genre "Electronic"
+
+# ...or stream a Deezer playlist straight from memory (login required,
+# zero disk usage — nothing is downloaded to --music-dir)
+deezco stream --mode deezer --playlist 908622995 \
+  --server http://localhost:8000 \
+  --mount /radio \
+  --password hackme \
+  --name "My Radio"
 
 # The password can also come from the environment
 export DEEZCO_ICECAST_PASSWORD=hackme

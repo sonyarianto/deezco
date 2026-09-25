@@ -27,7 +27,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::DeezerApi;
-use crate::cli::{Cli, Commands, OutputFormat, SortDir, SortKey, extract_id, parse_format};
+use crate::cli::{
+    Cli, Commands, OutputFormat, SortDir, SortKey, StreamMode, extract_id, parse_format,
+};
 use crate::models::GwTrack;
 use crate::output::{
     artist_header, enrich_followed_artists, print_album_json, print_defaults, print_favorites_json,
@@ -377,9 +379,17 @@ async fn main() -> Result<()> {
     };
 
     // Login and prepare the output dir for every command except logout.
-    // Stream is pure-local (no Deezer API, no ARL) — the admin downloads
-    // first, then streams from --music-dir.
-    if !matches!(command, Commands::Logout | Commands::Stream { .. }) {
+    // Stream is pure-local in `local` mode (no Deezer API, no ARL) — the
+    // admin downloads first, then streams from --music-dir. In `deezer`
+    // mode the playlist is fetched from the API, so login is required.
+    if !matches!(
+        command,
+        Commands::Logout
+            | Commands::Stream {
+                mode: StreamMode::Local,
+                ..
+            }
+    ) {
         if !auth::login(&api, flag_arl.as_deref(), env_arl.as_deref()).await? {
             return Ok(());
         }
@@ -560,6 +570,8 @@ async fn main() -> Result<()> {
             refresh_secs,
         } => serve::serve(api, format, &host, port, refresh_secs).await?,
         Commands::Stream {
+            mode,
+            playlist,
             music_dir,
             server,
             mount,
@@ -583,6 +595,41 @@ async fn main() -> Result<()> {
             refresh_secs,
             jingle_dir,
         } => {
+            // Mode validation: deezer streams a playlist from memory (login,
+            // zero disk); local plays --music-dir files (no login).
+            let playlist_id = match mode {
+                StreamMode::Deezer => {
+                    let Some(playlist) = playlist else {
+                        anyhow::bail!("--mode deezer requires a playlist URL or ID");
+                    };
+                    if music_dir.is_some() {
+                        anyhow::bail!(
+                            "--mode deezer fetches tracks into memory and never touches disk; drop --music-dir (or use --mode local)"
+                        );
+                    }
+                    Some(extract_id(&playlist, "playlist"))
+                }
+                StreamMode::Local => {
+                    if playlist.is_some() {
+                        anyhow::bail!(
+                            "--playlist requires --mode deezer (local mode plays --music-dir files, no login)"
+                        );
+                    }
+                    None
+                }
+            };
+            let music_dir = match mode {
+                StreamMode::Local => {
+                    let Some(dir) = music_dir else {
+                        anyhow::bail!("--mode local requires --music-dir <dir>");
+                    };
+                    if dir.exists() && !dir.is_dir() {
+                        anyhow::bail!("--music-dir {} is not a directory", dir.display());
+                    }
+                    Some(dir)
+                }
+                StreamMode::Deezer => None,
+            };
             let password = password.or_else(|| {
                 std::env::var("DEEZCO_ICECAST_PASSWORD")
                     .ok()
@@ -635,9 +682,6 @@ async fn main() -> Result<()> {
                 key: stereo_tool_key,
                 reset_per_track: stereo_tool_reset_track,
             });
-            if music_dir.exists() && !music_dir.is_dir() {
-                anyhow::bail!("--music-dir {} is not a directory", music_dir.display());
-            }
             if let Some(dir) = &jingle_dir
                 && !dir.is_dir()
             {
@@ -653,6 +697,7 @@ async fn main() -> Result<()> {
                 genre,
                 url,
                 public,
+                playlist: playlist_id,
                 music_dir,
                 jingle_dir,
             };
@@ -667,9 +712,14 @@ async fn main() -> Result<()> {
                 stereo_tool,
                 stereo_lib,
             };
-            // Fail fast on missing pipeline binaries (no login/network needed).
+            // Fail fast on missing pipeline binaries before connecting.
+            // (Deezer mode already logged in via the shared login above.)
             icecast::check_prerequisites(&pipeline)?;
-            icecast::stream(format, config, refresh_secs, pipeline).await?;
+            let api = match mode {
+                StreamMode::Deezer => Some(api),
+                StreamMode::Local => None,
+            };
+            icecast::stream(api, format, config, refresh_secs, pipeline).await?;
         }
     }
 

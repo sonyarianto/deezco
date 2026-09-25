@@ -123,6 +123,16 @@ pub enum SortDir {
     Desc,
 }
 
+/// Which audio source `stream` plays.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Debug)]
+pub enum StreamMode {
+    /// Play local files from --music-dir (no Deezer API, no login).
+    Local,
+    /// Stream a Deezer playlist: each track is fetched into memory,
+    /// DSP-processed, then streamed (zero disk usage; requires login).
+    Deezer,
+}
+
 /// The Stream variant carries many small CLI fields, making it larger than
 /// the other variants.
 #[allow(clippy::large_enum_variant)]
@@ -169,15 +179,26 @@ pub enum Commands {
         refresh_secs: u64,
     },
     /// Stream local audio files to an Icecast server as a live radio source.
-    /// The station admin downloads tracks first (playlist/favorites/album),
-    /// then `stream` plays pure local files from --music-dir — no Deezer
-    /// API, no login, shuffle + loop with periodic rescan for new files.
+    /// Two modes (see --mode): `local` plays pure local files from
+    /// --music-dir with no Deezer API and no login (the station admin
+    /// downloads tracks first); `deezer` streams a Deezer playlist where
+    /// each track is fetched into memory, DSP-processed, then streamed —
+    /// zero disk usage, but requires login (ARL).
     Stream {
-        /// Directory with station library audio files (mp3/flac, recursive).
-        /// Downloaded beforehand via e.g. `deezco playlist <id> -o ./library`.
-        /// New files are picked up on rescan; missing/empty dir plays filler.
+        /// Stream source mode: `local` (default) or `deezer`.
+        #[arg(long, value_enum, default_value_t = StreamMode::Local)]
+        mode: StreamMode,
+        /// Deezer playlist URL or playlist ID (what to stream).
+        /// Required in `deezer` mode, rejected in `local` mode.
         #[arg(long)]
-        music_dir: PathBuf,
+        playlist: Option<String>,
+        /// Directory with station library audio files (mp3/flac, recursive).
+        /// Required in `local` mode (download beforehand via e.g.
+        /// `deezco playlist <id> -o ./library`); new files are picked up on
+        /// rescan, missing/empty dir plays filler. Rejected in `deezer`
+        /// mode, which never touches disk.
+        #[arg(long)]
+        music_dir: Option<PathBuf>,
         /// Icecast server base URL, e.g. http://localhost:8000
         #[arg(long)]
         server: String,
@@ -258,11 +279,12 @@ pub enum Commands {
         /// the PCM bus.
         #[arg(long, default_value_t = 44100)]
         stereo_rate: u32,
-        /// How often to rescan --music-dir so new downloads are picked up
+        /// How often to rescan --music-dir (`local` mode) or refetch the
+        /// playlist (`deezer` mode) so new tracks are picked up
         #[arg(long, default_value_t = 780)]
         refresh_secs: u64,
         /// Directory containing jingle/filler audio files (mp3/flac).
-        /// When the library has no ready track (empty, or next prefetch
+        /// When no real track is ready (empty library, or next prefetch
         /// still pending) a random jingle is played instead of
         /// silence, keeping the Icecast source alive without dead air.
         /// Falls back to generated silence when unset or empty.

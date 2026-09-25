@@ -4,7 +4,7 @@
 
 Native MP3 passthrough (default) has zero extra deps. The PCM pipeline activates if **any** of these is set:
 
-- `--crossfade <secs>` (0..12, equal-power)
+- `--crossfade <secs>` (0..30, equal-power)
 - `--target-lufs <LUFS>` (R128 loudness)
 - `--gain-db <dB>` (-24..+24)
 - `--bitrate <kbps>` (forces CBR transcode)
@@ -44,7 +44,7 @@ Two backends (mutually exclusive):
 - **`--stereo-tool /opt/stereo_tool_cmd_64`** — per-track subprocess (`WAV 16-bit` stdin/stdout), state resets each track, key visible in `ps aux`, failure bypasses track.
 - **`--stereo-tool-lib /opt/libStereoTool_intel64.so`** — in-process `libStereoTool` (`dlopen`), no spawn/pipe, key stays in-process, state persists across tracks by default (`--stereo-tool-reset-track` for CLI-like resets). Shared via `Arc<Mutex<...>>` with ordered `claim_dsp_turn` for continuity.
 
-Prerequisites are checked before login/network (`check_prerequisites`).
+Prerequisites are checked before connecting (`check_prerequisites`) — before any login/network in `local` mode; after login in `deezer` mode.
 
 ## Crossfade
 

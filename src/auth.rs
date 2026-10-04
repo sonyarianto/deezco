@@ -34,9 +34,23 @@ async fn save_arl_to(dir: &Path, arl: &str) -> Result<()> {
     fs::create_dir_all(dir)
         .await
         .context("Failed to create config dir")?;
-    fs::write(dir.join(".arl"), arl.trim())
+    let path = dir.join(".arl");
+    fs::write(&path, arl.trim())
         .await
         .context("Failed to save ARL")?;
+    // The ARL is a password-equivalent cookie: restrict it to owner-only.
+    // Without this the file inherits the umask (typically 0644) and any
+    // local user can read it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .context("Failed to restrict config dir permissions")?;
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .context("Failed to restrict ARL permissions")?;
+    }
     Ok(())
 }
 
@@ -339,6 +353,22 @@ mod tests {
             read_stored_arl_from(dir.path()).await.as_deref(),
             Some("abc")
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn saved_arl_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("perms");
+        save_arl_to(dir.path(), "secret-arl").await.unwrap();
+        let mode = std::fs::metadata(dir.path().join(".arl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "ARL file must be owner-only, got {mode:o}");
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "config dir must be owner-only");
     }
 
     #[tokio::test]

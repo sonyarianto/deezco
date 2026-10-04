@@ -377,6 +377,31 @@ mod tests {
         assert!((buf[1] + 0.5).abs() < 0.01);
     }
 
+    /// Golden: a fixed non-clipping sine through gain must produce
+    /// bit-exact scaled samples. Later chain additions (e.g. a transparent
+    /// limiter) must keep this output identical — peak 0.8 stays under the
+    /// 1.0 threshold, so nothing downstream may touch it.
+    #[test]
+    fn golden_gain_chain_is_bit_exact() {
+        let input: Vec<f32> = (0..4410)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin() * 0.4;
+                [s, s]
+            })
+            .collect();
+        let factor = GainProcessor::new(6.0).factor();
+        let expected: Vec<f32> = input
+            .iter()
+            .map(|s| (s * factor).clamp(-1.0, 1.0))
+            .collect();
+        let mut chain = ProcessorChain::new();
+        chain.push(GainProcessor::new(6.0));
+        let mut buf = input.clone();
+        chain.process(&mut buf).unwrap();
+        assert_eq!(buf, expected);
+        assert!(buf.iter().all(|s| s.abs() <= 0.81));
+    }
+
     #[test]
     fn gain_clamps_to_prevent_hard_clip() {
         let mut gain = GainProcessor::new(24.0);

@@ -814,6 +814,15 @@ mod tests {
         assert!(resample_linear_stereo(&[], 22050, 44100).is_empty());
     }
 
+    /// Golden: the f32 same-rate path (every Deezer source) must return the
+    /// input untouched — resampler upgrades must never alter this path.
+    #[test]
+    fn resample_f32_same_rate_is_identity() {
+        let input = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.5];
+        assert_eq!(resample_linear_stereo_f32(&input, 44100, 44100), input);
+        assert!(resample_linear_stereo_f32(&[], 22050, 44100).is_empty());
+    }
+
     #[test]
     fn resample_upsample_doubles_frame_count() {
         // 4 frames at 22050 Hz -> 8 frames at 44100 Hz; endpoints preserved.

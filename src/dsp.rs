@@ -12,11 +12,6 @@
 //! path stays native MP3 passthrough with zero extra dependencies; the
 //! chain only runs when the pipeline is active.
 
-// Scaffolding allow: covers chain API surface that unit tests exercise
-// but production constructs only on the pipeline path (e.g. bypass-only
-// configs); remove it as coverage converges.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -25,13 +20,16 @@ use anyhow::Result;
 /// `[-1.0, 1.0]`, at the bus sample rate (see [`crate::audio::BUS_RATE`]).
 /// Implementations must be `Send` because the producer drives the chain from
 /// a background streaming task.
+/// Note: there is intentionally no `reset` hook. Chains are built fresh for
+/// every track, so per-track state starts clean by construction; the one
+/// persistent processor (`StereoLibHandle`) owns its own `reset_per_track`
+/// flag instead of going through the chain. A `reset` method here would
+/// silently do nothing useful and mislead future stateful processors.
 pub trait AudioProcessor: Send {
     /// Short human-readable name used in log lines.
     fn name(&self) -> &str;
     /// Process `buf` in place. `buf.len()` is always even (stereo frames).
     fn process(&mut self, buf: &mut [f32]) -> Result<()>;
-    /// Reset stateful processors on track boundaries / reconnects.
-    fn reset(&mut self) {}
 }
 
 /// Ordered DSP chain. Runs post-crossfade, pre-encode — the exact slot a
@@ -60,6 +58,8 @@ impl ProcessorChain {
     }
 
     /// Number of registered processors.
+    // Test-only surface (no production caller); kept for unit tests.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.processors.len()
     }
@@ -75,13 +75,6 @@ impl ProcessorChain {
             processor.process(buf)?;
         }
         Ok(())
-    }
-
-    /// Reset every stateful processor (e.g. after a reconnect).
-    pub fn reset(&mut self) {
-        for processor in &mut self.processors {
-            processor.reset();
-        }
     }
 }
 
@@ -102,6 +95,8 @@ impl GainProcessor {
     }
 
     /// Linear gain factor (1.0 = unity).
+    // Test-only surface (no production caller); kept for unit tests.
+    #[allow(dead_code)]
     pub fn factor(&self) -> f32 {
         self.gain
     }

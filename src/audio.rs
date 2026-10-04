@@ -11,9 +11,12 @@
 //! `SymphoniaDecoder` (pure Rust) and `SessionEncoder` (statically linked
 //! LAME) — the whole loop stays in-process with zero runtime dependencies.
 
-// Scaffolding allow: covers bus API surface that unit tests exercise but
-// production constructs only on some paths (e.g. alternate curve variants,
-// future taps); remove it as coverage converges.
+// Audited 2026-10-04: module-level allow is deliberate, not scaffolding.
+// Covered items are real API/test surface with no production caller yet:
+// `BUS_CHANNELS`, `PcmBuffer::{new, silence, duration_secs, is_empty}`,
+// `CrossfadeCurve::Linear`, `FrameDecoder::name`,
+// `resample_linear_stereo` (i16 path; live decode uses the f32 path), and
+// `SessionEncoder::flush`. Narrow per-item allows would just be noise.
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};

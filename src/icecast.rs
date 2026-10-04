@@ -16,7 +16,7 @@ use crate::audio::{
     BUS_RATE, CrossfadeConfig, FrameDecoder, PcmBuffer, SessionEncoder, SymphoniaDecoder,
     nearest_bitrate, render_track_overlap,
 };
-use crate::dsp::{GainProcessor, ProcessorChain, StereoToolProcessor};
+use crate::dsp::{GainProcessor, PeakLimiter, ProcessorChain, StereoToolProcessor};
 use crate::files::is_music_file;
 use crate::models::{GwTrack, TrackFormat};
 use crate::queue::{LocalFileQueue, LocalTrack, NextTrackError, TrackQueue};
@@ -844,6 +844,8 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(StreamTrack, PreparedAudio)> 
                 .is_some_and(|config| config.reset_per_track),
         ));
     }
+    // Safety net last (log label mirrors the real chain below).
+    label_chain.push(PeakLimiter::new());
     let chain_names = label_chain.names().join(" -> ");
     let dsp_label = if chain_names.is_empty() {
         "ready".to_string()
@@ -881,6 +883,9 @@ async fn fetch_next_track(ctx: TaskCtx) -> Result<(StreamTrack, PreparedAudio)> 
                     .is_some_and(|config| config.reset_per_track),
             ));
         }
+        // Safety net last: tames Stereo Tool overshoots above 0 dBFS;
+        // bit-exact bypass below threshold (see PeakLimiter).
+        chain.push(PeakLimiter::new());
         let mut out = out_pcm;
         let res = chain.process(&mut out);
         crate::stereo_lib::clear_process_label();
@@ -1557,6 +1562,8 @@ impl Producer {
                         ));
                     }
                 }
+                // Safety net last (see the track path above).
+                chain.push(PeakLimiter::new());
                 if !chain.is_empty() {
                     let names = chain.names().join(" -> ");
                     crate::info!(
@@ -1768,6 +1775,8 @@ impl Producer {
                         ));
                     }
                 }
+                // Safety net last (see the track path above).
+                chain.push(PeakLimiter::new());
                 if !chain.is_empty() {
                     let names = chain.names().join(" -> ");
                     crate::info!(
@@ -1907,6 +1916,8 @@ impl Producer {
                         ));
                     }
                 }
+                // Safety net last (see the track path above; no-op on silence).
+                chain.push(PeakLimiter::new());
                 if !chain.is_empty() {
                     // Silence through DSP is still silence; just keep the
                     // processing slot consistent (and log for visibility).

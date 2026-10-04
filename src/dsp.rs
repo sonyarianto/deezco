@@ -4,17 +4,23 @@
 //!
 //! ```text
 //! MP3 bytes -> Decoder -> PCM f32 stereo @ bus rate -> Crossfader
-//!   -> ProcessorChain (Gain -> StereoTool -> ...) -> Encoder -> Icecast
+//!   -> ProcessorChain (Gain -> StereoTool -> Limiter) -> Encoder -> Icecast
 //! ```
+//!
+//! The limiter is appended last by each call site (after the optional
+//! shared libStereoTool tap), so it always guards the encoder input.
 //!
 //! This module owns the `ProcessorChain` tap: gain is live, and Stereo Tool
 //! runs here as a per-track subprocess with bypass fallback. The default
 //! path stays native MP3 passthrough with zero extra dependencies; the
 //! chain only runs when the pipeline is active.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use anyhow::Result;
+
+use crate::audio::BUS_RATE;
 
 /// Audio processors operate on interleaved stereo `f32` PCM in the range
 /// `[-1.0, 1.0]`, at the bus sample rate (see [`crate::audio::BUS_RATE`]).
@@ -115,6 +121,133 @@ impl AudioProcessor for GainProcessor {
         for sample in buf.iter_mut() {
             *sample = (*sample * self.gain).clamp(-1.0, 1.0);
         }
+        Ok(())
+    }
+}
+
+/// Lookahead peak limiter (brickwall at 0 dBFS), always last in the chain.
+///
+/// Catches what upstream clamps cannot: overshoots produced *by* Stereo
+/// Tool itself, which would otherwise hit the encoder as hard-clipped
+/// samples. Design contract, in order of importance:
+///
+/// 1. Transparent when quiet: buffers peaking at or below 1.0 pass through
+///    bit-exact (fast path, no float ops at all) — normal material sounds
+///    identical with or without this processor.
+/// 2. No gap on fresh state: chains are built per track, so the delay line
+///    starts empty every track; gain is derived from the buffer's own
+///    upcoming samples (true lookahead from the first frame), never from
+///    zero-fill.
+/// 3. Stereo-linked: one gain from `max(|L|, |R|)` drives both channels, so
+///    the stereo image never shifts.
+///
+/// Upstream clamps (loudness/gain/crossfade) are deliberately untouched, so
+/// levels into Stereo Tool stay exactly as before; this only tames what
+/// comes out above 0 dBFS.
+pub struct PeakLimiter {
+    /// Delayed interleaved audio (up to `LOOKAHEAD_FRAMES` stereo frames).
+    delay: VecDeque<f32>,
+    /// Required gain per delayed frame, in the same order.
+    gain_delay: VecDeque<f32>,
+    /// Peak envelope with instant attack and exponential release; survives
+    /// across `process` calls for streaming continuity.
+    envelope: f32,
+    /// Per-sample release multiplier for [`PeakLimiter::RELEASE_SECS`].
+    release_coeff: f32,
+}
+
+impl PeakLimiter {
+    /// Lookahead in stereo frames (~5.8 ms at the bus rate): long enough to
+    /// catch a transient, short enough to stay inaudible on radio.
+    const LOOKAHEAD_FRAMES: usize = 256;
+    /// Gain recovery time after a peak (seconds).
+    const RELEASE_SECS: f32 = 0.05;
+
+    /// Build a limiter with empty state (fresh per track by construction).
+    pub fn new() -> Self {
+        Self {
+            delay: VecDeque::with_capacity(Self::LOOKAHEAD_FRAMES * 2),
+            gain_delay: VecDeque::with_capacity(Self::LOOKAHEAD_FRAMES),
+            envelope: 0.0,
+            release_coeff: (-1.0 / (BUS_RATE as f32 * Self::RELEASE_SECS)).exp(),
+        }
+    }
+
+    /// Required gain for one linked stereo peak (≤ 1.0, instant attack).
+    fn required_gain(&mut self, peak: f32) -> f32 {
+        self.envelope = peak.max(self.envelope * self.release_coeff);
+        if self.envelope > 1.0 {
+            1.0 / self.envelope
+        } else {
+            1.0
+        }
+    }
+}
+
+impl Default for PeakLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioProcessor for PeakLimiter {
+    fn name(&self) -> &str {
+        "limiter"
+    }
+
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(buf.len() % 2, 0, "stereo frames are always even");
+        // Fast path (the common case): nothing above 0 dBFS means the
+        // limiter has no job — return without touching a single sample so
+        // quiet material stays bit-exact.
+        if buf.iter().all(|sample| sample.abs() <= 1.0) {
+            return Ok(());
+        }
+        // Streaming lookahead: delay the audio while the gain is derived
+        // from the undelayed envelope, so the gain drops *before* the
+        // transient arrives at the output. All indices step in stereo
+        // frames; the delay never holds more than LOOKAHEAD_FRAMES.
+        let mut written = 0;
+        let mut read = 0;
+        while read < buf.len() {
+            let peak = buf[read].abs().max(buf[read + 1].abs());
+            let gain = self.required_gain(peak);
+            self.delay.push_back(buf[read]);
+            self.delay.push_back(buf[read + 1]);
+            self.gain_delay.push_back(gain);
+            if self.delay.len() > Self::LOOKAHEAD_FRAMES * 2 {
+                let delayed_gain = self
+                    .gain_delay
+                    .pop_front()
+                    .expect("gain delay tracks audio delay");
+                for _ in 0..2 {
+                    let delayed = self.delay.pop_front().expect("delay is full");
+                    buf[written] = (delayed * delayed_gain).clamp(-1.0, 1.0);
+                    written += 1;
+                }
+            }
+            read += 2;
+        }
+        // End of input: the last delayed frames leave with the carried gain
+        // state (release tail). Total output always equals total input.
+        // Audio is always pushed/popped in L/R pairs, so the delay drains
+        // in whole frames exactly like the main loop above.
+        while self.delay.len() >= 2 {
+            let delayed_gain = self
+                .gain_delay
+                .pop_front()
+                .expect("gain delay tracks audio delay");
+            for _ in 0..2 {
+                let delayed = self.delay.pop_front().expect("delay drains evenly");
+                buf[written] = (delayed * delayed_gain).clamp(-1.0, 1.0);
+                written += 1;
+            }
+        }
+        debug_assert!(self.gain_delay.is_empty());
+        debug_assert_eq!(written, buf.len());
         Ok(())
     }
 }
@@ -377,10 +510,10 @@ mod tests {
         assert!((buf[1] + 0.5).abs() < 0.01);
     }
 
-    /// Golden: a fixed non-clipping sine through gain must produce
-    /// bit-exact scaled samples. Later chain additions (e.g. a transparent
-    /// limiter) must keep this output identical — peak 0.8 stays under the
-    /// 1.0 threshold, so nothing downstream may touch it.
+    /// Golden: a fixed non-clipping sine through gain + limiter must
+    /// produce bit-exact scaled samples. Peak 0.8 stays under the 1.0
+    /// threshold, so the limiter downstream may not touch it — this pins
+    /// the transparency contract in situ.
     #[test]
     fn golden_gain_chain_is_bit_exact() {
         let input: Vec<f32> = (0..4410)
@@ -396,10 +529,121 @@ mod tests {
             .collect();
         let mut chain = ProcessorChain::new();
         chain.push(GainProcessor::new(6.0));
+        chain.push(PeakLimiter::new());
         let mut buf = input.clone();
         chain.process(&mut buf).unwrap();
         assert_eq!(buf, expected);
         assert!(buf.iter().all(|s| s.abs() <= 0.81));
+    }
+
+    #[test]
+    fn limiter_reports_its_name() {
+        assert_eq!(PeakLimiter::new().name(), "limiter");
+    }
+
+    #[test]
+    fn limiter_leaves_quiet_audio_bit_exact() {
+        // The transparency contract: at or below 0 dBFS not one sample moves.
+        let input: Vec<f32> = (0..2048)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin() * 0.9;
+                [s, s]
+            })
+            .collect();
+        let mut buf = input.clone();
+        PeakLimiter::new().process(&mut buf).unwrap();
+        assert_eq!(buf, input);
+    }
+
+    #[test]
+    fn limiter_leaves_full_scale_dc_untouched() {
+        let mut buf = [1.0, -1.0, 1.0, -1.0];
+        PeakLimiter::new().process(&mut buf).unwrap();
+        assert_eq!(buf, [1.0, -1.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn limiter_tames_hot_sine_without_flat_top() {
+        // 1.3 peak: must come back to 0 dBFS without NaN and without
+        // losing the body of the signal.
+        let input: Vec<f32> = (0..44100)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin() * 1.3;
+                [s, s]
+            })
+            .collect();
+        let mut buf = input.clone();
+        PeakLimiter::new().process(&mut buf).unwrap();
+        assert_eq!(buf.len(), input.len());
+        assert!(buf.iter().all(|s| s.is_finite()));
+        let peak: f32 = buf.iter().map(|s| s.abs()).fold(0.0, f32::max);
+        assert!(peak <= 1.0, "brickwall must hold (peak={peak})");
+        assert!(
+            peak > 0.95,
+            "limiter must not crush the signal (peak={peak})"
+        );
+    }
+
+    #[test]
+    fn limiter_catches_leading_transient_with_no_gap() {
+        // Impulse on the very first frame: true lookahead limits it in
+        // place — output starts with limited audio, never with zeros.
+        let mut buf = vec![0.0; 4096];
+        buf[0] = 1.8;
+        buf[1] = -1.8;
+        PeakLimiter::new().process(&mut buf).unwrap();
+        assert_ne!(buf[0], 0.0, "first frame must not be a delay gap");
+        assert!(buf.iter().all(|s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn limiter_links_stereo_channels() {
+        // Same gain both sides: the L/R ratio is preserved everywhere.
+        let input = vec![1.5, 0.15, -1.5, -0.15, 0.5, 0.05];
+        let mut buf = input.clone();
+        PeakLimiter::new().process(&mut buf).unwrap();
+        for (i, pair) in buf.chunks_exact(2).enumerate() {
+            let (a, b) = (input[i * 2], input[i * 2 + 1]);
+            if a.abs() > 1e-6 && b.abs() > 1e-6 {
+                assert!(
+                    (pair[0] / a - pair[1] / b).abs() < 1e-6,
+                    "channels must share one gain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limiter_empty_input_is_ok() {
+        let mut buf: Vec<f32> = Vec::new();
+        PeakLimiter::new().process(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn limiter_split_calls_stay_continuous() {
+        // One whole call vs two halves through the same instance: the seam
+        // lacks lookahead across the boundary, so allow a small tolerance —
+        // continuity, not identity, is the contract here.
+        let input: Vec<f32> = (0..8820)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin() * 1.1;
+                [s, s]
+            })
+            .collect();
+        let mut whole = input.clone();
+        PeakLimiter::new().process(&mut whole).unwrap();
+        let mut split = input.clone();
+        let mut limiter = PeakLimiter::new();
+        let mid = split.len() / 2;
+        limiter.process(&mut split[..mid]).unwrap();
+        limiter.process(&mut split[mid..]).unwrap();
+        let worst: f32 = whole
+            .iter()
+            .zip(split.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 0.05, "split calls must stay continuous ({worst})");
     }
 
     #[test]

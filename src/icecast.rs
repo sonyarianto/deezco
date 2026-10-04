@@ -70,6 +70,30 @@ impl Producer {
         self.prefetch.iter().any(|h| !h.is_finished())
     }
 
+    /// True when the persistent libStereoTool instance runs with continuous
+    /// state (default): DSP calls must follow stream order. Filler on the
+    /// streaming path has no sequence number, so it cannot claim the ordered
+    /// turn — it must bypass the shared instance while a real track is still
+    /// DSP'ing, otherwise the DSP order (track-then-filler) reverses the
+    /// stream order (filler-then-track) and stalls the source TCP.
+    fn ordered_dsp_active(&self) -> bool {
+        self.runtime.stereo_lib.is_some()
+            && !self
+                .runtime
+                .pipeline
+                .stereo_lib
+                .as_ref()
+                .is_some_and(|config| config.reset_per_track)
+    }
+
+    /// Skip the shared libStereoTool call for filler while a real track DSP
+    /// is still pending. Gain (fast, stateless) still runs; only the shared
+    /// stateful instance is bypassed. When no track is pending (burst holes)
+    /// filler uses the full chain so jingles stay sonically consistent.
+    fn should_bypass_filler_st(&self) -> bool {
+        self.runtime.pipeline.is_active() && self.ordered_dsp_active() && self.has_pending_track()
+    }
+
     fn jingle_target(&self) -> usize {
         // ST-aware: no jingles at all before the first real track is ready —
         // otherwise the single shared ST instance (Mutex) blocks the track's
@@ -1005,14 +1029,17 @@ struct Producer {
     recent_jingles: VecDeque<PathBuf>,
     /// Encoder for native filler (silence/jingles) when pipeline is inactive.
     filler_encoder: Option<SessionEncoder>,
-    /// Decoded + DSP-processed jingles ready to play instantly. Stored as
-    /// loudness-corrected + DSP-processed PCM **before** crossfade — crossfade
-    /// is applied at playback with the current `XfadeShared` tail so the mix
-    /// stays correct even though the jingle was prefetched minutes earlier.
-    /// Keeps up to `JINGLE_PREFETCH_LIGHT` (5) or `JINGLE_PREFETCH_ST` (1
-    /// when ST is active); with ST the effective target throttles to 1 while
-    /// a track prefetch is still pending so the real track wins the shared
-    /// libStereoTool Mutex (2026-09-21 starvation fix).
+    /// Decoded jingles ready to mix instantly. Stored as loudness-corrected
+    /// raw PCM **before** crossfade and **before** DSP — crossfade is applied
+    /// at playback with the current `XfadeShared` tail, then the mixed output
+    /// runs the full DSP chain (same order as regular tracks: mix -> DSP).
+    /// Prefetch does decode + loudness only (fast, no ST mutex) so background
+    /// jingles never starve real tracks; DSP happens on the streaming path at
+    /// playback where the tail is known. Keeps up to `JINGLE_PREFETCH_LIGHT`
+    /// (5) or `JINGLE_PREFETCH_ST` (1 when ST is active); with ST the
+    /// effective target throttles to 1 while a track prefetch is still pending
+    /// so the real track wins (2026-09-21 starvation fix, extended 2026-10-04
+    /// to remove background ST entirely).
     jingle_cache: VecDeque<(String, Vec<f32>)>,
     #[allow(clippy::type_complexity)]
     jingle_handles: VecDeque<JoinHandle<Result<(String, Vec<f32>)>>>,
@@ -1342,7 +1369,6 @@ impl Producer {
             return;
         };
         let pipeline = self.runtime.pipeline.clone();
-        let stereo_lib = self.runtime.stereo_lib.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<(String, Vec<f32>)> {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("failed to read jingle {}", path.display()))?;
@@ -1355,8 +1381,12 @@ impl Producer {
                 .unwrap_or("Jingle")
                 .to_string();
             let display = format!("Jingle - {title}");
-            // Decode + loudness + DSP without crossfade (crossfade is cheap
-            // and must use the current XfadeShared tail at playback time).
+            // Decode + loudness only (no crossfade, no DSP): crossfade needs
+            // the current XfadeShared tail at playback time, and DSP must run
+            // after the mix (mix -> DSP, same as regular tracks). Prefetching
+            // DSP here would mix raw-tail + processed-head at playback and
+            // double-process the published tail, plus contend the shared
+            // libStereoTool mutex behind real tracks.
             let mut pcm = SymphoniaDecoder::new()
                 .decode(&bytes)
                 .with_context(|| format!("decode jingle {}", path.display()))?
@@ -1369,27 +1399,6 @@ impl Producer {
                 && let Some(corr) = crate::loudness::analyze(&pcm, crate::audio::BUS_RATE, target)
             {
                 crate::loudness::apply_correction(&mut pcm, corr.gain_db);
-            }
-            if pipeline.is_active() {
-                let mut chain = pipeline.build_chain();
-                if let Some(shared) = &stereo_lib {
-                    let reset = pipeline
-                        .stereo_lib
-                        .as_ref()
-                        .is_some_and(|c| c.reset_per_track);
-                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
-                        shared.clone(),
-                        reset,
-                    ));
-                }
-                if !chain.is_empty() {
-                    crate::stereo_lib::set_process_label(display.clone());
-                    let res = chain
-                        .process(&mut pcm)
-                        .with_context(|| format!("DSP jingle {}", path.display()));
-                    crate::stereo_lib::clear_process_label();
-                    res?;
-                }
             }
             Ok((display, pcm))
         });
@@ -1507,6 +1516,10 @@ impl Producer {
             });
         }
         if self.encoder.is_some() {
+            // Cached PCM is raw (decode + loudness only): mix with the held
+            // tail first, then run the full DSP chain — same mix -> DSP order
+            // as regular tracks. The published tail stays raw so the next
+            // track mixes raw + raw instead of double-processing.
             if self.runtime.pipeline.crossfade.is_enabled() {
                 let mut shared = self.runtime.xfade.lock().await;
                 let (out, new_tail) = render_track_overlap(
@@ -1518,13 +1531,61 @@ impl Producer {
                 shared.tail = new_tail;
                 pcm = out;
             }
-            // pcm is already DSP-processed in the prefetch task, so no second
-            // chain here — just set the current track.
+            let pipeline = self.runtime.pipeline.clone();
+            let stereo_lib = self.runtime.stereo_lib.clone();
+            let bypass_st = self.should_bypass_filler_st();
+            if bypass_st {
+                crate::info!(
+                    "deezco: cached jingle \"{display}\" bypasses stereo-tool-lib (track DSP pending, preserving stream order)"
+                );
+            }
+            let display_for_dsp = display.clone();
+            let dsp_result = tokio::task::spawn_blocking(move || {
+                let mut chain = pipeline.build_chain();
+                if let Some(shared) = &stereo_lib {
+                    let reset = pipeline
+                        .stereo_lib
+                        .as_ref()
+                        .is_some_and(|c| c.reset_per_track);
+                    // Ordered continuous instance has no sequence number on
+                    // the filler path: bypass instead of reversing history.
+                    // Reset-per-track mode is stateless per call, safe to run.
+                    if !bypass_st || reset {
+                        chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                            shared.clone(),
+                            reset,
+                        ));
+                    }
+                }
+                if !chain.is_empty() {
+                    let names = chain.names().join(" -> ");
+                    crate::info!(
+                        "deezco: DSP ({names}) \"{display_for_dsp}\" ({} frames, cached)...",
+                        pcm.len() / 2
+                    );
+                }
+                crate::stereo_lib::set_process_label(display_for_dsp.clone());
+                if let Err(err) = chain.process(&mut pcm) {
+                    crate::warn!(
+                        "deezco: cached jingle DSP failed for \"{display_for_dsp}\": {err}; bypassing"
+                    );
+                }
+                crate::stereo_lib::clear_process_label();
+                pcm
+            })
+            .await;
+            let processed = match dsp_result {
+                Ok(samples) => samples,
+                Err(err) => {
+                    crate::warn!("deezco: cached jingle DSP task panicked: {err}");
+                    return false;
+                }
+            };
             let bps = u64::from(self.runtime.encode_bps) * 1000 / 8;
             self.current = Some(CurrentTrack {
                 title: display,
                 audio: CurrentAudio::Pcm {
-                    samples: pcm,
+                    samples: processed,
                     pos: 0,
                 },
                 bytes_per_sec: bps,
@@ -1677,14 +1738,21 @@ impl Producer {
                 pcm = out;
             }
             // DSP chain (gain + Stereo Tool/lib) on the already-leveled and
-            // crossfaded PCM. Runs on a blocking thread; the libStereoTool
-            // mutex is held inside process() and serializes with prefetch
-            // tasks. Filler does not claim the ordered DSP turn — it simply
-            // serializes on the mutex — which keeps stream order (filler
-            // between two tracks runs between their DSP calls) without
-            // stalling the sequenced handoff.
+            // crossfaded PCM. Runs on a blocking thread. The filler has no
+            // sequence number, so it cannot claim the ordered libStereoTool
+            // turn: while a real track DSP is pending the shared continuous
+            // instance is bypassed (gain still runs) to preserve stream order
+            // and keep the source TCP flowing; otherwise the DSP order
+            // (track-then-filler) would reverse the stream order
+            // (filler-then-track).
             let pipeline = self.runtime.pipeline.clone();
             let stereo_lib = self.runtime.stereo_lib.clone();
+            let bypass_st = self.should_bypass_filler_st();
+            if bypass_st {
+                crate::info!(
+                    "deezco: jingle \"{display}\" bypasses stereo-tool-lib (track DSP pending, preserving stream order)"
+                );
+            }
             let display_for_dsp = display.clone();
             let dsp_result = tokio::task::spawn_blocking(move || {
                 let mut chain = pipeline.build_chain();
@@ -1693,10 +1761,12 @@ impl Producer {
                         .stereo_lib
                         .as_ref()
                         .is_some_and(|c| c.reset_per_track);
-                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
-                        shared.clone(),
-                        reset,
-                    ));
+                    if !bypass_st || reset {
+                        chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                            shared.clone(),
+                            reset,
+                        ));
+                    }
                 }
                 if !chain.is_empty() {
                     let names = chain.names().join(" -> ");
@@ -1816,9 +1886,13 @@ impl Producer {
                 pcm = out;
             }
             // Silence is already 0.0 — gain/loudness are no-ops — but run the
-            // chain anyway so latency and state handling match regular tracks.
+            // chain anyway so latency and state handling match regular tracks,
+            // except the shared continuous instance while a real track is
+            // pending (same ordered-DSP bypass as jingles: no seq number, no
+            // reversal, no TCP stall).
             let pipeline = self.runtime.pipeline.clone();
             let stereo_lib = self.runtime.stereo_lib.clone();
+            let bypass_st = self.should_bypass_filler_st();
             let dsp_result = tokio::task::spawn_blocking(move || {
                 let mut chain = pipeline.build_chain();
                 if let Some(shared) = &stereo_lib {
@@ -1826,10 +1900,12 @@ impl Producer {
                         .stereo_lib
                         .as_ref()
                         .is_some_and(|c| c.reset_per_track);
-                    chain.push(crate::stereo_lib::StereoLibProcessor::shared(
-                        shared.clone(),
-                        reset,
-                    ));
+                    if !bypass_st || reset {
+                        chain.push(crate::stereo_lib::StereoLibProcessor::shared(
+                            shared.clone(),
+                            reset,
+                        ));
+                    }
                 }
                 if !chain.is_empty() {
                     // Silence through DSP is still silence; just keep the

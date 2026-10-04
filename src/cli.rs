@@ -277,10 +277,18 @@ pub enum Commands {
         /// defaults apply when unset.
         #[arg(long)]
         stereo_tool_sts: Option<PathBuf>,
-        /// Stereo Tool license key (visible in `ps aux` while running, like
-        /// the official CLI expects).
+        /// Stereo Tool license key. Lowest priority: `--stereo-tool-key-file`
+        /// wins, then `DEEZCO_STEREO_KEY`, then this flag. Note the key is
+        /// visible in `ps aux` while running (like the official CLI); prefer
+        /// the file or env var on shared machines.
         #[arg(long)]
         stereo_tool_key: Option<String>,
+        /// Read the Stereo Tool license key from a file (trailing newline
+        /// ignored) instead of argv, so it never appears in `ps aux`.
+        /// Highest priority: wins over `DEEZCO_STEREO_KEY` and
+        /// `--stereo-tool-key`.
+        #[arg(long)]
+        stereo_tool_key_file: Option<PathBuf>,
         /// Sample rate (Hz) of the Stereo Tool bus; must be 44100 to match
         /// the PCM bus.
         #[arg(long, default_value_t = 44100)]

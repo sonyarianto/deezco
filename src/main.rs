@@ -21,10 +21,10 @@ mod stereo_lib;
 mod track;
 mod web_assets;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::api::DeezerApi;
 use crate::cli::{
@@ -254,6 +254,32 @@ async fn download_artist_query(
     }
     println!("\nRun `deezco artist <ID>` to download the discography.");
     Ok(false)
+}
+
+/// Resolve the Stereo Tool license key without forcing it through argv:
+/// `--stereo-tool-key-file` wins, then `DEEZCO_STEREO_KEY`, then
+/// `--stereo-tool-key` (same precedence idea as the ARL sources). A
+/// given-but-empty key file fails fast; an empty env value or flag is
+/// treated as unset.
+async fn resolve_stereo_tool_key(
+    flag: Option<String>,
+    key_file: Option<PathBuf>,
+    env: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(path) = key_file {
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read --stereo-tool-key-file {}", path.display()))?;
+        let key = raw.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("--stereo-tool-key-file {} is empty", path.display());
+        }
+        return Ok(Some(key));
+    }
+    if let Some(key) = env.filter(|value| !value.is_empty()) {
+        return Ok(Some(key));
+    }
+    Ok(flag.filter(|value| !value.is_empty()))
 }
 
 #[tokio::main]
@@ -613,6 +639,7 @@ async fn main() -> Result<()> {
             stereo_tool_reset_track,
             stereo_tool_sts,
             stereo_tool_key,
+            stereo_tool_key_file,
             stereo_rate,
             refresh_secs,
             jingle_dir,
@@ -700,6 +727,12 @@ async fn main() -> Result<()> {
             if stereo_tool_reset_track && stereo_tool_lib.is_none() {
                 anyhow::bail!("--stereo-tool-reset-track requires --stereo-tool-lib");
             }
+            let stereo_tool_key = resolve_stereo_tool_key(
+                stereo_tool_key,
+                stereo_tool_key_file,
+                std::env::var("DEEZCO_STEREO_KEY").ok(),
+            )
+            .await?;
             let stereo_tool = stereo_tool.map(|binary| crate::dsp::StereoToolConfig {
                 binary,
                 settings: stereo_tool_sts.clone(),
@@ -758,6 +791,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_stereo_tool_key;
     use crate::cli::{SortDir, SortKey, extract_id, parse_cli_quality, parse_format};
     use crate::models::{FollowedArtist, GwTrack, TrackFormat};
     use crate::output::artist_header;
@@ -1159,6 +1193,81 @@ mod tests {
         assert!(parse_cli_quality("").is_err());
         assert!(parse_cli_quality(" flac").is_err());
         assert!(parse_cli_quality("256").is_err());
+    }
+
+    async fn write_key_file(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("deezco-stkey-test-{name}"));
+        tokio::fs::write(&path, contents).await.unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn stereo_key_file_wins_over_env_and_flag() {
+        let path = write_key_file("priority", "<file-key>\n").await;
+        let resolved = resolve_stereo_tool_key(
+            Some("flag-key".to_string()),
+            Some(path.clone()),
+            Some("env-key".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("<file-key>"));
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stereo_key_env_wins_over_flag() {
+        let resolved = resolve_stereo_tool_key(
+            Some("flag-key".to_string()),
+            None,
+            Some("env-key".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("env-key"));
+    }
+
+    #[tokio::test]
+    async fn stereo_key_falls_back_to_flag_then_none() {
+        let resolved = resolve_stereo_tool_key(Some("flag-key".to_string()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("flag-key"));
+        assert!(
+            resolve_stereo_tool_key(None, None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Empty env/flag count as unset
+        assert!(
+            resolve_stereo_tool_key(Some(String::new()), None, Some(String::new()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stereo_key_file_errors_are_loud() {
+        // Missing file: IO error, never a silent fallback to another source.
+        assert!(
+            resolve_stereo_tool_key(
+                Some("flag-key".to_string()),
+                Some(PathBuf::from("/nonexistent-dir/st.key")),
+                Some("env-key".to_string()),
+            )
+            .await
+            .is_err()
+        );
+        // Explicit-but-empty file: fail fast instead of falling back.
+        let path = write_key_file("empty", "  \n").await;
+        assert!(
+            resolve_stereo_tool_key(None, Some(path.clone()), Some("env-key".to_string()))
+                .await
+                .is_err()
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
     }
 
     #[test]

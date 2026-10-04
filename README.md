@@ -89,6 +89,7 @@ deezco [OPTIONS] [COMMAND]
 | `DEEZCO_OUTPUT_DIR` | Overrides the default output directory. Takes precedence over the default, but `-o, --output` still wins. |
 | `DEEZCO_ARL` | Deezer ARL cookie used for login when no ARL is stored. Takes precedence over the stored cookie, but `--arl` still wins. Transient — never written to `~/.config/deezco/.arl` (use `--arl` or `login` to persist). |
 | `DEEZCO_ICECAST_PASSWORD` | Icecast source password used by `stream` when `--password` is not given. |
+| `DEEZCO_STEREO_KEY` | Stereo Tool license key used by `stream` when `--stereo-tool-key-file` is not given. Priority: file > env > `--stereo-tool-key`. |
 
 ```bash
 # Set it once for your session
@@ -355,13 +356,14 @@ deezco stream --music-dir ./library --server http://localhost:8000 --mount /radi
 # Broadcast processing via the licensed Thimeo Stereo Tool CLI. Every track
 # runs decode -> Stereo Tool -> session encode; processor state resets at
 # each track boundary, and a tool failure bypasses the track instead of
-# killing the stream. The key is visible in `ps aux` while running,
-# like the official CLI:
+# killing the stream. A --stereo-tool-key flag is visible in `ps aux`
+# while running (like the official CLI) — prefer --stereo-tool-key-file
+# or DEEZCO_STEREO_KEY on shared machines:
 deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
   --password hackme --crossfade 6 \
   --stereo-tool /opt/stereo_tool_cmd_64 \
   --stereo-tool-sts /etc/stereo/audio.sts \
-  --stereo-tool-key "$STEREO_KEY"
+  --stereo-tool-key-file /run/secrets/stereo.key
 
 # Same processing via the in-process libStereoTool shared library
 # (from Stereo_Tool_Generic_plugin.zip): no per-track spawn, no pipe
@@ -372,7 +374,7 @@ deezco stream --music-dir ./library --server http://localhost:8000 --mount /radi
   --password hackme --crossfade 6 \
   --stereo-tool-lib /opt/libStereoTool_intel64.so \
   --stereo-tool-sts /etc/stereo/audio.sts \
-  --stereo-tool-key "$STEREO_KEY"
+  --stereo-tool-key-file /run/secrets/stereo.key
 ```
 
 ### Output layout

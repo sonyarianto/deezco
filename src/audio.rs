@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 
 /// Sample rate (Hz) every stage resamples to before mixing. 44100 matches
-/// Deezer's MP3 sources, so the linear resampler below is a rarely-hit
+/// Deezer's MP3 sources, so the cubic resampler below is a rarely-hit
 /// fallback; Stereo Tool also accepts this rate natively.
 pub const BUS_RATE: u32 = 44100;
 /// Channel count on the bus. Stereo Tool is a stereo processor, so mono
@@ -211,7 +211,7 @@ pub trait FrameDecoder: Send + Sync {
 /// a C parser).
 /// Output: stereo `f32` at the source rate, resampled to [`BUS_RATE`] only
 /// when it differs (44100 Hz sources skip the resampler entirely — the
-/// linear interpolator below is a fallback for 48 kHz FLACs and the like).
+/// cubic interpolator below is a fallback for 48 kHz FLACs and the like).
 pub struct SymphoniaDecoder;
 
 impl SymphoniaDecoder {
@@ -342,7 +342,7 @@ impl SymphoniaDecoder {
             } else {
                 // Rate switched mid-file: resample this chunk back to the
                 // track rate so the single output stream stays coherent.
-                stereo.extend(resample_linear_stereo_f32(
+                stereo.extend(resample_cubic_stereo_f32(
                     &chunk,
                     rate,
                     src_rate.expect("just set"),
@@ -369,7 +369,7 @@ impl FrameDecoder for SymphoniaDecoder {
 
     fn decode(&self, bytes: &[u8]) -> Result<PcmBuffer> {
         let (stereo_f32, src_rate) = Self::decode_frames(bytes)?;
-        let at_bus_rate = resample_linear_stereo_f32(&stereo_f32, src_rate, BUS_RATE);
+        let at_bus_rate = resample_cubic_stereo_f32(&stereo_f32, src_rate, BUS_RATE);
         Ok(PcmBuffer::from_interleaved(at_bus_rate))
     }
 }
@@ -457,10 +457,12 @@ fn resample_linear_stereo(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i1
     out
 }
 
-/// Linear-interpolating resampler for interleaved stereo `f32`: same math
-/// as [`resample_linear_stereo`] without the integer roundtrip, so decoded
-/// floats keep full precision through a rate switch.
-fn resample_linear_stereo_f32(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+/// Catmull-Rom (cubic Hermite) resampler for interleaved stereo `f32`.
+/// Same framing contract as the old linear version (floor-truncated output
+/// length, exact endpoints), but with far less HF roll-off and aliasing on
+/// non-bus-rate sources such as local 48/96 kHz FLACs. Same-rate input
+/// still returns untouched — the hot path for Deezer sources never changes.
+fn resample_cubic_stereo_f32(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || input.is_empty() {
         return input.to_vec();
     }
@@ -470,14 +472,35 @@ fn resample_linear_stereo_f32(input: &[f32], src_rate: u32, dst_rate: u32) -> Ve
     for i in 0..out_frames {
         let pos = i as f64 * src_rate as f64 / dst_rate as f64;
         let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        let a = idx.min(in_frames - 1) * 2;
-        let b = (idx + 1).min(in_frames - 1) * 2;
+        let t = (pos - idx as f64) as f32;
+        // Cubic window around idx, clamped at the edges (endpoints stay
+        // exact because Catmull-Rom passes through p1/p2 at t = 0/1).
+        let i0 = idx.saturating_sub(1).min(in_frames - 1) * 2;
+        let i1 = idx.min(in_frames - 1) * 2;
+        let i2 = (idx + 1).min(in_frames - 1) * 2;
+        let i3 = (idx + 2).min(in_frames - 1) * 2;
         for ch in 0..2 {
-            out.push(input[a + ch] * (1.0 - frac) + input[b + ch] * frac);
+            out.push(catmull_rom(
+                input[i0 + ch],
+                input[i1 + ch],
+                input[i2 + ch],
+                input[i3 + ch],
+                t,
+            ));
         }
     }
     out
+}
+
+/// Catmull-Rom interpolation between `p1` and `p2`, with neighbors `p0`
+/// and `p3` setting the tangents. Passes through `p1` at `t = 0` and `p2`
+/// at `t = 1`.
+fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let m1 = 0.5 * (p2 - p0);
+    let m2 = 0.5 * (p3 - p1);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    (2.0 * p1 - 2.0 * p2 + m1 + m2) * t3 + (-3.0 * p1 + 3.0 * p2 - 2.0 * m1 - m2) * t2 + m1 * t + p1
 }
 
 /// Convert interleaved stereo `i16` to `f32` in `[-1.0, 1.0]`.
@@ -819,8 +842,63 @@ mod tests {
     #[test]
     fn resample_f32_same_rate_is_identity() {
         let input = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.5];
-        assert_eq!(resample_linear_stereo_f32(&input, 44100, 44100), input);
-        assert!(resample_linear_stereo_f32(&[], 22050, 44100).is_empty());
+        assert_eq!(resample_cubic_stereo_f32(&input, 44100, 44100), input);
+        assert!(resample_cubic_stereo_f32(&[], 22050, 44100).is_empty());
+    }
+
+    /// Cubic must beat linear on real content: 1 kHz sine at 48 kHz down
+    /// to the bus rate, measured against the analytic sine at the exact
+    /// output instants. (Linear reference inlined — the old algorithm.)
+    #[test]
+    fn resample_cubic_beats_linear_on_sine() {
+        fn linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+            let in_frames = input.len() / 2;
+            let out_frames = (in_frames as u64 * dst_rate as u64 / src_rate as u64) as usize;
+            let mut out = Vec::with_capacity(out_frames * 2);
+            for i in 0..out_frames {
+                let pos = i as f64 * src_rate as f64 / dst_rate as f64;
+                let idx = pos.floor() as usize;
+                let frac = (pos - idx as f64) as f32;
+                let a = idx.min(in_frames - 1) * 2;
+                let b = (idx + 1).min(in_frames - 1) * 2;
+                for ch in 0..2 {
+                    out.push(input[a + ch] * (1.0 - frac) + input[b + ch] * frac);
+                }
+            }
+            out
+        }
+        fn rms_error(resampled: &[f32]) -> f32 {
+            // Ideal sine value at each output frame instant.
+            let (pairs, _) = resampled.as_chunks::<2>();
+            let err: f32 = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, frame)| {
+                    let t = i as f32 / BUS_RATE as f32;
+                    let ideal = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.9;
+                    (frame[0] - ideal).powi(2)
+                })
+                .sum();
+            (err / (resampled.len() / 2) as f32).sqrt()
+        }
+        let input: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin() * 0.9;
+                [s, s]
+            })
+            .collect();
+        let cubic = resample_cubic_stereo_f32(&input, 48000, BUS_RATE);
+        let linear = linear(&input, 48000, BUS_RATE);
+        assert_eq!(cubic.len(), linear.len());
+        // Endpoints pass through the original points either way.
+        assert!((cubic[0] - input[0]).abs() < 1e-6);
+        let cubic_err = rms_error(&cubic);
+        let linear_err = rms_error(&linear);
+        assert!(
+            cubic_err < linear_err,
+            "cubic ({cubic_err}) must beat linear ({linear_err})"
+        );
+        assert!(cubic_err < 1e-3, "cubic error too large ({cubic_err})");
     }
 
     #[test]

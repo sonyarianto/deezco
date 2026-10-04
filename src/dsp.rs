@@ -602,7 +602,8 @@ mod tests {
         let input = vec![1.5, 0.15, -1.5, -0.15, 0.5, 0.05];
         let mut buf = input.clone();
         PeakLimiter::new().process(&mut buf).unwrap();
-        for (i, pair) in buf.chunks_exact(2).enumerate() {
+        let (pairs, _) = buf.as_chunks::<2>();
+        for (i, pair) in pairs.iter().enumerate() {
             let (a, b) = (input[i * 2], input[i * 2 + 1]);
             if a.abs() > 1e-6 && b.abs() > 1e-6 {
                 assert!(

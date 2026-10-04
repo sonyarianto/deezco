@@ -28,7 +28,7 @@ use std::path::Path;
 
 use crate::api::DeezerApi;
 use crate::cli::{
-    Cli, Commands, OutputFormat, SortDir, SortKey, StreamMode, extract_id, parse_format,
+    Cli, Commands, OutputFormat, SortDir, SortKey, StreamMode, extract_id, parse_cli_quality,
 };
 use crate::models::GwTrack;
 use crate::output::{
@@ -259,13 +259,21 @@ async fn download_artist_query(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut format = parse_format(&cli.quality);
+    // Strict quality parsing: typos fail fast instead of silently downloading
+    // the wrong format.
+    let mut format = parse_cli_quality(&cli.quality)?;
     let sort = cli.sort;
     let preview = cli.preview || cli.preview_and_full;
     let (min_format, max_format) = resolve_quality_bounds(
-        cli.exact.as_deref().map(parse_format),
-        cli.min_quality.as_deref().map(parse_format),
-        cli.max_quality.as_deref().map(parse_format),
+        cli.exact.as_deref().map(parse_cli_quality).transpose()?,
+        cli.min_quality
+            .as_deref()
+            .map(parse_cli_quality)
+            .transpose()?,
+        cli.max_quality
+            .as_deref()
+            .map(parse_cli_quality)
+            .transpose()?,
     );
 
     // An unsatisfiable floor: every download would fail
@@ -402,7 +410,8 @@ async fn main() -> Result<()> {
         }
         drop(user);
 
-        if !matches!(command, Commands::Serve { .. } | Commands::Stream { .. }) {
+        // A dry run must not touch disk: listing only, no output dir.
+        if !cli.dry_run && !matches!(command, Commands::Serve { .. } | Commands::Stream { .. }) {
             tokio::fs::create_dir_all(&output).await?;
         }
     }
@@ -524,6 +533,9 @@ async fn main() -> Result<()> {
                 "Downloading releases from {} followed artist(s)\n",
                 enriched.len()
             );
+            // Per-artist failures don't abort the run ("continue with the
+            // rest"); the non-zero exit is reported once at the end.
+            let mut failed_artists = 0;
             for artist in &enriched {
                 println!("{}", artist_header(artist));
                 let art_id = artist.id.to_string();
@@ -531,7 +543,7 @@ async fn main() -> Result<()> {
                     println!("  [skip] Already on disk");
                     continue;
                 }
-                download::download_artist(
+                if let Err(e) = download::download_artist(
                     &api,
                     &art_id,
                     options,
@@ -539,7 +551,17 @@ async fn main() -> Result<()> {
                     cli.concurrency,
                     cli.dry_run,
                 )
-                .await?;
+                .await
+                {
+                    eprintln!("  [err] {}: {e}", artist.name);
+                    failed_artists += 1;
+                }
+            }
+            if failed_artists > 0 {
+                anyhow::bail!(
+                    "Following: {failed_artists} artist(s) failed out of {}",
+                    enriched.len()
+                );
             }
         }
         Commands::Album { url } => {
@@ -640,6 +662,14 @@ async fn main() -> Result<()> {
                     "an Icecast source password is required (--password or DEEZCO_ICECAST_PASSWORD)"
                 );
             };
+            if !(server.starts_with("http://") || server.starts_with("https://")) {
+                anyhow::bail!(
+                    "--server must start with http:// or https:// (e.g. http://localhost:8000), got '{server}'"
+                );
+            }
+            if !mount.starts_with('/') {
+                anyhow::bail!("--mount must start with '/' (e.g. /radio), got '{mount}'");
+            }
             if !(0.0..=crate::audio::MAX_CROSSFADE_SECS).contains(&crossfade) || crossfade.is_nan()
             {
                 anyhow::bail!(
@@ -728,7 +758,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{SortDir, SortKey, extract_id, parse_format};
+    use crate::cli::{SortDir, SortKey, extract_id, parse_cli_quality, parse_format};
     use crate::models::{FollowedArtist, GwTrack, TrackFormat};
     use crate::output::artist_header;
     use crate::resolve::{
@@ -1103,10 +1133,32 @@ mod tests {
 
     #[test]
     fn parse_format_defaults_to_mp3_320() {
+        // Lenient on purpose: internal API-data paths (sort ranking) must
+        // never abort on an unknown string; CLI flags use parse_cli_quality.
         assert_eq!(parse_format(""), TrackFormat::Mp3_320);
         assert_eq!(parse_format("wav"), TrackFormat::Mp3_320);
         // Whitespace is not trimmed
         assert_eq!(parse_format(" flac"), TrackFormat::Mp3_320);
+    }
+
+    #[test]
+    fn parse_cli_quality_accepts_known_aliases() {
+        assert_eq!(parse_cli_quality("flac").unwrap(), TrackFormat::Flac);
+        assert_eq!(parse_cli_quality("LOSSLESS").unwrap(), TrackFormat::Flac);
+        assert_eq!(parse_cli_quality("320").unwrap(), TrackFormat::Mp3_320);
+        assert_eq!(parse_cli_quality("mp3_320").unwrap(), TrackFormat::Mp3_320);
+        assert_eq!(parse_cli_quality("128").unwrap(), TrackFormat::Mp3_128);
+        assert_eq!(parse_cli_quality("1").unwrap(), TrackFormat::Mp3_128);
+    }
+
+    #[test]
+    fn parse_cli_quality_rejects_typos_instead_of_falling_back() {
+        // A typo must fail fast, never silently download 320.
+        assert!(parse_cli_quality("flacc").is_err());
+        assert!(parse_cli_quality("wav").is_err());
+        assert!(parse_cli_quality("").is_err());
+        assert!(parse_cli_quality(" flac").is_err());
+        assert!(parse_cli_quality("256").is_err());
     }
 
     #[test]

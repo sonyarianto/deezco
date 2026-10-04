@@ -57,11 +57,28 @@ pub(crate) fn summarize_downloads(results: Vec<(String, Result<PathBuf>)>) -> (u
     (downloaded, failed)
 }
 
+/// Fail a batch command when any track failed, so scripts/CI get a non-zero
+/// exit instead of a printed summary with exit 0. Callers always finish the
+/// whole batch first ("continue with the rest"); this only converts the
+/// already-reported outcome into an exit code.
+pub(crate) fn ensure_no_failures(what: &str, downloaded: usize, failed: usize) -> Result<()> {
+    if failed > 0 {
+        anyhow::bail!("{what}: {failed} failed, {downloaded} downloaded");
+    }
+    Ok(())
+}
+
 /// Print the tracks a download would fetch, without downloading.
 /// Tracks below `--min-quality` are flagged instead of listed as downloadable.
 /// In preview modes, format checks don't apply and lines are marked
 /// `[preview]` or `[preview + full]`.
-pub(crate) fn print_dry_run_tracks(header: &str, tracks: &[GwTrack], options: DownloadOptions) {
+/// Returns how many tracks would be rejected by `--min-quality`, so callers
+/// can exit non-zero just like a real batch with failures.
+pub(crate) fn print_dry_run_tracks(
+    header: &str,
+    tracks: &[GwTrack],
+    options: DownloadOptions,
+) -> usize {
     if options.preview {
         let kind = if options.preview_and_full {
             "preview + full"
@@ -77,7 +94,7 @@ pub(crate) fn print_dry_run_tracks(header: &str, tracks: &[GwTrack], options: Do
                 dry_run_track_label(track, options)
             );
         }
-        return;
+        return 0;
     }
 
     println!(
@@ -115,5 +132,23 @@ pub(crate) fn print_dry_run_tracks(header: &str, tracks: &[GwTrack], options: Do
             "\nDry run: {} track(s) would be rejected by --min-quality",
             rejected
         );
+    }
+    rejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_no_failures_passes_on_clean_batch() {
+        assert!(ensure_no_failures("Playlist", 10, 0).is_ok());
+        assert!(ensure_no_failures("Playlist", 0, 0).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_failures_fails_on_any_failure() {
+        assert!(ensure_no_failures("Playlist", 9, 1).is_err());
+        assert!(ensure_no_failures("Album", 0, 3).is_err());
     }
 }

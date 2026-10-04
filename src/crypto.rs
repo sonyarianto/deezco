@@ -16,9 +16,17 @@ pub fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> String {
     let cipher = Aes128::new_from_slice(key).expect("Invalid AES key length");
     let mut result = Vec::new();
 
-    for chunk in data.chunks(16) {
-        let block: [u8; 16] = chunk.try_into().expect("chunk must be 16 bytes");
-        let mut block = Array::from(block);
+    // Full 16-byte blocks only. Callers pad to a multiple of 16, so a
+    // remainder indicates a programming error: truncate instead of panicking
+    // (a short URL fails gracefully at fetch time rather than killing a 24/7
+    // stream), while `debug_assert` still catches it in tests.
+    let (chunks, remainder) = data.as_chunks::<16>();
+    debug_assert!(
+        remainder.is_empty(),
+        "aes_ecb_encrypt requires 16-byte-aligned input"
+    );
+    for chunk in chunks {
+        let mut block = Array::from(*chunk);
         cipher.encrypt_block(&mut block);
         result.extend_from_slice(&block);
     }

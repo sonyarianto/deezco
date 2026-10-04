@@ -323,7 +323,13 @@ impl DeezerApi {
             let batch: Vec<FollowedArtist> = match body["data"].as_array() {
                 Some(arr) => arr
                     .iter()
-                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .filter_map(|item| match serde_json::from_value(item.clone()) {
+                        Ok(artist) => Some(artist),
+                        Err(e) => {
+                            crate::warn!("deezco: skipping unparsable followed artist: {e}");
+                            None
+                        }
+                    })
                     .collect(),
                 None => Vec::new(),
             };
@@ -392,7 +398,13 @@ impl DeezerApi {
 
         let tracks: Vec<GwTrack> = data
             .iter()
-            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .filter_map(|item| match serde_json::from_value(item.clone()) {
+                Ok(track) => Some(track),
+                Err(e) => {
+                    crate::warn!("deezco: skipping unparsable track (song.getListData): {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(tracks)
@@ -425,7 +437,15 @@ impl DeezerApi {
 
             let albums: Vec<AlbumInfo> = data
                 .iter()
-                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .filter_map(|item| match serde_json::from_value(item.clone()) {
+                    Ok(album) => Some(album),
+                    Err(e) => {
+                        crate::warn!(
+                            "deezco: skipping unparsable album (album.getDiscography): {e}"
+                        );
+                        None
+                    }
+                })
                 .collect();
 
             let count = albums.len() as u64;
@@ -452,7 +472,13 @@ impl DeezerApi {
 
         let tracks: Vec<GwTrack> = data
             .iter()
-            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .filter_map(|item| match serde_json::from_value(item.clone()) {
+                Ok(track) => Some(track),
+                Err(e) => {
+                    crate::warn!("deezco: skipping unparsable track (song.getListByAlbum): {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(tracks)

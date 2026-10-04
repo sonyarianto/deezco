@@ -1,4 +1,5 @@
 use crate::models::TrackFormat;
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -174,8 +175,13 @@ pub enum Commands {
         /// Port to bind the HTTP server to
         #[arg(long, default_value_t = 9001)]
         port: u16,
-        /// How often to refetch playlists so web edits are picked up
-        #[arg(long, default_value_t = 780)]
+        /// How often to refetch playlists so web edits are picked up.
+        /// Minimum 1: zero would rescan on every track (busy-loop).
+        #[arg(
+            long,
+            default_value_t = 780,
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
         refresh_secs: u64,
     },
     /// Stream local audio files to an Icecast server as a live radio source.
@@ -280,8 +286,13 @@ pub enum Commands {
         #[arg(long, default_value_t = 44100)]
         stereo_rate: u32,
         /// How often to rescan --music-dir (`local` mode) or refetch the
-        /// playlist (`deezer` mode) so new tracks are picked up
-        #[arg(long, default_value_t = 780)]
+        /// playlist (`deezer` mode) so new tracks are picked up.
+        /// Minimum 1: zero would rescan on every track (busy-loop).
+        #[arg(
+            long,
+            default_value_t = 780,
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
         refresh_secs: u64,
         /// Directory containing jingle/filler audio files (mp3/flac).
         /// When no real track is ready (empty library, or next prefetch
@@ -299,6 +310,20 @@ pub fn parse_format(quality: &str) -> TrackFormat {
         "320" | "mp3_320" | "3" => TrackFormat::Mp3_320,
         "128" | "mp3_128" | "1" => TrackFormat::Mp3_128,
         _ => TrackFormat::Mp3_320,
+    }
+}
+
+/// Parse a user-supplied quality flag strictly: unknown values fail instead
+/// of silently falling back to 320 (a `--quality flacc` typo must not
+/// download the wrong format). The lenient [`parse_format`] stays for
+/// internal API-data paths (e.g. sort ranking), where an unknown string
+/// must never abort the command.
+pub fn parse_cli_quality(quality: &str) -> Result<TrackFormat> {
+    match quality.to_lowercase().as_str() {
+        "flac" | "lossless" | "9" => Ok(TrackFormat::Flac),
+        "320" | "mp3_320" | "3" => Ok(TrackFormat::Mp3_320),
+        "128" | "mp3_128" | "1" => Ok(TrackFormat::Mp3_128),
+        _ => anyhow::bail!("unknown quality '{quality}' (expected flac, 320, or 128)"),
     }
 }
 

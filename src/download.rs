@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::api::DeezerApi;
-use crate::batch::{download_tracks_concurrently, print_dry_run_tracks, summarize_downloads};
+use crate::batch::{
+    download_tracks_concurrently, ensure_no_failures, print_dry_run_tracks, summarize_downloads,
+};
 use crate::dedupe::{
     build_audio_hash_index, clean_artist_directory, collect_audio_files, dedupe_audio_file,
 };
@@ -37,7 +39,14 @@ pub async fn download_playlist(
     let total = tracks.len();
 
     if dry_run {
-        print_dry_run_tracks(&format!("Playlist: {}", playlist_name), &tracks, options);
+        let rejected =
+            print_dry_run_tracks(&format!("Playlist: {}", playlist_name), &tracks, options);
+        if rejected > 0 {
+            anyhow::bail!(
+                "Dry run: {} track(s) would be rejected by --min-quality",
+                rejected
+            );
+        }
         return Ok(());
     }
 
@@ -54,7 +63,7 @@ pub async fn download_playlist(
         "\nPlaylist complete: {} downloaded, {} failed out of {} tracks",
         downloaded, failed, total
     );
-    Ok(())
+    ensure_no_failures("Playlist", downloaded, failed)
 }
 
 /// Download user's favorite (liked) tracks
@@ -126,6 +135,10 @@ pub async fn download_favorites(
                 "\nDry run: {} track(s) would be rejected by --min-quality",
                 rejected
             );
+            anyhow::bail!(
+                "Dry run: {} track(s) would be rejected by --min-quality",
+                rejected
+            );
         }
         return Ok(());
     }
@@ -154,7 +167,7 @@ pub async fn download_favorites(
         "\nFavorites complete: {} downloaded, {} failed out of {} tracks",
         downloaded, failed, total
     );
-    Ok(())
+    ensure_no_failures("Favorites", downloaded, failed)
 }
 
 /// Data needed to decide whether an artist's releases are already on disk.
@@ -296,6 +309,12 @@ pub async fn download_artist(
             "\nDry run complete: would download {} track(s), {} rejected by --min-quality",
             total, rejected
         );
+        if rejected > 0 {
+            anyhow::bail!(
+                "Dry run: {} track(s) would be rejected by --min-quality",
+                rejected
+            );
+        }
         return Ok(());
     }
 
@@ -403,7 +422,7 @@ pub async fn download_artist(
         "\nArtist download complete: {} downloaded, {} linked duplicates, {} skipped, {} failed",
         total_downloaded, total_linked, total_skipped, total_failed
     );
-    Ok(())
+    ensure_no_failures("Artist", total_downloaded, total_failed)
 }
 
 /// Download all tracks from an album
@@ -425,11 +444,17 @@ pub async fn download_album(
     let total = tracks.len();
 
     if dry_run {
-        print_dry_run_tracks(
+        let rejected = print_dry_run_tracks(
             &format!("Album: {} - {}", artist_name, album_title),
             &tracks,
             options,
         );
+        if rejected > 0 {
+            anyhow::bail!(
+                "Dry run: {} track(s) would be rejected by --min-quality",
+                rejected
+            );
+        }
         return Ok(());
     }
 
@@ -450,7 +475,7 @@ pub async fn download_album(
         "\nAlbum complete: {} downloaded, {} failed out of {} tracks",
         downloaded, failed, total
     );
-    Ok(())
+    ensure_no_failures("Album", downloaded, failed)
 }
 
 /// Download a single track by URL or ID

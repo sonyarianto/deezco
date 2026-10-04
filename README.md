@@ -194,6 +194,8 @@ deezco --min-quality flac track 3135556
 deezco -q flac --min-quality 320 playlist 908622995
 # Works with dry-run too: exit code 1 when the single track would fall below
 deezco --dry-run --min-quality flac --pick 1 track "Get Lucky"
+# Batch exit codes: any failed track (or any dry-run rejection) means exit 1.
+# The batch always runs to completion first, so partial results are kept.
 
 # Cap the bitrate for data-sensitive connections (e.g. 128kbps max)
 deezco -q flac --max-quality 128 favorites

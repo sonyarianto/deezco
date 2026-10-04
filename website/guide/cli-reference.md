@@ -62,7 +62,8 @@ deezco stream --mode deezer --playlist <ID> --server <URL> --mount <MOUNT> --pas
 # [--no-metadata] [--refresh-secs 780] [--jingle-dir DIR]
 # [--crossfade 0..30] [--gain-db -24..24] [--bitrate 8..320]
 # [--target-lufs -23..-6] [--stereo-tool PATH] [--stereo-tool-lib PATH]
-# [--stereo-tool-sts PATH] [--stereo-tool-key KEY] [--stereo-tool-reset-track]
+# [--stereo-tool-sts PATH] [--stereo-tool-key KEY | --stereo-tool-key-file PATH]
+# [--stereo-tool-reset-track]
 ```
 
 ## Env vars
@@ -72,6 +73,7 @@ deezco stream --mode deezer --playlist <ID> --server <URL> --mount <MOUNT> --pas
 | `DEEZCO_OUTPUT_DIR` | Override output dir ( `-o` wins ) |
 | `DEEZCO_ARL` | Transient ARL ( `--arl` wins ) |
 | `DEEZCO_ICECAST_PASSWORD` | Icecast password fallback |
+| `DEEZCO_STEREO_KEY` | Stereo Tool key fallback (file > env > `--stereo-tool-key`) |
 
 ## Examples
 

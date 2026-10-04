@@ -81,17 +81,19 @@ deezco stream ... --crossfade 6 --bitrate 128
 # loudness normalization (R128 / BS.1770)
 deezco stream ... --crossfade 6 --target-lufs -14  # -9 hot, -14 streaming, -23 broadcast
 
-# Stereo Tool via CLI (per-track spawn, state resets)
+# Stereo Tool via CLI (per-track spawn, state resets).
+# Prefer --stereo-tool-key-file (or DEEZCO_STEREO_KEY): a --stereo-tool-key
+# flag is visible in `ps aux`. Priority: file > env > flag.
 deezco stream ... --crossfade 6 \
   --stereo-tool /opt/stereo_tool_cmd_64 \
   --stereo-tool-sts /etc/stereo/audio.sts \
-  --stereo-tool-key "$STEREO_KEY"
+  --stereo-tool-key-file /run/secrets/stereo.key
 
 # Stereo Tool via libStereoTool (persistent, state continuous)
 deezco stream ... --crossfade 6 \
   --stereo-tool-lib /opt/libStereoTool_intel64.so \
   --stereo-tool-sts /etc/stereo/audio.sts \
-  --stereo-tool-key "$STEREO_KEY" \
+  --stereo-tool-key-file /run/secrets/stereo.key \
   # optional: --stereo-tool-reset-track
 ```
 

@@ -321,11 +321,12 @@ deezco stream --music-dir ./library --server http://sapircast.caster.fm:14508 \
 # When the PCM pipeline is active (--crossfade/--gain-db/--target-lufs/
 # --bitrate/--stereo-tool*/--stereo-tool-lib) filler PCM follows the same
 # path as regular tracks (loudness -> crossfade -> DSP -> session CBR) so
-# jingles stay sonically consistent. With --stereo-tool-lib the single
-# shared instance serializes all DSP: jingle cache is throttled to 1 while
-# a real track is still being decoded/DSP'd (so the track wins the Mutex
-# and avoids the 2026-09-21 infinite-jingle starvation), expanding to 5
-# only when tracks are fully prefetched to bridge burst holes; filler
+# jingles stay sonically consistent. Jingle prefetch does decode + loudness
+# only (no background DSP), so it never contends the shared instance;
+# with --stereo-tool-lib the continuous instance is additionally bypassed
+# for filler while a real track DSP is still pending (gain still runs),
+# expanding the cache to 5 only when tracks are fully prefetched to bridge
+# burst holes (2026-09-21 starvation fix, extended 2026-10-04); filler
 # streaks (5+ consecutive) are now warned with last track error and
 # music-dir context (use DEEZCO_DEBUG=1):
 deezco stream --music-dir ./library --server http://localhost:8000 --mount /radio \
